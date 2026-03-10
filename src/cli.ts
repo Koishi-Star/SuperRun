@@ -11,8 +11,19 @@ program
   .action(async (prompt: string) => {
     try {
       console.log("user:", prompt);
-      const reply = await runAgentLoop(prompt);
-      console.log("assistant:", reply);
+      process.stdout.write("assistant: ");
+
+      const reply = await runAgentLoop(prompt, {
+        onChunk: (chunk) => {
+          process.stdout.write(chunk);
+        },
+      });
+
+      if (!reply) {
+        process.stdout.write("(empty response)");
+      }
+
+      process.stdout.write("\n");
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown error";

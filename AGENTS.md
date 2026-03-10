@@ -11,8 +11,12 @@
 - Runtime: Node.js + TypeScript + ESM.
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `miko <prompt>`.
-- `src/cli.ts` only prints the user prompt and a placeholder assistant response.
-- `src/agent/loop.ts`, `src/llm/router.ts`, `src/llm/openaiComptale.ts`, `src/llm/types.ts`, and `src/utils/env.ts` are present but effectively empty.
+- `src/cli.ts` loads `.env`, accepts a single prompt argument, and streams the assistant response to stdout.
+- `src/agent/loop.ts` builds a minimal system+user message list and performs a single model call.
+- `src/llm/types.ts` defines the shared chat message, chat options, and client interface types.
+- `src/llm/router.ts` currently routes all requests to a single OpenAI-compatible client.
+- `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming and proxy support.
+- `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
 
 ## Working rules
 
@@ -33,11 +37,11 @@
 
 ## Priorities for upcoming work
 
-1. Replace the placeholder response in `src/cli.ts` with a real call into `src/agent/loop.ts`.
-2. Define minimal shared LLM types before adding provider-specific logic.
-3. Implement environment parsing for API keys and model selection.
-4. Add one working provider path end-to-end before supporting multiple providers or tools.
-5. Add basic error messages for missing config, provider failures, and invalid CLI usage.
+1. Add conversation state so the CLI can support multi-turn exchanges instead of a single request/response.
+2. Centralize prompt assembly in `src/agent/loop.ts` so system instructions and future tool messages stay in one place.
+3. Tighten CLI UX with explicit flags for model/provider overrides and clearer invalid-usage handling.
+4. Add focused tests for env validation, router behavior, and agent loop message assembly.
+5. Only after multi-turn chat is stable, introduce a narrow tool interface for local command execution or file operations.
 
 ## Implementation preferences
 
@@ -54,5 +58,5 @@
 
 ## Notes
 
-- There is mojibake in the placeholder assistant output in `src/cli.ts`; treat it as temporary placeholder text and replace it when touching that flow.
+- The placeholder assistant output in `src/cli.ts` has already been replaced by a real model call.
 - No test suite exists yet. If behavior becomes non-trivial, add focused tests around parsing, env validation, and agent loop behavior.

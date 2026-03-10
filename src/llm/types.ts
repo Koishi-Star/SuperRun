@@ -6,6 +6,7 @@ export type ChatMessage = {
 export type ChatOptions = {
   model?: string;
   temperature?: number;
+  onChunk?: (chunk: string) => void;
 };
 
 export interface LLMClient {

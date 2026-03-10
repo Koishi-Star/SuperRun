@@ -1,7 +1,14 @@
 import { chatOnce } from "../llm/router.js";
 import type { ChatMessage } from "../llm/types.js";
 
-export async function runAgentLoop(userPrompt: string): Promise<string> {
+export type RunAgentLoopOptions = {
+  onChunk?: (chunk: string) => void;
+};
+
+export async function runAgentLoop(
+  userPrompt: string,
+  options?: RunAgentLoopOptions,
+): Promise<string> {
   const messages: ChatMessage[] = [
     {
       role: "system",
@@ -14,5 +21,8 @@ export async function runAgentLoop(userPrompt: string): Promise<string> {
     },
   ];
 
-  return chatOnce(messages);
+  return chatOnce(
+    messages,
+    options?.onChunk ? { onChunk: options.onChunk } : undefined,
+  );
 }
