@@ -1,7 +1,7 @@
 {
   "name": "superrun",
   "version": "1.0.0",
-  "description": "",
+  "description": "An open-source coding agent CLI inspired by Claude Code, focused on safer operations and better provider integration.",
   "main": "index.js",
   "scripts": {
     "predev": "npm run build --silent",
@@ -9,9 +9,16 @@
     "build": "tsc",
     "start": "node dist/index.js"
   },
-  "keywords": [],
+  "keywords": [
+    "agent",
+    "cli",
+    "coding-agent",
+    "llm",
+    "openai-compatible",
+    "typescript"
+  ],
   "author": "",
-  "license": "ISC",
+  "license": "Apache-2.0",
   "dependencies": {
     "chalk": "^5.6.2",
     "commander": "^14.0.3",
