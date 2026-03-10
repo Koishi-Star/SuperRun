@@ -1,5 +1,23 @@
+import { Agent, ProxyAgent, type Dispatcher } from "undici";
 import type { ChatMessage, ChatOptions, LLMClient } from "./types.js";
 import { getOpenAICompatibleConfig } from "../utils/env.js";
+
+// Respect HTTPS_PROXY / HTTP_PROXY / https_proxy / http_proxy env vars.
+// undici does NOT pick up system proxy automatically, unlike curl.
+function buildDispatcher(): Dispatcher {
+  const proxyUrl =
+    process.env["HTTPS_PROXY"] ??
+    process.env["https_proxy"] ??
+    process.env["HTTP_PROXY"] ??
+    process.env["http_proxy"];
+
+  const connectOptions = { timeout: 30_000 }; // 30s TCP connect timeout
+
+  if (proxyUrl) {
+    return new ProxyAgent({ uri: proxyUrl, connect: connectOptions });
+  }
+  return new Agent({ connect: connectOptions });
+}
 
 type OpenAICompatibleResponse = {
   choices?: Array<{
@@ -94,10 +112,14 @@ export class OpenAICompatibleClient implements LLMClient {
         },
         body,
         signal: controller.signal,
+        // @ts-expect-error — undici dispatcher is not in the standard fetch types
+        dispatcher: buildDispatcher(),
       });
     } catch (err) {
+      const cause = err instanceof Error && "cause" in err ? (err as NodeJS.ErrnoException & { cause?: unknown }).cause : undefined;
+      const causeMsg = cause instanceof Error ? ` (cause: ${cause.message})` : cause ? ` (cause: ${String(cause)})` : "";
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Failed to reach LLM provider at ${url.origin}: ${msg}`);
+      throw new Error(`Failed to reach LLM provider at ${url.origin}: ${msg}${causeMsg}`);
     } finally {
       clearTimeout(timer);
     }
