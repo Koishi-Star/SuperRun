@@ -44,5 +44,6 @@
 
     // File Name Consistency
     "forceConsistentCasingInFileNames": true
-  }
+  },
+  "include": ["src/**/*.ts"]
 }

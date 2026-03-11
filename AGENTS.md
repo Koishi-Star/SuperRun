@@ -11,12 +11,13 @@
 - Runtime: Node.js + TypeScript + ESM.
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `miko <prompt>`.
-- `src/cli.ts` loads `.env`, accepts a single prompt argument, and streams the assistant response to stdout.
-- `src/agent/loop.ts` builds a minimal system+user message list and performs a single model call.
+- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, and now provides a lightweight terminal UI in TTY sessions.
+- `src/agent/loop.ts` manages session state, message history, system prompt assembly, and per-turn model calls.
 - `src/llm/types.ts` defines the shared chat message, chat options, and client interface types.
 - `src/llm/router.ts` currently routes all requests to a single OpenAI-compatible client.
 - `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming and proxy support.
 - `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
+- `test/` contains focused tests for env parsing, agent loop history handling, and interactive CLI multi-turn behavior using a local mock OpenAI-compatible server.
 
 ## Working rules
 
@@ -24,6 +25,7 @@
 - Preserve ESM-style imports with `.js` extensions in TypeScript source where needed.
 - Do not introduce heavy frameworks or complex dependency trees unless clearly justified.
 - Prefer explicit types and small modules over clever abstractions.
+- When modifying code, add concise comments for the changed logic so the intent remains easy to follow.
 - When adding a new subsystem, wire it through the CLI end-to-end in the smallest usable form first.
 
 ## Expected architecture direction
@@ -37,11 +39,11 @@
 
 ## Priorities for upcoming work
 
-1. Add conversation state so the CLI can support multi-turn exchanges instead of a single request/response.
-2. Centralize prompt assembly in `src/agent/loop.ts` so system instructions and future tool messages stay in one place.
-3. Tighten CLI UX with explicit flags for model/provider overrides and clearer invalid-usage handling.
-4. Add focused tests for env validation, router behavior, and agent loop message assembly.
-5. Only after multi-turn chat is stable, introduce a narrow tool interface for local command execution or file operations.
+1. Expand the lightweight TUI carefully with session metadata, transient status states, and clearer error surfacing.
+2. Consider lightweight history truncation so long chats do not grow without bound.
+3. Decide whether sessions should be in-memory only or optionally persisted across CLI runs.
+4. Add router-level coverage once a second provider or selection rule exists.
+5. Only after chat behavior is stable, introduce a narrow tool interface for local command execution or file operations.
 
 ## Implementation preferences
 
@@ -59,4 +61,4 @@
 ## Notes
 
 - The placeholder assistant output in `src/cli.ts` has already been replaced by a real model call.
-- No test suite exists yet. If behavior becomes non-trivial, add focused tests around parsing, env validation, and agent loop behavior.
+- The project now has a small `node:test` suite executed via `npm test`.

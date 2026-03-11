@@ -1,7 +1,11 @@
-export type ChatMessage = {
-  role: "system" | "user" | "assistant";
+export type ChatRole = "system" | "user" | "assistant";
+
+export type ChatMessage<Role extends ChatRole = ChatRole> = {
+  role: Role;
   content: string;
 };
+
+export type ConversationMessage = ChatMessage<"user" | "assistant">;
 
 export type ChatOptions = {
   model?: string;
