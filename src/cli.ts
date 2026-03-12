@@ -187,7 +187,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /settings /session /sessions /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
+      console.log("Commands: /help /settings /session /history [id|index|title] /sessions /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
     }
     return true;
   }
@@ -199,6 +199,31 @@ async function handleInteractivePrompt(
 
   if (prompt === "/session") {
     renderCurrentSessionSummary(ui, session, state);
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/history")) {
+    const sessionSelector = parseCommandArgument(prompt, "/history");
+    try {
+      if (!sessionSelector) {
+        renderHistory(ui, {
+          label: formatSessionLabel(state.currentSessionTitle, state.currentSessionId),
+          history: session.history,
+          current: true,
+        });
+        return true;
+      }
+
+      const targetSession = resolveSessionSelector(sessionSelector, state);
+      const storedSession = await loadSession(targetSession.id);
+      renderHistory(ui, {
+        label: formatSessionLabel(storedSession.title, storedSession.id),
+        history: storedSession.history,
+        current: storedSession.id === state.currentSessionId,
+      });
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to load history.");
+    }
     return true;
   }
 
@@ -624,6 +649,47 @@ function renderSessionList(
   }
 }
 
+function renderHistory(
+  ui: TerminalUI | null,
+  options: {
+    label: string;
+    history: AgentSession["history"];
+    current: boolean;
+  },
+): void {
+  if (ui) {
+    ui.renderSectionTitle("History");
+  } else {
+    console.log("History");
+  }
+
+  renderInfo(ui, `Session: ${options.label}`);
+  renderInfo(ui, `Messages: ${options.history.length}`);
+  if (options.current) {
+    renderInfo(ui, "Viewing the current conversation.");
+  }
+
+  if (options.history.length === 0) {
+    renderInfo(ui, "No messages yet.");
+    return;
+  }
+
+  writeBodyLine(ui, "");
+
+  for (const [index, message] of options.history.entries()) {
+    const speaker = message.role === "user" ? "You" : "Assistant";
+    writeBodyLine(ui, `${index + 1}. ${speaker}`);
+
+    for (const line of message.content.split(/\r?\n/)) {
+      writeBodyLine(ui, `   ${line}`);
+    }
+
+    if (index < options.history.length - 1) {
+      writeBodyLine(ui, "");
+    }
+  }
+}
+
 function renderSystemPromptTips(
   ui: TerminalUI | null,
   currentPrompt: string,
@@ -738,6 +804,15 @@ function renderError(ui: TerminalUI | null, message: string): void {
   }
 
   console.error(`error: ${message}`);
+}
+
+function writeBodyLine(ui: TerminalUI | null, message: string): void {
+  if (ui) {
+    output.write(`${message}\n`);
+    return;
+  }
+
+  console.log(message);
 }
 
 function summarizePrompt(prompt: string): string {

@@ -116,7 +116,7 @@ test("CLI handles local slash commands and rejects unknown slash commands withou
 
     assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
     assert.equal(server.requests.length, 0);
-    assert.match(stdout, /Commands: \/help \/settings \/session \/sessions \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
+    assert.match(stdout, /Commands: \/help \/settings \/session \/history \[id\|index\|title\] \/sessions \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
     assert.match(stderr, /error: Unknown command: \/sessiojn\. Type \/help\./);
   } finally {
     await server.close();
@@ -368,6 +368,122 @@ test("CLI can rename sessions, show previews, and switch by list index", async (
 
     const indexContent = await readFile(indexPath, "utf8");
     assert.doesNotMatch(indexContent, new RegExp(adaSessionId));
+  } finally {
+    await secondServer.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI can show current and selected session history without calling the model again", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+  const cliPath = path.resolve("src/index.ts");
+  const firstServer = await startMockOpenAIServer([
+    "Hello Ada.",
+    "Hello Grace.",
+  ]);
+
+  try {
+    const firstChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: firstServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let firstStderr = "";
+    firstChild.stderr.setEncoding("utf8");
+    firstChild.stderr.on("data", (chunk: string) => {
+      firstStderr += chunk;
+    });
+
+    firstChild.stdin.write("My name is Ada.\n");
+    firstChild.stdin.write("/new\n");
+    firstChild.stdin.write("My name is Grace.\n");
+    firstChild.stdin.end("/exit\n");
+
+    const [firstExitCode] = (await once(firstChild, "close")) as [number | null];
+    assert.equal(firstExitCode, 0, firstStderr || "CLI exited with a non-zero code.");
+  } finally {
+    await firstServer.close();
+  }
+
+  const sessionFiles = await readdir(path.join(tempDir, "sessions"));
+  const storedSessionIds = sessionFiles
+    .filter((name) => name.endsWith(".json") && name !== "index.json")
+    .map((name) => name.replace(/\.json$/, ""));
+
+  let adaSessionId = "";
+
+  for (const sessionId of storedSessionIds) {
+    const content = await readFile(
+      path.join(tempDir, "sessions", `${sessionId}.json`),
+      "utf8",
+    );
+    if (content.includes("My name is Ada.")) {
+      adaSessionId = sessionId;
+      break;
+    }
+  }
+
+  assert.ok(adaSessionId, "Expected to find a saved session containing Ada.");
+
+  const secondServer = await startMockOpenAIServer([]);
+
+  try {
+    const secondChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: secondServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    secondChild.stdout.setEncoding("utf8");
+    secondChild.stderr.setEncoding("utf8");
+    secondChild.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    secondChild.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    secondChild.stdin.write("/history\n");
+    secondChild.stdin.write("/history 2\n");
+    secondChild.stdin.end("exit()\n");
+
+    const [secondExitCode] = (await once(secondChild, "close")) as [number | null];
+
+    assert.equal(secondExitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(secondServer.requests.length, 0);
+    assert.match(stdout, /History\r?\nSession: My name is Grace\./);
+    assert.match(stdout, /Viewing the current conversation\./);
+    assert.match(stdout, /1\. You\r?\n   My name is Grace\./);
+    assert.match(stdout, /2\. Assistant\r?\n   Hello Grace\./);
+    assert.match(stdout, new RegExp(`History\\r?\\nSession: My name is Ada\\. \\[${adaSessionId}\\]`));
+    assert.match(stdout, /1\. You\r?\n   My name is Ada\./);
+    assert.match(stdout, /2\. Assistant\r?\n   Hello Ada\./);
   } finally {
     await secondServer.close();
     await rm(tempDir, { recursive: true, force: true });

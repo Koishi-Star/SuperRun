@@ -21,7 +21,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.bold.hex("#ff6b35")("SuperRun")}\n`);
       output.write(`${chalk.dim("Local coding agent interactive mode")}\n`);
       output.write(
-        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
+        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/history")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
       );
     },
     renderCommands: () => {
@@ -29,6 +29,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.cyan("/help")}  Show command help\n`);
       output.write(`${chalk.cyan("/settings")} Show the active system prompt and persistence path\n`);
       output.write(`${chalk.cyan("/session")}  Show current session status\n`);
+      output.write(`${chalk.cyan("/history")}  Show the current or selected session transcript\n`);
       output.write(`${chalk.cyan("/sessions")} List saved sessions\n`);
       output.write(`${chalk.cyan("/new")}      Create and switch to a fresh session\n`);
       output.write(`${chalk.cyan("/switch")}   Switch to a saved session by id, title, or list index\n`);
