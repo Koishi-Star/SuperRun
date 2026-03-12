@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
+import { emitKeypressEvents, type Key } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import type { Interface } from "node:readline/promises";
 import { Command } from "commander";
@@ -26,6 +27,11 @@ import {
   type SessionStoreState,
   type StoredSession,
 } from "./session/store.js";
+import {
+  createSessionPickerState,
+  getSessionPickerViewModel,
+  moveSessionPicker,
+} from "./ui/session-picker.js";
 import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
 export const program = new Command();
@@ -128,9 +134,7 @@ async function runInteractiveSession(
   const ui = input.isTTY && output.isTTY ? createTerminalUI(output) : null;
 
   if (ui) {
-    ui.renderWelcome();
-    renderSessionPromptHint(ui, session, state.settings);
-    renderSessionStoreHint(ui, state);
+    renderInteractiveShell(ui, session, state);
   } else {
     console.log('Interactive mode. Type "/exit" to quit.');
     renderSessionPromptHint(ui, session, state.settings);
@@ -228,6 +232,30 @@ async function handleInteractivePrompt(
   }
 
   if (prompt === "/sessions") {
+    if (ui) {
+      const selectedSession = await runSessionPicker(ui, state);
+
+      try {
+        if (selectedSession) {
+          const storedSession = await loadSession(selectedSession.id);
+          restoreStoredSession(session, storedSession);
+          state.currentSessionId = storedSession.id;
+          state.currentSessionTitle = storedSession.title;
+          state.sessionStore = await setActiveSession(storedSession.id);
+          renderInteractiveShell(ui, session, state);
+          renderSessionSwitched(ui, storedSession);
+          return true;
+        }
+
+        renderInteractiveShell(ui, session, state);
+        return true;
+      } catch (error) {
+        renderInteractiveShell(ui, session, state);
+        renderError(ui, error instanceof Error ? error.message : "Failed to switch session.");
+        return true;
+      }
+    }
+
     renderSessionList(ui, state);
     return true;
   }
@@ -345,10 +373,7 @@ async function handleInteractivePrompt(
 
   if (prompt === "/clear") {
     if (ui) {
-      ui.clearScreen();
-      ui.renderWelcome();
-      renderSessionPromptHint(ui, session, state.settings);
-      renderSessionStoreHint(ui, state);
+      renderInteractiveShell(ui, session, state);
     }
     return true;
   }
@@ -500,6 +525,17 @@ function resetCurrentSession(
   session.history = [];
 }
 
+function renderInteractiveShell(
+  ui: TerminalUI,
+  session: AgentSession,
+  state: InteractiveState,
+): void {
+  ui.clearScreen();
+  ui.renderWelcome();
+  renderSessionPromptHint(ui, session, state.settings);
+  renderSessionStoreHint(ui, state);
+}
+
 function renderSessionPromptHint(
   ui: TerminalUI | null,
   session: AgentSession,
@@ -532,7 +568,7 @@ function renderSessionStoreHint(
       ui,
       `Current session: ${formatSessionLabel(state.currentSessionTitle, currentSessionId)}. Saved sessions: ${state.sessionStore.sessions.length}.`,
     );
-  renderInfo(ui, 'Use "/sessions" to list them, "/switch <index>" to jump, or "/new" to start fresh.');
+    renderInfo(ui, 'Use "/sessions" to browse saved work, or "/new" to start fresh.');
     if (ui) {
       output.write("\n");
     }
@@ -551,7 +587,7 @@ function renderSessionStoreHint(
     ui,
     `Saved sessions: ${state.sessionStore.sessions.length}. Active session is not loaded.`,
   );
-  renderInfo(ui, 'Use "/sessions" to list them or "/switch <index>" to load one.');
+  renderInfo(ui, 'Use "/sessions" to browse them or "/switch <index>" to load one.');
   if (ui) {
     output.write("\n");
   }
@@ -947,4 +983,99 @@ function resolveSessionSelector(
   }
 
   return sessionSummary;
+}
+
+async function runSessionPicker(
+  ui: TerminalUI,
+  state: InteractiveState,
+): Promise<SessionSummary | null> {
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    return null;
+  }
+
+  emitKeypressEvents(input);
+
+  let pickerState = createSessionPickerState();
+  const previousRawMode = input.isRaw === true;
+
+  ui.clearScreen();
+  ui.renderSessionPicker(
+    getSessionPickerViewModel(
+      state.sessionStore.sessions,
+      state.currentSessionId,
+      pickerState,
+    ),
+  );
+
+  return new Promise((resolve) => {
+    const finish = (result: SessionSummary | null) => {
+      input.off("keypress", onKeypress);
+      if (!previousRawMode) {
+        input.setRawMode(false);
+      }
+      resolve(result);
+    };
+
+    const onKeypress = (_value: string, key: Key) => {
+      const direction = getSessionPickerDirection(key);
+      if (direction) {
+        pickerState = moveSessionPicker(
+          pickerState,
+          state.sessionStore.sessions,
+          direction,
+        );
+        ui.clearScreen();
+        ui.renderSessionPicker(
+          getSessionPickerViewModel(
+            state.sessionStore.sessions,
+            state.currentSessionId,
+            pickerState,
+          ),
+        );
+        return;
+      }
+
+      if (key.name === "return") {
+        const viewModel = getSessionPickerViewModel(
+          state.sessionStore.sessions,
+          state.currentSessionId,
+          pickerState,
+        );
+        const selectedOption = viewModel.options[pickerState.selectedIndex];
+        finish(selectedOption?.kind === "session" ? selectedOption.session : null);
+        return;
+      }
+
+      if (key.name === "escape" || key.name === "q" || (key.ctrl && key.name === "c")) {
+        finish(null);
+      }
+    };
+
+    input.on("keypress", onKeypress);
+    if (!previousRawMode) {
+      input.setRawMode(true);
+    }
+  });
+}
+
+function getSessionPickerDirection(
+  key: Key,
+): "up" | "down" | "left" | "right" | null {
+  if (key.name === "up") {
+    return "up";
+  }
+
+  if (key.name === "down") {
+    return "down";
+  }
+
+  if (key.name === "left") {
+    return "left";
+  }
+
+  if (key.name === "right") {
+    return "right";
+  }
+
+  return null;
 }
