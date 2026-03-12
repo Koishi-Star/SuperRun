@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
-import { emitKeypressEvents, type Key } from "node:readline";
+import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import type { Interface } from "node:readline/promises";
 import { Command } from "commander";
@@ -27,11 +27,7 @@ import {
   type SessionStoreState,
   type StoredSession,
 } from "./session/store.js";
-import {
-  createSessionPickerState,
-  getSessionPickerViewModel,
-  moveSessionPicker,
-} from "./ui/session-picker.js";
+import { runSessionPickerInteraction } from "./ui/session-picker-controller.js";
 import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
 export const program = new Command();
@@ -994,88 +990,10 @@ async function runSessionPicker(
   }
 
   emitKeypressEvents(input);
-
-  let pickerState = createSessionPickerState();
-  const previousRawMode = input.isRaw === true;
-
-  ui.clearScreen();
-  ui.renderSessionPicker(
-    getSessionPickerViewModel(
-      state.sessionStore.sessions,
-      state.currentSessionId,
-      pickerState,
-    ),
-  );
-
-  return new Promise((resolve) => {
-    const finish = (result: SessionSummary | null) => {
-      input.off("keypress", onKeypress);
-      if (!previousRawMode) {
-        input.setRawMode(false);
-      }
-      resolve(result);
-    };
-
-    const onKeypress = (_value: string, key: Key) => {
-      const direction = getSessionPickerDirection(key);
-      if (direction) {
-        pickerState = moveSessionPicker(
-          pickerState,
-          state.sessionStore.sessions,
-          direction,
-        );
-        ui.clearScreen();
-        ui.renderSessionPicker(
-          getSessionPickerViewModel(
-            state.sessionStore.sessions,
-            state.currentSessionId,
-            pickerState,
-          ),
-        );
-        return;
-      }
-
-      if (key.name === "return") {
-        const viewModel = getSessionPickerViewModel(
-          state.sessionStore.sessions,
-          state.currentSessionId,
-          pickerState,
-        );
-        const selectedOption = viewModel.options[pickerState.selectedIndex];
-        finish(selectedOption?.kind === "session" ? selectedOption.session : null);
-        return;
-      }
-
-      if (key.name === "escape" || key.name === "q" || (key.ctrl && key.name === "c")) {
-        finish(null);
-      }
-    };
-
-    input.on("keypress", onKeypress);
-    if (!previousRawMode) {
-      input.setRawMode(true);
-    }
+  return runSessionPickerInteraction({
+    ui,
+    input,
+    sessions: state.sessionStore.sessions,
+    currentSessionId: state.currentSessionId,
   });
-}
-
-function getSessionPickerDirection(
-  key: Key,
-): "up" | "down" | "left" | "right" | null {
-  if (key.name === "up") {
-    return "up";
-  }
-
-  if (key.name === "down") {
-    return "down";
-  }
-
-  if (key.name === "left") {
-    return "left";
-  }
-
-  if (key.name === "right") {
-    return "right";
-  }
-
-  return null;
 }

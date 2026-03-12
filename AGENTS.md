@@ -22,11 +22,11 @@
 - `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
 - `src/session/store.ts` persists multiple saved sessions, tracks the active session, derives session titles and previews, and restores sessions across CLI runs.
 - `src/ui/tui.ts` contains the lightweight terminal UI helpers used in TTY interactive sessions, including command help, the `/sessions` picker, and history workflows.
-- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
+- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, session picker interaction, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, a narrow TTY `/sessions` picker, lightweight TTY UI, and focused tests for the current slice.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, a narrow TTY `/sessions` picker, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage.
 - Not done yet: search/filter for larger session lists, richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, multi-provider routing, and tool execution.
 - Current maturity: the chat loop is solid for local experiments and saved-session workflows, but the agent still behaves like a chat-first CLI rather than a full coding agent with tools.
 
