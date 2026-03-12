@@ -1,7 +1,7 @@
-import { homedir } from "node:os";
 import path from "node:path";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
+import { getConfigFilePath } from "./paths.js";
 
 type PersistedSettings = {
   systemPrompt?: unknown;
@@ -87,29 +87,7 @@ export async function resetSystemPrompt(): Promise<SuperRunSettings> {
 }
 
 function getSettingsFilePath(): string {
-  const overrideDir = process.env.SUPERRUN_CONFIG_DIR?.trim();
-  if (overrideDir) {
-    return path.join(overrideDir, "settings.json");
-  }
-
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA?.trim();
-    if (appData) {
-      return path.join(appData, "SuperRun", "settings.json");
-    }
-  }
-
-  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim();
-  if (xdgConfigHome) {
-    return path.join(xdgConfigHome, "superrun", "settings.json");
-  }
-
-  const home = homedir().trim();
-  if (!home) {
-    throw new Error("Unable to determine the home directory for settings.");
-  }
-
-  return path.join(home, ".config", "superrun", "settings.json");
+  return getConfigFilePath("settings.json");
 }
 
 function isMissingFileError(error: unknown): error is NodeJS.ErrnoException {

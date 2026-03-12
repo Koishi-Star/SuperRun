@@ -4,7 +4,9 @@ import { createInterface } from "node:readline/promises";
 import type { Interface } from "node:readline/promises";
 import { Command } from "commander";
 import {
+  type AgentSession,
   createAgentSession,
+  getAgentSessionStats,
   runAgentTurn,
 } from "./agent/loop.js";
 import {
@@ -13,6 +15,13 @@ import {
   saveSystemPrompt,
   type SuperRunSettings,
 } from "./config/settings.js";
+import {
+  clearSavedSession,
+  loadSavedSession,
+  saveSession,
+  type SavedSession,
+  type SavedSessionState,
+} from "./session/store.js";
 import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
 export const program = new Command();
@@ -24,6 +33,7 @@ program
   .action(async (prompt?: string) => {
     try {
       const settings = await loadSettings();
+      const savedSessionState = await loadSavedSession();
       const session = createAgentSession({
         systemPrompt: settings.systemPrompt,
       });
@@ -34,7 +44,7 @@ program
         return;
       }
 
-      await runInteractiveSession(session, settings);
+      await runInteractiveSession(session, settings, savedSessionState);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown error";
@@ -45,6 +55,8 @@ program
 
 type InteractiveState = {
   settings: SuperRunSettings;
+  savedSession: SavedSession | null;
+  savedSessionFilePath: string;
   pendingSystemPromptLines: string[] | null;
 };
 
@@ -71,10 +83,13 @@ async function runSingleTurn(
 async function runInteractiveSession(
   session: ReturnType<typeof createAgentSession>,
   settings: SuperRunSettings,
+  savedSessionState: SavedSessionState,
 ): Promise<void> {
   const rl = createInterface({ input, output });
   const state: InteractiveState = {
     settings,
+    savedSession: savedSessionState.session,
+    savedSessionFilePath: savedSessionState.filePath,
     pendingSystemPromptLines: null,
   };
   // Keep piped/non-interactive usage plain, but enable a richer prompt in a real terminal.
@@ -82,10 +97,12 @@ async function runInteractiveSession(
 
   if (ui) {
     ui.renderWelcome();
-    renderSessionPromptHint(ui, state.settings);
+    renderSessionPromptHint(ui, session, state.settings);
+    renderSavedSessionHint(ui, state.savedSession);
   } else {
     console.log('Interactive mode. Type "/exit" to quit.');
-    renderSessionPromptHint(ui, state.settings);
+    renderSessionPromptHint(ui, session, state.settings);
+    renderSavedSessionHint(ui, state.savedSession);
   }
 
   try {
@@ -139,13 +156,36 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /settings /system /system reset /clear /exit");
+      console.log("Commands: /help /settings /session /resume /forget /system /system reset /clear /exit");
     }
     return true;
   }
 
   if (prompt === "/settings") {
-    renderSettingsSummary(ui, state.settings);
+    renderSettingsSummary(ui, session, state.settings);
+    return true;
+  }
+
+  if (prompt === "/session") {
+    renderSessionSummary(ui, session, state);
+    return true;
+  }
+
+  if (prompt === "/resume") {
+    if (!state.savedSession) {
+      renderInfo(ui, "No saved session is available to resume.");
+      return true;
+    }
+
+    restoreSavedSession(session, state.savedSession);
+    renderSessionResumed(ui, state.savedSession);
+    return true;
+  }
+
+  if (prompt === "/forget") {
+    applySystemPrompt(session, state.settings.systemPrompt);
+    await clearSavedSessionState(state);
+    renderSessionForgotten(ui, state.settings.systemPrompt, state.savedSessionFilePath);
     return true;
   }
 
@@ -158,7 +198,8 @@ async function handleInteractivePrompt(
     const settings = await resetSystemPrompt();
     applySystemPrompt(session, settings.systemPrompt);
     state.settings = settings;
-    renderSystemPromptApplied(ui, settings, true);
+    await clearSavedSessionState(state);
+    renderSystemPromptApplied(ui, session, settings, true);
     return true;
   }
 
@@ -166,7 +207,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.clearScreen();
       ui.renderWelcome();
-      renderSessionPromptHint(ui, state.settings);
+      renderSessionPromptHint(ui, session, state.settings);
     }
     return true;
   }
@@ -182,6 +223,8 @@ async function handleInteractivePrompt(
       process.stdout.write(chunk);
     },
   });
+
+  await persistCurrentSession(session, state);
 
   if (!reply) {
     process.stdout.write("(empty response)");
@@ -241,7 +284,8 @@ async function handlePipedSystemPromptLine(
     applySystemPrompt(session, settings.systemPrompt);
     state.settings = settings;
     state.pendingSystemPromptLines = null;
-    renderSystemPromptApplied(ui, settings, true);
+    await clearSavedSessionState(state);
+    renderSystemPromptApplied(ui, session, settings, true);
     return true;
   }
 
@@ -270,7 +314,8 @@ async function runSystemPromptEditor(
   const settings = await saveSystemPrompt(nextPrompt);
   applySystemPrompt(session, settings.systemPrompt);
   state.settings = settings;
-  renderSystemPromptApplied(ui, settings, true);
+  await clearSavedSessionState(state);
+  renderSystemPromptApplied(ui, session, settings, true);
 }
 
 async function readMultilineSystemPrompt(
@@ -312,12 +357,18 @@ function applySystemPrompt(
 
 function renderSessionPromptHint(
   ui: TerminalUI | null,
+  session: ReturnType<typeof createAgentSession>,
   settings: Pick<SuperRunSettings, "systemPrompt" | "hasStoredSystemPrompt">,
 ): void {
+  const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
   renderInfo(
     ui,
     `Active behavior (${source}): ${summarizePrompt(settings.systemPrompt)}`,
+  );
+  renderInfo(
+    ui,
+    `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
   renderInfo(ui, 'Use "/system" to change it. Saving a new prompt resets the current conversation.');
   if (ui) {
@@ -325,10 +376,38 @@ function renderSessionPromptHint(
   }
 }
 
+function renderSavedSessionHint(
+  ui: TerminalUI | null,
+  savedSession: SavedSession | null,
+): void {
+  if (!savedSession) {
+    return;
+  }
+
+  const stats = getAgentSessionStats(
+    createAgentSession({
+      systemPrompt: savedSession.systemPrompt,
+      history: savedSession.history,
+      maxHistoryTurns: savedSession.maxHistoryTurns,
+    }),
+  );
+
+  renderInfo(
+    ui,
+    `Saved session available: ${stats.historyTurnCount} turns, ${stats.historyCharCount} chars, updated ${savedSession.updatedAt}.`,
+  );
+  renderInfo(ui, 'Use "/resume" to restore it or "/forget" to discard it.');
+  if (ui) {
+    output.write("\n");
+  }
+}
+
 function renderSettingsSummary(
   ui: TerminalUI | null,
+  session: ReturnType<typeof createAgentSession>,
   settings: SuperRunSettings,
 ): void {
+  const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
 
   if (ui) {
@@ -339,6 +418,15 @@ function renderSettingsSummary(
 
   renderInfo(ui, `Source: ${source}`);
   renderInfo(ui, `Path: ${settings.filePath}`);
+  renderInfo(
+    ui,
+    `History policy: keep the most recent ${stats.maxHistoryTurns} turns.`,
+  );
+  renderInfo(
+    ui,
+    `Current history: ${stats.historyTurnCount} turns, ${stats.historyMessageCount} messages, ${stats.historyCharCount} chars.`,
+  );
+  renderInfo(ui, `System prompt size: ${stats.systemPromptCharCount} chars.`);
   renderInfo(ui, "This text defines how the agent should behave on every turn.");
   renderInfo(ui, "Changing it persists the new behavior for future runs and clears the current conversation.");
 
@@ -348,6 +436,54 @@ function renderSettingsSummary(
   } else {
     process.stdout.write(body);
   }
+}
+
+function renderSessionSummary(
+  ui: TerminalUI | null,
+  session: AgentSession,
+  state: InteractiveState,
+): void {
+  const currentStats = getAgentSessionStats(session);
+  const savedSession = state.savedSession;
+
+  if (ui) {
+    ui.renderSectionTitle("Session");
+  } else {
+    console.log("Session");
+  }
+
+  renderInfo(
+    ui,
+    `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
+  );
+  renderInfo(
+    ui,
+    `Current behavior: ${summarizePrompt(session.systemPrompt)}`,
+  );
+  renderInfo(
+    ui,
+    `Saved session path: ${state.savedSessionFilePath}`,
+  );
+
+  if (!savedSession) {
+    renderInfo(ui, "Saved session: none.");
+    return;
+  }
+
+  const savedStats = getAgentSessionStats(
+    createAgentSession({
+      systemPrompt: savedSession.systemPrompt,
+      history: savedSession.history,
+      maxHistoryTurns: savedSession.maxHistoryTurns,
+    }),
+  );
+
+  renderInfo(
+    ui,
+    `Saved session: ${savedStats.historyTurnCount} turns, ${savedStats.historyMessageCount} messages, ${savedStats.historyCharCount} chars.`,
+  );
+  renderInfo(ui, `Saved session updated: ${savedSession.updatedAt}`);
+  renderInfo(ui, `Saved behavior: ${summarizePrompt(savedSession.systemPrompt)}`);
 }
 
 function renderSystemPromptTips(
@@ -368,14 +504,56 @@ function renderSystemPromptTips(
 
 function renderSystemPromptApplied(
   ui: TerminalUI | null,
+  session: ReturnType<typeof createAgentSession>,
   settings: SuperRunSettings,
   historyCleared: boolean,
 ): void {
+  const stats = getAgentSessionStats(session);
   renderInfo(ui, `Saved system prompt to ${settings.filePath}`);
   if (historyCleared) {
     renderInfo(ui, "Conversation history cleared so the new behavior starts cleanly.");
   }
+  renderInfo(
+    ui,
+    `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+  );
   renderInfo(ui, `This agent will now behave as: ${summarizePrompt(settings.systemPrompt)}`);
+}
+
+function renderSessionResumed(
+  ui: TerminalUI | null,
+  savedSession: SavedSession,
+): void {
+  const stats = getAgentSessionStats(
+    createAgentSession({
+      systemPrompt: savedSession.systemPrompt,
+      history: savedSession.history,
+      maxHistoryTurns: savedSession.maxHistoryTurns,
+    }),
+  );
+
+  renderInfo(
+    ui,
+    `Resumed saved session from ${savedSession.updatedAt}.`,
+  );
+  renderInfo(
+    ui,
+    `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+  );
+  renderInfo(
+    ui,
+    `This agent will now behave as: ${summarizePrompt(savedSession.systemPrompt)}`,
+  );
+}
+
+function renderSessionForgotten(
+  ui: TerminalUI | null,
+  systemPrompt: string,
+  filePath: string,
+): void {
+  renderInfo(ui, `Removed saved session at ${filePath}`);
+  renderInfo(ui, "Current conversation cleared.");
+  renderInfo(ui, `This agent will now behave as: ${summarizePrompt(systemPrompt)}`);
 }
 
 function renderInfo(ui: TerminalUI | null, message: string): void {
@@ -403,4 +581,35 @@ function summarizePrompt(prompt: string): string {
   }
 
   return `${singleLine.slice(0, 93)}...`;
+}
+
+function restoreSavedSession(
+  session: AgentSession,
+  savedSession: SavedSession,
+): void {
+  session.systemPrompt = savedSession.systemPrompt;
+  session.history = [...savedSession.history];
+  session.maxHistoryTurns = savedSession.maxHistoryTurns;
+}
+
+async function persistCurrentSession(
+  session: AgentSession,
+  state: InteractiveState,
+): Promise<void> {
+  if (session.history.length === 0) {
+    return;
+  }
+
+  state.savedSession = await saveSession({
+    systemPrompt: session.systemPrompt,
+    history: session.history,
+    maxHistoryTurns: session.maxHistoryTurns,
+  });
+}
+
+async function clearSavedSessionState(
+  state: InteractiveState,
+): Promise<void> {
+  state.savedSessionFilePath = await clearSavedSession();
+  state.savedSession = null;
 }

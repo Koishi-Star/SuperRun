@@ -11,13 +11,16 @@ What works today:
 - interactive multi-turn chat
 - streaming assistant output
 - OpenAI-compatible chat completion provider
+- persistent system prompt profiles managed from the interactive UI
+- persistence for the most recent interactive session, with manual resume/forget controls
+- simple history truncation that keeps the most recent 10 turns
+- simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
 - focused tests for env parsing, agent history, and CLI interaction
 
 What does not exist yet:
 
 - tool calling
-- session persistence across runs
 - multiple providers
 - advanced TUI
 
@@ -29,7 +32,7 @@ The base prompt is defined centrally in [`src/prompts/system.ts`](./src/prompts/
 The current request shape is:
 
 1. a base `system` prompt
-2. prior `user` and `assistant` turns from the current session
+2. prior `user` and `assistant` turns from the current session, truncated to the most recent 10 turns
 3. the current `user` prompt
 
 That is the correct structure for the current stage.
@@ -105,11 +108,35 @@ node dist/index.js
 In interactive mode, these local commands are supported:
 
 - `/help`
+- `/settings`
+- `/session`
+- `/resume`
+- `/forget`
+- `/system`
+- `/system reset`
 - `/clear`
 - `/exit`
 
-The current session history lives in memory only.
-Once the process exits, the conversation is gone.
+The current conversation is now saved as a single local session snapshot.
+Starting a new CLI run does not auto-resume it, but the CLI will tell you when a saved session is available.
+
+The system prompt is different:
+
+- it can be changed at runtime from the interactive UI
+- it is persisted across runs in a local settings file
+- changing it clears the current conversation so the new behavior starts cleanly
+
+The saved session behaves like this:
+
+- only the most recent saved session is kept
+- `/resume` restores it into the current conversation
+- `/forget` deletes it and clears the current conversation
+- changing the system prompt also deletes the saved session snapshot so stale history is not resumed later
+
+The current session metadata uses simple stats:
+
+- history turns kept: 10
+- history size: counted by characters, not tokens
 
 ## PowerShell Examples
 
@@ -152,7 +179,9 @@ npm test
 ## Project Structure
 
 - `src/cli.ts`: CLI entry behavior, single-turn mode, interactive mode, TUI wiring
-- `src/agent/loop.ts`: session state, message history, prompt assembly
+- `src/agent/loop.ts`: session state, prompt assembly, history truncation, and session stats
+- `src/config/settings.ts`: persisted system prompt settings
+- `src/session/store.ts`: persisted session snapshot storage
 - `src/prompts/system.ts`: central base system prompt definition
 - `src/llm/types.ts`: shared message and client types
 - `src/llm/router.ts`: current provider routing
@@ -163,9 +192,8 @@ npm test
 
 ## Near-Term Priorities
 
-- improve the base system prompt and make it easier to override
-- add lightweight history truncation
-- decide whether sessions should be optionally persisted
+- improve the base system prompt itself and make profiles easier to manage
+- decide whether single-session persistence should stay manual or become auto-resume
 - expand the TUI carefully without introducing heavy dependencies
 - add tools only after chat behavior is stable
 
