@@ -32,7 +32,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.cyan("/settings")} Show the active system prompt and persistence path\n`);
       output.write(`${chalk.cyan("/session")}  Show current session status\n`);
       output.write(`${chalk.cyan("/history")}  Show the current or selected session transcript\n`);
-      output.write(`${chalk.cyan("/sessions")} Open the saved-session picker\n`);
+      output.write(`${chalk.cyan("/sessions")} Open the saved-session picker, optionally filtered by text\n`);
       output.write(`${chalk.cyan("/new")}      Create and switch to a fresh session\n`);
       output.write(`${chalk.cyan("/switch")}   Switch to a saved session by id, title, or list index\n`);
       output.write(`${chalk.cyan("/rename")}   Rename the current saved session\n`);
@@ -66,8 +66,25 @@ export function createTerminalUI(output: Writable): TerminalUI {
         divider,
       ];
 
+      if (viewModel.filterQuery) {
+        lines.push(
+          formatFrameTextLine(
+            width,
+            `Filter: "${viewModel.filterQuery}" (${viewModel.resultCount} match${viewModel.resultCount === 1 ? "" : "es"})`,
+          ),
+        );
+        lines.push(divider);
+      }
+
       if (viewModel.options.length === 1 && viewModel.options[0]?.kind === "exit") {
-        lines.push(formatFrameTextLine(width, "No saved sessions yet."));
+        lines.push(
+          formatFrameTextLine(
+            width,
+            viewModel.filterQuery
+              ? `No saved sessions match "${viewModel.filterQuery}".`
+              : "No saved sessions yet.",
+          ),
+        );
         lines.push(formatFrameTextLine(width, ""));
       }
 

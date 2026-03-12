@@ -11,7 +11,7 @@
 - Runtime: Node.js + TypeScript + ESM.
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `superrun [prompt]`.
-- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings, history browsing, and session management.
+- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings, history browsing, filtered session browsing, and session management.
 - `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, and per-turn model calls.
 - `src/prompts/system.ts` centralizes the base system prompt used for each session.
 - `src/config/settings.ts` persists the default system prompt profile used across runs.
@@ -26,8 +26,8 @@
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, a narrow TTY `/sessions` picker, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage.
-- Not done yet: search/filter for larger session lists, richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, multi-provider routing, and tool execution.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a narrow TTY `/sessions` picker, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage.
+- Not done yet: richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, multi-provider routing, and tool execution.
 - Current maturity: the chat loop is solid for local experiments and saved-session workflows, but the agent still behaves like a chat-first CLI rather than a full coding agent with tools.
 
 ## Working rules
@@ -51,10 +51,9 @@
 ## Priorities for upcoming work
 
 1. Expand the lightweight TUI carefully beyond the current `/sessions` picker with clearer saved-session actions, transient status states, and better error surfacing.
-2. Refine the session metadata model for larger saved-session lists: search/filter, better previews, and predictable sorting as the list grows.
-3. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
-4. Add router-level coverage once a second provider or selection rule exists.
-5. Only after chat/session behavior is stable, introduce a narrow tool interface for local command execution or file operations.
+2. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
+3. Add router-level coverage once a second provider or selection rule exists.
+4. Only after chat/session behavior is stable, introduce a narrow tool interface for local command execution or file operations.
 
 ## Implementation preferences
 
@@ -74,6 +73,6 @@
 - The placeholder assistant output in `src/cli.ts` has already been replaced by a real model call.
 - Multi-turn chat and centralized system prompt assembly are already in place.
 - Saved multi-session workflows are already in place, including active-session restore between runs.
-- Session titles, previews, rename, and history inspection are already in place for the current saved-session UX slice.
+- Session titles, previews, rename, history inspection, and `/sessions [query]` filtering are already in place for the current saved-session UX slice.
 - System prompt overrides are already persisted locally and reset the current conversation when changed.
 - The project now has a small `node:test` suite executed via `npm test`.

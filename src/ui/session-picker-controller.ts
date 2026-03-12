@@ -25,12 +25,14 @@ export async function runSessionPickerInteraction(options: {
   input: SessionPickerInput;
   sessions: SessionSummary[];
   currentSessionId: string | null;
+  filterQuery?: string | null | undefined;
 }): Promise<SessionSummary | null> {
   const {
     ui,
     input,
     sessions,
     currentSessionId,
+    filterQuery,
   } = options;
   let pickerState = createSessionPickerState();
   const previousRawMode = input.isRaw === true;
@@ -59,6 +61,7 @@ export async function runSessionPickerInteraction(options: {
           sessions,
           currentSessionId,
           pickerState,
+          { filterQuery },
         );
         const selectedOption = viewModel.options[pickerState.selectedIndex];
         finish(selectedOption?.kind === "session" ? selectedOption.session : null);
@@ -83,6 +86,7 @@ export async function runSessionPickerInteraction(options: {
         sessions,
         currentSessionId,
         pickerState,
+        { filterQuery },
       ),
     );
   }

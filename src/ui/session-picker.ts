@@ -26,6 +26,8 @@ export type SessionPickerViewModel = {
   pageIndex: number;
   totalPages: number;
   selectedIndex: number;
+  filterQuery: string | null;
+  resultCount: number;
   options: SessionPickerOption[];
 };
 
@@ -40,16 +42,19 @@ export function getSessionPickerViewModel(
   sessions: SessionSummary[],
   currentSessionId: string | null,
   state: SessionPickerState,
+  viewOptions?: {
+    filterQuery?: string | null | undefined;
+  },
 ): SessionPickerViewModel {
   const normalizedState = normalizeSessionPickerState(state, sessions);
   const pageSessions = getPageSessions(sessions, normalizedState.pageIndex);
-  const options: SessionPickerOption[] = pageSessions.map((session, index) => ({
+  const pickerOptions: SessionPickerOption[] = pageSessions.map((session, index) => ({
     kind: "session",
     session,
     globalIndex: normalizedState.pageIndex * SESSION_PICKER_PAGE_SIZE + index + 1,
     isCurrent: session.id === currentSessionId,
   }));
-  options.push({
+  pickerOptions.push({
     kind: "exit",
     label: SESSION_PICKER_EXIT_LABEL,
   });
@@ -58,7 +63,9 @@ export function getSessionPickerViewModel(
     pageIndex: normalizedState.pageIndex,
     totalPages: getTotalPages(sessions),
     selectedIndex: normalizedState.selectedIndex,
-    options,
+    filterQuery: normalizeFilterQuery(viewOptions?.filterQuery),
+    resultCount: sessions.length,
+    options: pickerOptions,
   };
 }
 
@@ -168,4 +175,9 @@ function getPageOptionCount(
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
+}
+
+function normalizeFilterQuery(value: string | null | undefined): string | null {
+  const normalized = value?.trim() ?? "";
+  return normalized ? normalized : null;
 }

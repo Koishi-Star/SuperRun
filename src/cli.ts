@@ -187,7 +187,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /settings /session /history [id|index|title] /sessions /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
+      console.log("Commands: /help /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
     }
     return true;
   }
@@ -227,9 +227,18 @@ async function handleInteractivePrompt(
     return true;
   }
 
-  if (prompt === "/sessions") {
+  if (matchesCommand(prompt, "/sessions")) {
+    const filterQuery = parseCommandArgument(prompt, "/sessions");
+    const filteredSessions = filterSessionSummaries(
+      state.sessionStore.sessions,
+      filterQuery,
+    );
+
     if (ui) {
-      const selectedSession = await runSessionPicker(ui, state);
+      const selectedSession = await runSessionPicker(ui, state, {
+        sessions: filteredSessions,
+        filterQuery,
+      });
 
       try {
         if (selectedSession) {
@@ -252,7 +261,10 @@ async function handleInteractivePrompt(
       }
     }
 
-    renderSessionList(ui, state);
+    renderSessionList(ui, state, {
+      sessions: filteredSessions,
+      filterQuery,
+    });
     return true;
   }
 
@@ -657,25 +669,50 @@ function renderCurrentSessionSummary(
 function renderSessionList(
   ui: TerminalUI | null,
   state: InteractiveState,
+  options?: {
+    sessions?: SessionSummary[];
+    filterQuery?: string;
+  },
 ): void {
+  const sessions = options?.sessions ?? state.sessionStore.sessions;
+  const filterQuery = normalizeText(options?.filterQuery);
+
   if (ui) {
     ui.renderSectionTitle("Sessions");
   } else {
     console.log("Sessions");
   }
 
-  if (state.sessionStore.sessions.length === 0) {
-    renderInfo(ui, "No saved sessions.");
+  if (sessions.length === 0) {
+    renderInfo(
+      ui,
+      filterQuery
+        ? `No saved sessions match "${filterQuery}".`
+        : "No saved sessions.",
+    );
     return;
   }
 
-  renderInfo(ui, 'Use "/switch <index>", "/switch <id>", or "/switch <title>" to load a session.');
-
-  for (const [index, sessionSummary] of state.sessionStore.sessions.entries()) {
-    const marker = sessionSummary.id === state.currentSessionId ? "*" : " ";
+  if (filterQuery) {
     renderInfo(
       ui,
-      `${marker} ${index + 1}. ${sessionSummary.title} [${sessionSummary.id}]  ${sessionSummary.turnCount} turns  ${sessionSummary.charCount} chars  ${formatTimestamp(sessionSummary.updatedAt)}`,
+      `Filter: "${filterQuery}" (${sessions.length} match${sessions.length === 1 ? "" : "es"}).`,
+    );
+  }
+
+  renderInfo(
+    ui,
+    'Use "/switch <index>", "/switch <id>", or "/switch <title>" to load a session.',
+  );
+
+  for (const sessionSummary of sessions) {
+    const marker = sessionSummary.id === state.currentSessionId ? "*" : " ";
+    const displayIndex = state.sessionStore.sessions.findIndex(
+      (candidate) => candidate.id === sessionSummary.id,
+    ) + 1;
+    renderInfo(
+      ui,
+      `${marker} ${displayIndex}. ${sessionSummary.title} [${sessionSummary.id}]  ${sessionSummary.turnCount} turns  ${sessionSummary.charCount} chars  ${formatTimestamp(sessionSummary.updatedAt)}`,
     );
     renderInfo(ui, `    ${sessionSummary.preview}`);
   }
@@ -984,6 +1021,10 @@ function resolveSessionSelector(
 async function runSessionPicker(
   ui: TerminalUI,
   state: InteractiveState,
+  options?: {
+    sessions?: SessionSummary[];
+    filterQuery?: string | undefined;
+  },
 ): Promise<SessionSummary | null> {
   if (!input.isTTY || typeof input.setRawMode !== "function") {
     return null;
@@ -993,7 +1034,27 @@ async function runSessionPicker(
   return runSessionPickerInteraction({
     ui,
     input,
-    sessions: state.sessionStore.sessions,
+    sessions: options?.sessions ?? state.sessionStore.sessions,
     currentSessionId: state.currentSessionId,
+    filterQuery: options?.filterQuery,
   });
+}
+
+function filterSessionSummaries(
+  sessions: SessionSummary[],
+  query: string,
+): SessionSummary[] {
+  const normalizedQuery = normalizeText(query).toLowerCase();
+  if (!normalizedQuery) {
+    return sessions;
+  }
+
+  return sessions.filter((session) => {
+    const searchableText = `${session.title}\n${session.preview}`.toLowerCase();
+    return searchableText.includes(normalizedQuery);
+  });
+}
+
+function normalizeText(value: string | null | undefined): string {
+  return value?.trim() ?? "";
 }

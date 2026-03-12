@@ -116,7 +116,7 @@ test("CLI handles local slash commands and rejects unknown slash commands withou
 
     assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
     assert.equal(server.requests.length, 0);
-    assert.match(stdout, /Commands: \/help \/settings \/session \/history \[id\|index\|title\] \/sessions \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
+    assert.match(stdout, /Commands: \/help \/settings \/session \/history \[id\|index\|title\] \/sessions \[query\] \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
     assert.match(stderr, /error: Unknown command: \/sessiojn\. Type \/help\./);
   } finally {
     await server.close();
@@ -484,6 +484,99 @@ test("CLI can show current and selected session history without calling the mode
     assert.match(stdout, new RegExp(`History\\r?\\nSession: My name is Ada\\. \\[${adaSessionId}\\]`));
     assert.match(stdout, /1\. You\r?\n   My name is Ada\./);
     assert.match(stdout, /2\. Assistant\r?\n   Hello Ada\./);
+  } finally {
+    await secondServer.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI can filter saved sessions by title or preview text", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+  const cliPath = path.resolve("src/index.ts");
+  const firstServer = await startMockOpenAIServer([
+    "Blue heron.",
+    "Basalt flow.",
+  ]);
+
+  try {
+    const firstChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: firstServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let firstStderr = "";
+    firstChild.stderr.setEncoding("utf8");
+    firstChild.stderr.on("data", (chunk: string) => {
+      firstStderr += chunk;
+    });
+
+    firstChild.stdin.write("Ornithology note.\n");
+    firstChild.stdin.write("/new\n");
+    firstChild.stdin.write("Volcanology note.\n");
+    firstChild.stdin.end("/exit\n");
+
+    const [firstExitCode] = (await once(firstChild, "close")) as [number | null];
+    assert.equal(firstExitCode, 0, firstStderr || "CLI exited with a non-zero code.");
+  } finally {
+    await firstServer.close();
+  }
+
+  const secondServer = await startMockOpenAIServer([]);
+
+  try {
+    const secondChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: secondServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    secondChild.stdout.setEncoding("utf8");
+    secondChild.stderr.setEncoding("utf8");
+    secondChild.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    secondChild.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    secondChild.stdin.write("/sessions basalt\n");
+    secondChild.stdin.write("/sessions missing-term\n");
+    secondChild.stdin.end("/exit\n");
+
+    const [secondExitCode] = (await once(secondChild, "close")) as [number | null];
+
+    assert.equal(secondExitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(secondServer.requests.length, 0);
+    assert.match(stdout, /Sessions\r?\nFilter: "basalt" \(1 match\)\./);
+    assert.match(stdout, /Volcanology note\./);
+    assert.match(stdout, /Assistant: Basalt flow\./);
+    assert.match(stdout, /No saved sessions match "missing-term"\./);
   } finally {
     await secondServer.close();
     await rm(tempDir, { recursive: true, force: true });
