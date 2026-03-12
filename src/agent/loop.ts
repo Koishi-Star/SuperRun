@@ -1,9 +1,11 @@
 import { chatOnce } from "../llm/router.js";
 import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
+import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 
 export type AgentTurnOptions = ChatOptions;
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
+const MAX_TOOL_CALL_ROUNDS = 3;
 
 export type AgentSession = {
   systemPrompt: string;
@@ -64,7 +66,10 @@ export async function runAgentTurn(
   }
 
   trimSessionHistory(session);
-  const reply = await chatOnce(buildTurnMessages(session, trimmedPrompt), options);
+  const reply = await resolveAgentReply(
+    buildTurnMessages(session, trimmedPrompt),
+    options,
+  );
 
   session.history.push(
     {
@@ -104,6 +109,62 @@ export function getAgentSessionStats(session: AgentSession): AgentSessionStats {
 
 function trimSessionHistory(session: AgentSession): void {
   session.history = trimConversationHistory(session.history, session.maxHistoryTurns);
+}
+
+async function resolveAgentReply(
+  baseMessages: ChatMessage[],
+  options?: AgentTurnOptions,
+): Promise<string> {
+  const messages = [...baseMessages];
+  const tools = getAgentToolDefinitions();
+
+  for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+    const response = await chatOnce(messages, {
+      ...(options?.model ? { model: options.model } : {}),
+      ...(options?.temperature !== undefined
+        ? { temperature: options.temperature }
+        : {}),
+      tools,
+    });
+
+    if (response.toolCalls.length === 0) {
+      if (!response.content) {
+        throw new Error("Model returned empty content.");
+      }
+
+      if (options?.onChunk) {
+        // Tool routing currently resolves non-streaming first, then flushes the
+        // final assistant reply through the existing chunk callback.
+        options.onChunk(response.content);
+      }
+
+      return response.content;
+    }
+
+    if (round === MAX_TOOL_CALL_ROUNDS) {
+      throw new Error("Model exceeded the maximum tool call rounds.");
+    }
+
+    messages.push({
+      role: "assistant",
+      content: response.content,
+      toolCalls: response.toolCalls,
+      ...(response.reasoningContent
+        ? { reasoningContent: response.reasoningContent }
+        : {}),
+    });
+
+    for (const toolCall of response.toolCalls) {
+      const toolResult = await executeAgentTool(toolCall);
+      messages.push({
+        role: "tool",
+        toolCallId: toolCall.id,
+        content: toolResult,
+      });
+    }
+  }
+
+  throw new Error("Model exceeded the maximum tool call rounds.");
 }
 
 function trimConversationHistory(

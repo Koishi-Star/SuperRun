@@ -12,22 +12,23 @@
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `superrun [prompt]`.
 - `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings, history browsing, filtered session browsing, and session management.
-- `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, and per-turn model calls.
+- `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, per-turn model calls, and a narrow tool-calling loop.
 - `src/prompts/system.ts` centralizes the base system prompt used for each session.
 - `src/config/settings.ts` persists the default system prompt profile used across runs.
 - `src/config/paths.ts` centralizes where local config and session files are stored.
-- `src/llm/types.ts` defines the shared chat message, chat options, and client interface types.
+- `src/llm/types.ts` defines the shared chat message, tool call, chat options, and client interface types.
 - `src/llm/router.ts` currently routes all requests to a single OpenAI-compatible client.
-- `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming and proxy support.
+- `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming, proxy support, and function-call parsing.
 - `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
 - `src/session/store.ts` persists multiple saved sessions, tracks the active session, derives session titles and previews, and restores sessions across CLI runs.
+- `src/tools/list_files.ts` implements the first local read-only tool for repository structure inspection under the workspace root.
 - `src/ui/tui.ts` contains the lightweight terminal UI helpers used in TTY interactive sessions, including command help, the `/sessions` picker, and history workflows.
-- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, session picker interaction, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
+- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, session picker interaction, tool orchestration, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a narrow TTY `/sessions` picker, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage.
-- Not done yet: richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, multi-provider routing, and tool execution.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a narrow TTY `/sessions` picker, the first `list_files` function call, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage and tool orchestration.
+- Not done yet: richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, additional local tools such as file reading, multi-provider routing, and write/command execution boundaries.
 - Current maturity: the chat loop is solid for local experiments and saved-session workflows, but the agent still behaves like a chat-first CLI rather than a full coding agent with tools.
 
 ## Working rules
@@ -51,9 +52,10 @@
 ## Priorities for upcoming work
 
 1. Expand the lightweight TUI carefully beyond the current `/sessions` picker with clearer saved-session actions, transient status states, and better error surfacing.
-2. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
-3. Add router-level coverage once a second provider or selection rule exists.
-4. Only after chat/session behavior is stable, introduce a narrow tool interface for local command execution or file operations.
+2. Add the second read-only local tool, likely line-bounded file reading, on top of the new `list_files` slice.
+3. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
+4. Add router-level coverage once a second provider or selection rule exists.
+5. Only after read-only tool behavior is stable, introduce stricter write/command execution boundaries.
 
 ## Implementation preferences
 

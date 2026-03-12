@@ -16,11 +16,12 @@ What works today:
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
+- the first read-only local tool for listing workspace files
 - focused tests for env parsing, agent history, and CLI interaction
 
 What does not exist yet:
 
-- tool calling
+- file-reading, writing, or shell tools beyond the initial `list_files` slice
 - multiple providers
 - advanced TUI
 
@@ -35,7 +36,7 @@ The current request shape is:
 2. prior `user` and `assistant` turns from the current session, truncated to the most recent 10 turns
 3. the current `user` prompt
 
-That is the correct structure for the current stage.
+That is the correct structure for the current stage, with a narrow tool-calling loop now available when the model requests `list_files`.
 The default base system prompt currently lives in [`src/prompts/system.ts`](./src/prompts/system.ts):
 
 ```ts
@@ -187,6 +188,7 @@ npm test
 - `src/llm/types.ts`: shared message and client types
 - `src/llm/router.ts`: current provider routing
 - `src/llm/openai_compatible.ts`: OpenAI-compatible adapter
+- `src/tools/list_files.ts`: workspace-scoped file listing tool
 - `src/utils/env.ts`: env validation and config loading
 - `src/ui/tui.ts`: lightweight terminal UI helpers
 - `test/`: focused tests for current behavior

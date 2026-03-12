@@ -1,21 +1,37 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import type { ChatMessage } from "../../src/llm/types.js";
+import type { ChatMessage, ToolDefinition } from "../../src/llm/types.js";
 
 export type MockChatRequest = {
   model?: string;
   messages: ChatMessage[];
   stream?: boolean;
   temperature?: number;
+  tools?: Array<{
+    type?: string;
+    function?: ToolDefinition;
+  }>;
+};
+
+export type MockToolCall = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+export type MockChatResponse = {
+  content?: string;
+  toolCalls?: MockToolCall[];
+  reasoningContent?: string;
 };
 
 type MockResponseFactory = (
   request: MockChatRequest,
   callIndex: number,
-) => string;
+) => MockResponse;
 
-export type MockResponse = string | MockResponseFactory;
+export type MockResponse = string | MockChatResponse | MockResponseFactory;
 
 export async function startMockOpenAIServer(responses: MockResponse[]) {
   const requests: MockChatRequest[] = [];
@@ -38,10 +54,14 @@ export async function startMockOpenAIServer(responses: MockResponse[]) {
     requests.push(request);
 
     const response = responses[callIndex] ?? `mock response ${callIndex + 1}`;
-    const content =
+    const payload =
       typeof response === "function"
         ? response(request, callIndex)
         : response;
+    const resolvedResponse =
+      typeof payload === "string"
+        ? { content: payload }
+        : payload;
     callIndex += 1;
 
     if (request.stream) {
@@ -51,7 +71,7 @@ export async function startMockOpenAIServer(responses: MockResponse[]) {
         "Cache-Control": "no-cache",
       });
       res.write(
-        `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: { content: resolvedResponse.content ?? "" } }] })}\n\n`,
       );
       res.write("data: [DONE]\n\n");
       res.end();
@@ -64,7 +84,24 @@ export async function startMockOpenAIServer(responses: MockResponse[]) {
         choices: [
           {
             message: {
-              content,
+              ...(resolvedResponse.content !== undefined
+                ? { content: resolvedResponse.content }
+                : {}),
+              ...(resolvedResponse.reasoningContent !== undefined
+                ? { reasoning_content: resolvedResponse.reasoningContent }
+                : {}),
+              ...(resolvedResponse.toolCalls?.length
+                ? {
+                    tool_calls: resolvedResponse.toolCalls.map((toolCall) => ({
+                      id: toolCall.id,
+                      type: "function",
+                      function: {
+                        name: toolCall.name,
+                        arguments: toolCall.arguments,
+                      },
+                    })),
+                  }
+                : {}),
             },
           },
         ],

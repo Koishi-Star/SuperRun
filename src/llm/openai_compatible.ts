@@ -1,5 +1,12 @@
 import { Agent, ProxyAgent, type Dispatcher } from "undici";
-import type { ChatMessage, ChatOptions, LLMClient } from "./types.js";
+import type {
+  ChatMessage,
+  ChatOptions,
+  ChatResponse,
+  LLMClient,
+  ToolCall,
+  ToolDefinition,
+} from "./types.js";
 import { getOpenAICompatibleConfig } from "../utils/env.js";
 
 // Respect HTTPS_PROXY / HTTP_PROXY / https_proxy / http_proxy env vars.
@@ -23,6 +30,8 @@ type OpenAICompatibleResponse = {
   choices?: Array<{
     message?: {
       content?: OpenAICompatibleContent;
+      tool_calls?: OpenAICompatibleToolCall[];
+      reasoning_content?: string;
     };
   }>;
   error?: {
@@ -49,6 +58,15 @@ type OpenAICompatibleContent =
       text?: string;
     }>;
 
+type OpenAICompatibleToolCall = {
+  id?: string;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+};
+
 export class OpenAICompatibleClient implements LLMClient {
   private readonly apiKey: string;
   private readonly baseURL: string;
@@ -63,18 +81,26 @@ export class OpenAICompatibleClient implements LLMClient {
     this.timeoutMs = config.timeoutMs;
   }
 
-  async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+  async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResponse> {
     const model = options?.model ?? this.defaultModel;
     const onChunk = options?.onChunk;
     const shouldStream = typeof onChunk === "function";
     const requestBody: Record<string, unknown> = {
       model,
-      messages,
+      messages: messages.map((message) => serializeChatMessage(message)),
       stream: shouldStream,
     };
 
+    if (shouldStream && options?.tools?.length) {
+      throw new Error("Streaming tool calls is not supported.");
+    }
+
     if (options?.temperature !== undefined) {
       requestBody.temperature = options.temperature;
+    }
+
+    if (options?.tools?.length) {
+      requestBody.tools = options.tools.map((tool) => serializeToolDefinition(tool));
     }
 
     if (shouldStream) {
@@ -98,20 +124,29 @@ export class OpenAICompatibleClient implements LLMClient {
       );
     }
 
-    const rawContent = data.choices?.[0]?.message?.content;
+    const message = data.choices?.[0]?.message;
+    const rawContent = message?.content;
     const content = normalizeAssistantContent(rawContent);
+    const toolCalls = normalizeToolCalls(message?.tool_calls);
+    const reasoningContent = normalizeReasoningContent(
+      message?.reasoning_content,
+    );
 
-    if (!content) {
+    if (!content && toolCalls.length === 0) {
       throw new Error("Model returned empty content.");
     }
 
-    return content;
+    return {
+      content,
+      toolCalls,
+      ...(reasoningContent ? { reasoningContent } : {}),
+    };
   }
 
   private async streamChat(
     payload: Record<string, unknown>,
     onChunk: (chunk: string) => void,
-  ): Promise<string> {
+  ): Promise<ChatResponse> {
     const response = await this.requestStream("chat/completions", payload);
     try {
       if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -195,7 +230,10 @@ export class OpenAICompatibleClient implements LLMClient {
         throw new Error("Model returned empty content.");
       }
 
-      return fullContent;
+      return {
+        content: fullContent,
+        toolCalls: [],
+      };
     } finally {
       clearTimeout(response.timer);
     }
@@ -289,6 +327,53 @@ export class OpenAICompatibleClient implements LLMClient {
   }
 }
 
+function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
+  if (message.role === "tool") {
+    return {
+      role: "tool",
+      content: message.content,
+      tool_call_id: message.toolCallId,
+    };
+  }
+
+  if (message.role === "assistant" && message.toolCalls?.length) {
+    return {
+      role: "assistant",
+      content: message.content,
+      ...(message.reasoningContent
+        ? { reasoning_content: message.reasoningContent }
+        : {}),
+      tool_calls: message.toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        type: "function",
+        function: {
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+        },
+      })),
+    };
+  }
+
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.role === "assistant" && message.reasoningContent
+      ? { reasoning_content: message.reasoningContent }
+      : {}),
+  };
+}
+
+function serializeToolDefinition(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  };
+}
+
 function normalizeAssistantContent(
   content: OpenAICompatibleContent | undefined,
 ): string {
@@ -305,6 +390,47 @@ function normalizeAssistantContent(
     .map((part) => part.text?.trim() ?? "")
     .filter(Boolean)
     .join("\n");
+}
+
+function normalizeToolCalls(
+  toolCalls: OpenAICompatibleToolCall[] | undefined,
+): ToolCall[] {
+  if (!Array.isArray(toolCalls)) {
+    return [];
+  }
+
+  return toolCalls.flatMap((toolCall) => {
+    const id = typeof toolCall.id === "string" ? toolCall.id.trim() : "";
+    const name =
+      typeof toolCall.function?.name === "string"
+        ? toolCall.function.name.trim()
+        : "";
+    const args =
+      typeof toolCall.function?.arguments === "string"
+        ? toolCall.function.arguments
+        : "";
+
+    if (!id || !name) {
+      return [];
+    }
+
+    return [
+      {
+        id,
+        name,
+        arguments: args,
+      },
+    ];
+  });
+}
+
+function normalizeReasoningContent(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized || undefined;
 }
 
 function parseSseEvent(event: string): string | null {

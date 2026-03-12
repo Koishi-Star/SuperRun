@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import test from "node:test";
+import { DEFAULT_SYSTEM_PROMPT } from "../src/prompts/system.js";
 import { startMockOpenAIServer } from "./helpers/mock-openai-server.js";
 
 test("CLI interactive mode preserves history across turns", async () => {
@@ -57,8 +58,7 @@ test("CLI interactive mode preserves history across turns", async () => {
     assert.deepEqual(server.requests[1]?.messages, [
       {
         role: "system",
-        content:
-          "You are a helpful coding assistant. Be accurate, concise, and practical.",
+        content: DEFAULT_SYSTEM_PROMPT,
       },
       { role: "user", content: "My name is Ada." },
       { role: "assistant", content: "Hello Ada." },
@@ -349,8 +349,7 @@ test("CLI can rename sessions, show previews, and switch by list index", async (
     assert.deepEqual(secondServer.requests[0]?.messages, [
       {
         role: "system",
-        content:
-          "You are a helpful coding assistant. Be accurate, concise, and practical.",
+        content: DEFAULT_SYSTEM_PROMPT,
       },
       { role: "user", content: "My name is Ada." },
       { role: "assistant", content: "Hello Ada." },
