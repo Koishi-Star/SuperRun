@@ -1,8 +1,6 @@
 import { chatOnce } from "../llm/router.js";
 import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types.js";
-
-const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful coding assistant. Be accurate, concise, and practical.";
+import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
 
 export type AgentTurnOptions = ChatOptions;
 
