@@ -16,11 +16,15 @@ import {
   type SuperRunSettings,
 } from "./config/settings.js";
 import {
-  clearSavedSession,
-  loadSavedSession,
+  createSession,
+  deleteSession,
+  loadSession,
+  loadSessionStore,
   saveSession,
-  type SavedSession,
-  type SavedSessionState,
+  setActiveSession,
+  type SessionSummary,
+  type SessionStoreState,
+  type StoredSession,
 } from "./session/store.js";
 import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
@@ -33,7 +37,6 @@ program
   .action(async (prompt?: string) => {
     try {
       const settings = await loadSettings();
-      const savedSessionState = await loadSavedSession();
       const session = createAgentSession({
         systemPrompt: settings.systemPrompt,
       });
@@ -44,7 +47,8 @@ program
         return;
       }
 
-      await runInteractiveSession(session, settings, savedSessionState);
+      const state = await createInteractiveState(settings, session);
+      await runInteractiveSession(session, state);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown error";
@@ -55,13 +59,49 @@ program
 
 type InteractiveState = {
   settings: SuperRunSettings;
-  savedSession: SavedSession | null;
-  savedSessionFilePath: string;
+  sessionStore: SessionStoreState;
+  currentSessionId: string | null;
+  currentSessionTitle: string | null;
   pendingSystemPromptLines: string[] | null;
 };
 
+const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
+
+async function createInteractiveState(
+  settings: SuperRunSettings,
+  session: AgentSession,
+): Promise<InteractiveState> {
+  let sessionStore = await loadSessionStore();
+  let currentSessionId: string | null = null;
+
+  if (sessionStore.activeSessionId) {
+    try {
+      const storedSession = await loadSession(sessionStore.activeSessionId);
+      restoreStoredSession(session, storedSession);
+      currentSessionId = storedSession.id;
+      return {
+        settings,
+        sessionStore,
+        currentSessionId,
+        currentSessionTitle: storedSession.title,
+        pendingSystemPromptLines: null,
+      };
+    } catch {
+      sessionStore = await setActiveSession(null);
+    }
+  }
+
+  return {
+    settings,
+    sessionStore,
+    currentSessionId,
+    currentSessionTitle: null,
+    pendingSystemPromptLines: null,
+  };
+}
+
 async function runSingleTurn(
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   prompt: string,
 ): Promise<void> {
   console.log("user:", prompt);
@@ -81,28 +121,20 @@ async function runSingleTurn(
 }
 
 async function runInteractiveSession(
-  session: ReturnType<typeof createAgentSession>,
-  settings: SuperRunSettings,
-  savedSessionState: SavedSessionState,
+  session: AgentSession,
+  state: InteractiveState,
 ): Promise<void> {
   const rl = createInterface({ input, output });
-  const state: InteractiveState = {
-    settings,
-    savedSession: savedSessionState.session,
-    savedSessionFilePath: savedSessionState.filePath,
-    pendingSystemPromptLines: null,
-  };
-  // Keep piped/non-interactive usage plain, but enable a richer prompt in a real terminal.
   const ui = input.isTTY && output.isTTY ? createTerminalUI(output) : null;
 
   if (ui) {
     ui.renderWelcome();
     renderSessionPromptHint(ui, session, state.settings);
-    renderSavedSessionHint(ui, state.savedSession);
+    renderSessionStoreHint(ui, state);
   } else {
     console.log('Interactive mode. Type "/exit" to quit.');
     renderSessionPromptHint(ui, session, state.settings);
-    renderSavedSessionHint(ui, state.savedSession);
+    renderSessionStoreHint(ui, state);
   }
 
   try {
@@ -137,7 +169,7 @@ async function runInteractiveSession(
 }
 
 async function handleInteractivePrompt(
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   prompt: string,
   rl: Interface,
   state: InteractiveState,
@@ -147,16 +179,15 @@ async function handleInteractivePrompt(
     return true;
   }
 
-  if (prompt === "/exit") {
+  if (isExitCommand(prompt)) {
     return false;
   }
 
-  // Handle local UI commands before sending anything to the model.
   if (prompt === "/help") {
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /settings /session /resume /forget /system /system reset /clear /exit");
+      console.log("Commands: /help /settings /session /sessions /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
     }
     return true;
   }
@@ -167,25 +198,109 @@ async function handleInteractivePrompt(
   }
 
   if (prompt === "/session") {
-    renderSessionSummary(ui, session, state);
+    renderCurrentSessionSummary(ui, session, state);
     return true;
   }
 
-  if (prompt === "/resume") {
-    if (!state.savedSession) {
-      renderInfo(ui, "No saved session is available to resume.");
+  if (prompt === "/sessions") {
+    renderSessionList(ui, state);
+    return true;
+  }
+
+  if (prompt === "/new") {
+    resetCurrentSession(session, state.settings.systemPrompt);
+    state.currentSessionTitle = null;
+    const result = await createSession({
+      systemPrompt: session.systemPrompt,
+      history: session.history,
+      maxHistoryTurns: session.maxHistoryTurns,
+    });
+    state.sessionStore = result.store;
+    state.currentSessionId = result.session.id;
+    state.currentSessionTitle = result.session.title;
+    renderNewSessionCreated(ui, result.session);
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/switch")) {
+    const sessionSelector = parseCommandArgument(prompt, "/switch");
+    if (!sessionSelector) {
+      renderError(ui, 'Usage: /switch <id|index|title>');
       return true;
     }
 
-    restoreSavedSession(session, state.savedSession);
-    renderSessionResumed(ui, state.savedSession);
+    try {
+      const targetSession = resolveSessionSelector(sessionSelector, state);
+      const storedSession = await loadSession(targetSession.id);
+      restoreStoredSession(session, storedSession);
+      state.currentSessionId = storedSession.id;
+      state.currentSessionTitle = storedSession.title;
+      state.sessionStore = await setActiveSession(storedSession.id);
+      renderSessionSwitched(ui, storedSession);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to switch session.");
+    }
     return true;
   }
 
-  if (prompt === "/forget") {
-    applySystemPrompt(session, state.settings.systemPrompt);
-    await clearSavedSessionState(state);
-    renderSessionForgotten(ui, state.settings.systemPrompt, state.savedSessionFilePath);
+  if (matchesCommand(prompt, "/rename")) {
+    const nextTitle = parseCommandArgument(prompt, "/rename");
+    if (!nextTitle) {
+      renderError(ui, 'Usage: /rename <title>');
+      return true;
+    }
+
+    if (!state.currentSessionId && session.history.length === 0) {
+      renderError(ui, 'No current session to rename. Start chatting or use "/new" first.');
+      return true;
+    }
+
+    await persistCurrentSession(session, state, {
+      allowEmpty: true,
+      title: nextTitle,
+    });
+    renderSessionRenamed(ui, state);
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/delete")) {
+    const sessionSelector = parseCommandArgument(prompt, "/delete");
+    let targetSessionId = state.currentSessionId;
+    if (sessionSelector) {
+      try {
+        targetSessionId = resolveSessionSelector(sessionSelector, state).id;
+      } catch (error) {
+        renderError(ui, error instanceof Error ? error.message : "Failed to resolve session.");
+        return true;
+      }
+    }
+
+    if (!targetSessionId) {
+      renderError(ui, "No current saved session is selected to delete.");
+      return true;
+    }
+
+    const deletedCurrent = state.currentSessionId === targetSessionId;
+    state.sessionStore = await deleteSession(targetSessionId);
+
+    if (deletedCurrent) {
+      if (state.sessionStore.activeSessionId) {
+        const activeSession = await loadSession(state.sessionStore.activeSessionId);
+        restoreStoredSession(session, activeSession);
+        state.currentSessionId = activeSession.id;
+        state.currentSessionTitle = activeSession.title;
+        renderSessionDeletedAndSwitched(ui, targetSessionId, activeSession);
+        return true;
+      }
+
+      resetCurrentSession(session, state.settings.systemPrompt);
+      state.currentSessionId = null;
+      state.currentSessionTitle = null;
+      renderSessionDeleted(ui, targetSessionId);
+      return true;
+    }
+
+    renderSessionDeleted(ui, targetSessionId);
     return true;
   }
 
@@ -196,9 +311,9 @@ async function handleInteractivePrompt(
 
   if (prompt === "/system reset") {
     const settings = await resetSystemPrompt();
-    applySystemPrompt(session, settings.systemPrompt);
     state.settings = settings;
-    await clearSavedSessionState(state);
+    resetCurrentSession(session, settings.systemPrompt);
+    await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
     return true;
   }
@@ -208,7 +323,13 @@ async function handleInteractivePrompt(
       ui.clearScreen();
       ui.renderWelcome();
       renderSessionPromptHint(ui, session, state.settings);
+      renderSessionStoreHint(ui, state);
     }
+    return true;
+  }
+
+  if (prompt.startsWith("/")) {
+    renderError(ui, `Unknown command: ${prompt}. Type /help.`);
     return true;
   }
 
@@ -235,7 +356,7 @@ async function handleInteractivePrompt(
 }
 
 async function handlePipedInteractiveLine(
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   line: string,
   state: InteractiveState,
   ui: TerminalUI | null,
@@ -255,7 +376,7 @@ async function handlePipedInteractiveLine(
 }
 
 async function handlePipedSystemPromptLine(
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   line: string,
   state: InteractiveState,
   ui: TerminalUI | null,
@@ -281,10 +402,10 @@ async function handlePipedSystemPromptLine(
     }
 
     const settings = await saveSystemPrompt(nextPrompt);
-    applySystemPrompt(session, settings.systemPrompt);
     state.settings = settings;
+    resetCurrentSession(session, settings.systemPrompt);
     state.pendingSystemPromptLines = null;
-    await clearSavedSessionState(state);
+    await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
     return true;
   }
@@ -298,7 +419,7 @@ function isReadlineClosedError(error: unknown): boolean {
 }
 
 async function runSystemPromptEditor(
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   rl: Interface,
   state: InteractiveState,
   ui: TerminalUI | null,
@@ -312,9 +433,9 @@ async function runSystemPromptEditor(
   }
 
   const settings = await saveSystemPrompt(nextPrompt);
-  applySystemPrompt(session, settings.systemPrompt);
   state.settings = settings;
-  await clearSavedSessionState(state);
+  resetCurrentSession(session, settings.systemPrompt);
+  await persistCurrentSession(session, state, { allowEmpty: true });
   renderSystemPromptApplied(ui, session, settings, true);
 }
 
@@ -346,57 +467,66 @@ async function readMultilineSystemPrompt(
   }
 }
 
-function applySystemPrompt(
-  session: ReturnType<typeof createAgentSession>,
+function resetCurrentSession(
+  session: AgentSession,
   systemPrompt: string,
 ): void {
   session.systemPrompt = systemPrompt;
-  // Reset history so new instructions apply to a clean conversation.
   session.history = [];
 }
 
 function renderSessionPromptHint(
   ui: TerminalUI | null,
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   settings: Pick<SuperRunSettings, "systemPrompt" | "hasStoredSystemPrompt">,
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
   renderInfo(
     ui,
-    `Active behavior (${source}): ${summarizePrompt(settings.systemPrompt)}`,
+    `Active behavior (${source}): ${summarizePrompt(session.systemPrompt)}`,
   );
   renderInfo(
     ui,
     `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
-  renderInfo(ui, 'Use "/system" to change it. Saving a new prompt resets the current conversation.');
+  renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
   if (ui) {
     output.write("\n");
   }
 }
 
-function renderSavedSessionHint(
+function renderSessionStoreHint(
   ui: TerminalUI | null,
-  savedSession: SavedSession | null,
+  state: InteractiveState,
 ): void {
-  if (!savedSession) {
+  const currentSessionId = state.currentSessionId;
+
+  if (currentSessionId) {
+    renderInfo(
+      ui,
+      `Current session: ${formatSessionLabel(state.currentSessionTitle, currentSessionId)}. Saved sessions: ${state.sessionStore.sessions.length}.`,
+    );
+  renderInfo(ui, 'Use "/sessions" to list them, "/switch <index>" to jump, or "/new" to start fresh.');
+    if (ui) {
+      output.write("\n");
+    }
     return;
   }
 
-  const stats = getAgentSessionStats(
-    createAgentSession({
-      systemPrompt: savedSession.systemPrompt,
-      history: savedSession.history,
-      maxHistoryTurns: savedSession.maxHistoryTurns,
-    }),
-  );
+  if (state.sessionStore.sessions.length === 0) {
+    renderInfo(ui, 'No saved sessions yet. Start chatting or use "/new" to create one now.');
+    if (ui) {
+      output.write("\n");
+    }
+    return;
+  }
 
   renderInfo(
     ui,
-    `Saved session available: ${stats.historyTurnCount} turns, ${stats.historyCharCount} chars, updated ${savedSession.updatedAt}.`,
+    `Saved sessions: ${state.sessionStore.sessions.length}. Active session is not loaded.`,
   );
-  renderInfo(ui, 'Use "/resume" to restore it or "/forget" to discard it.');
+  renderInfo(ui, 'Use "/sessions" to list them or "/switch <index>" to load one.');
   if (ui) {
     output.write("\n");
   }
@@ -404,7 +534,7 @@ function renderSavedSessionHint(
 
 function renderSettingsSummary(
   ui: TerminalUI | null,
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   settings: SuperRunSettings,
 ): void {
   const stats = getAgentSessionStats(session);
@@ -428,7 +558,7 @@ function renderSettingsSummary(
   );
   renderInfo(ui, `System prompt size: ${stats.systemPromptCharCount} chars.`);
   renderInfo(ui, "This text defines how the agent should behave on every turn.");
-  renderInfo(ui, "Changing it persists the new behavior for future runs and clears the current conversation.");
+  renderInfo(ui, "Changing it clears the current conversation and updates the default for new work.");
 
   const body = `${settings.systemPrompt}\n`;
   if (ui) {
@@ -438,13 +568,12 @@ function renderSettingsSummary(
   }
 }
 
-function renderSessionSummary(
+function renderCurrentSessionSummary(
   ui: TerminalUI | null,
   session: AgentSession,
   state: InteractiveState,
 ): void {
   const currentStats = getAgentSessionStats(session);
-  const savedSession = state.savedSession;
 
   if (ui) {
     ui.renderSectionTitle("Session");
@@ -454,36 +583,45 @@ function renderSessionSummary(
 
   renderInfo(
     ui,
+    `Current session: ${formatSessionLabel(
+      state.currentSessionTitle,
+      state.currentSessionId,
+    )}`,
+  );
+  renderInfo(
+    ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
   );
-  renderInfo(
-    ui,
-    `Current behavior: ${summarizePrompt(session.systemPrompt)}`,
-  );
-  renderInfo(
-    ui,
-    `Saved session path: ${state.savedSessionFilePath}`,
-  );
+  renderInfo(ui, `Current behavior: ${summarizePrompt(session.systemPrompt)}`);
+  renderInfo(ui, `Session index: ${state.sessionStore.indexFilePath}`);
+  renderInfo(ui, `Saved sessions total: ${state.sessionStore.sessions.length}`);
+}
 
-  if (!savedSession) {
-    renderInfo(ui, "Saved session: none.");
+function renderSessionList(
+  ui: TerminalUI | null,
+  state: InteractiveState,
+): void {
+  if (ui) {
+    ui.renderSectionTitle("Sessions");
+  } else {
+    console.log("Sessions");
+  }
+
+  if (state.sessionStore.sessions.length === 0) {
+    renderInfo(ui, "No saved sessions.");
     return;
   }
 
-  const savedStats = getAgentSessionStats(
-    createAgentSession({
-      systemPrompt: savedSession.systemPrompt,
-      history: savedSession.history,
-      maxHistoryTurns: savedSession.maxHistoryTurns,
-    }),
-  );
+  renderInfo(ui, 'Use "/switch <index>", "/switch <id>", or "/switch <title>" to load a session.');
 
-  renderInfo(
-    ui,
-    `Saved session: ${savedStats.historyTurnCount} turns, ${savedStats.historyMessageCount} messages, ${savedStats.historyCharCount} chars.`,
-  );
-  renderInfo(ui, `Saved session updated: ${savedSession.updatedAt}`);
-  renderInfo(ui, `Saved behavior: ${summarizePrompt(savedSession.systemPrompt)}`);
+  for (const [index, sessionSummary] of state.sessionStore.sessions.entries()) {
+    const marker = sessionSummary.id === state.currentSessionId ? "*" : " ";
+    renderInfo(
+      ui,
+      `${marker} ${index + 1}. ${sessionSummary.title} [${sessionSummary.id}]  ${sessionSummary.turnCount} turns  ${sessionSummary.charCount} chars  ${formatTimestamp(sessionSummary.updatedAt)}`,
+    );
+    renderInfo(ui, `    ${sessionSummary.preview}`);
+  }
 }
 
 function renderSystemPromptTips(
@@ -496,15 +634,15 @@ function renderSystemPromptTips(
     console.log("System Prompt Editor");
   }
 
-  renderInfo(ui, "This prompt controls the agent's behavior on every turn.");
-  renderInfo(ui, "Saving persists it for future runs and resets the current conversation.");
+  renderInfo(ui, "This prompt controls the default behavior for the current conversation.");
+  renderInfo(ui, "Saving clears the current conversation and updates the default for future sessions.");
   renderInfo(ui, 'Type the new prompt below. Use "/save" on its own line to persist or "/cancel" to abort.');
   renderInfo(ui, `Current behavior: ${summarizePrompt(currentPrompt)}`);
 }
 
 function renderSystemPromptApplied(
   ui: TerminalUI | null,
-  session: ReturnType<typeof createAgentSession>,
+  session: AgentSession,
   settings: SuperRunSettings,
   historyCleared: boolean,
 ): void {
@@ -520,40 +658,68 @@ function renderSystemPromptApplied(
   renderInfo(ui, `This agent will now behave as: ${summarizePrompt(settings.systemPrompt)}`);
 }
 
-function renderSessionResumed(
+function renderNewSessionCreated(
   ui: TerminalUI | null,
-  savedSession: SavedSession,
+  storedSession: StoredSession,
+): void {
+  renderInfo(
+    ui,
+    `Created new session: ${formatSessionLabel(storedSession.title, storedSession.id)}`,
+  );
+  renderInfo(ui, "Current conversation cleared.");
+}
+
+function renderSessionSwitched(
+  ui: TerminalUI | null,
+  storedSession: StoredSession,
 ): void {
   const stats = getAgentSessionStats(
     createAgentSession({
-      systemPrompt: savedSession.systemPrompt,
-      history: savedSession.history,
-      maxHistoryTurns: savedSession.maxHistoryTurns,
+      systemPrompt: storedSession.systemPrompt,
+      history: storedSession.history,
+      maxHistoryTurns: storedSession.maxHistoryTurns,
     }),
   );
 
   renderInfo(
     ui,
-    `Resumed saved session from ${savedSession.updatedAt}.`,
+    `Switched to session: ${formatSessionLabel(storedSession.title, storedSession.id)}`,
   );
   renderInfo(
     ui,
     `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
-  renderInfo(
-    ui,
-    `This agent will now behave as: ${summarizePrompt(savedSession.systemPrompt)}`,
-  );
+  renderInfo(ui, storedSession.preview);
+  renderInfo(ui, `This agent will now behave as: ${summarizePrompt(storedSession.systemPrompt)}`);
 }
 
-function renderSessionForgotten(
+function renderSessionDeleted(
   ui: TerminalUI | null,
-  systemPrompt: string,
-  filePath: string,
+  sessionId: string,
 ): void {
-  renderInfo(ui, `Removed saved session at ${filePath}`);
-  renderInfo(ui, "Current conversation cleared.");
-  renderInfo(ui, `This agent will now behave as: ${summarizePrompt(systemPrompt)}`);
+  renderInfo(ui, `Deleted session: ${sessionId}`);
+}
+
+function renderSessionDeletedAndSwitched(
+  ui: TerminalUI | null,
+  deletedSessionId: string,
+  nextSession: StoredSession,
+): void {
+  renderInfo(ui, `Deleted session: ${deletedSessionId}`);
+  renderSessionSwitched(ui, nextSession);
+}
+
+function renderSessionRenamed(
+  ui: TerminalUI | null,
+  state: InteractiveState,
+): void {
+  renderInfo(
+    ui,
+    `Renamed session: ${formatSessionLabel(
+      state.currentSessionTitle,
+      state.currentSessionId,
+    )}`,
+  );
 }
 
 function renderInfo(ui: TerminalUI | null, message: string): void {
@@ -583,33 +749,127 @@ function summarizePrompt(prompt: string): string {
   return `${singleLine.slice(0, 93)}...`;
 }
 
-function restoreSavedSession(
+function formatSessionLabel(
+  title: string | null,
+  sessionId: string | null,
+): string {
+  if (!sessionId) {
+    return "(unsaved)";
+  }
+
+  if (!title) {
+    return sessionId;
+  }
+
+  return `${title} [${sessionId}]`;
+}
+
+function formatTimestamp(timestamp: string): string {
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    return timestamp;
+  }
+
+  return parsed.toISOString().replace("T", " ").slice(0, 16);
+}
+
+function restoreStoredSession(
   session: AgentSession,
-  savedSession: SavedSession,
+  storedSession: StoredSession,
 ): void {
-  session.systemPrompt = savedSession.systemPrompt;
-  session.history = [...savedSession.history];
-  session.maxHistoryTurns = savedSession.maxHistoryTurns;
+  session.systemPrompt = storedSession.systemPrompt;
+  session.history = [...storedSession.history];
+  session.maxHistoryTurns = storedSession.maxHistoryTurns;
 }
 
 async function persistCurrentSession(
   session: AgentSession,
   state: InteractiveState,
+  options?: { allowEmpty?: boolean; title?: string },
 ): Promise<void> {
-  if (session.history.length === 0) {
+  if (!options?.allowEmpty && session.history.length === 0) {
     return;
   }
 
-  state.savedSession = await saveSession({
+  const sessionTitle = options?.title?.trim() || state.currentSessionTitle || undefined;
+
+  if (state.currentSessionId) {
+    const result = await saveSession(state.currentSessionId, {
+      ...(sessionTitle ? { title: sessionTitle } : {}),
+      systemPrompt: session.systemPrompt,
+      history: session.history,
+      maxHistoryTurns: session.maxHistoryTurns,
+    });
+    state.sessionStore = result.store;
+    state.currentSessionId = result.session.id;
+    state.currentSessionTitle = result.session.title;
+    return;
+  }
+
+  const result = await createSession({
+    ...(sessionTitle ? { title: sessionTitle } : {}),
     systemPrompt: session.systemPrompt,
     history: session.history,
     maxHistoryTurns: session.maxHistoryTurns,
   });
+  state.sessionStore = result.store;
+  state.currentSessionId = result.session.id;
+  state.currentSessionTitle = result.session.title;
 }
 
-async function clearSavedSessionState(
+function parseCommandArgument(
+  prompt: string,
+  command: string,
+): string {
+  if (prompt === command) {
+    return "";
+  }
+
+  return prompt.slice(command.length).trim();
+}
+
+function isExitCommand(prompt: string): boolean {
+  return EXIT_COMMANDS.has(prompt.trim());
+}
+
+function matchesCommand(prompt: string, command: string): boolean {
+  return prompt === command || prompt.startsWith(`${command} `);
+}
+
+function resolveSessionSelector(
+  selector: string,
   state: InteractiveState,
-): Promise<void> {
-  state.savedSessionFilePath = await clearSavedSession();
-  state.savedSession = null;
+): SessionSummary {
+  const trimmedSelector = selector.trim();
+
+  // Numeric selectors map to the current /sessions list order for quick TUI switching.
+  if (/^\d+$/.test(trimmedSelector)) {
+    const index = Number(trimmedSelector);
+    const sessionSummary = state.sessionStore.sessions[index - 1];
+    if (!sessionSummary) {
+      throw new Error(`Session index is out of range: ${trimmedSelector}`);
+    }
+
+    return sessionSummary;
+  }
+
+  const sessionSummary = state.sessionStore.sessions.find(
+    (candidate) => candidate.id === trimmedSelector,
+  );
+  if (!sessionSummary) {
+    const titleMatches = state.sessionStore.sessions.filter(
+      (candidate) => candidate.title === trimmedSelector,
+    );
+    if (titleMatches.length === 1) {
+      return titleMatches[0] as SessionSummary;
+    }
+
+    if (titleMatches.length > 1) {
+      throw new Error(`Session title is ambiguous: ${trimmedSelector}`);
+    }
+
+    throw new Error(`Session does not exist: ${trimmedSelector}`);
+  }
+
+  return sessionSummary;
 }

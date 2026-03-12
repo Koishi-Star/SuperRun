@@ -12,7 +12,7 @@ What works today:
 - streaming assistant output
 - OpenAI-compatible chat completion provider
 - persistent system prompt profiles managed from the interactive UI
-- persistence for the most recent interactive session, with manual resume/forget controls
+- multi-session storage with switching and deletion commands
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
@@ -110,28 +110,29 @@ In interactive mode, these local commands are supported:
 - `/help`
 - `/settings`
 - `/session`
-- `/resume`
-- `/forget`
+- `/sessions`
+- `/new`
+- `/switch <id>`
+- `/delete [id]`
 - `/system`
 - `/system reset`
 - `/clear`
 - `/exit`
 
-The current conversation is now saved as a single local session snapshot.
-Starting a new CLI run does not auto-resume it, but the CLI will tell you when a saved session is available.
+The current conversation now works with multiple saved sessions:
+
+- each saved session lives under `sessions/<id>.json`
+- the session index tracks the last active session
+- the CLI loads the last active session on startup when one exists
+- `/new` starts a fresh saved session
+- `/switch <id>` loads another saved session
+- `/delete [id]` removes the current or specified saved session
 
 The system prompt is different:
 
 - it can be changed at runtime from the interactive UI
 - it is persisted across runs in a local settings file
 - changing it clears the current conversation so the new behavior starts cleanly
-
-The saved session behaves like this:
-
-- only the most recent saved session is kept
-- `/resume` restores it into the current conversation
-- `/forget` deletes it and clears the current conversation
-- changing the system prompt also deletes the saved session snapshot so stale history is not resumed later
 
 The current session metadata uses simple stats:
 
@@ -181,7 +182,7 @@ npm test
 - `src/cli.ts`: CLI entry behavior, single-turn mode, interactive mode, TUI wiring
 - `src/agent/loop.ts`: session state, prompt assembly, history truncation, and session stats
 - `src/config/settings.ts`: persisted system prompt settings
-- `src/session/store.ts`: persisted session snapshot storage
+- `src/session/store.ts`: multi-session storage, index management, and active-session selection
 - `src/prompts/system.ts`: central base system prompt definition
 - `src/llm/types.ts`: shared message and client types
 - `src/llm/router.ts`: current provider routing
@@ -193,7 +194,7 @@ npm test
 ## Near-Term Priorities
 
 - improve the base system prompt itself and make profiles easier to manage
-- decide whether single-session persistence should stay manual or become auto-resume
+- improve multi-session UX with better hints, renaming, and previews
 - expand the TUI carefully without introducing heavy dependencies
 - add tools only after chat behavior is stable
 

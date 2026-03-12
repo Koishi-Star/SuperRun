@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import test from "node:test";
 import { startMockOpenAIServer } from "./helpers/mock-openai-server.js";
 
@@ -12,6 +12,7 @@ test("CLI interactive mode preserves history across turns", async () => {
     "Hello Ada.",
     "Your name is Ada.",
   ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
 
   try {
     const cliPath = path.resolve("src/index.ts");
@@ -26,6 +27,7 @@ test("CLI interactive mode preserves history across turns", async () => {
           OPENAI_BASE_URL: server.baseURL,
           OPENAI_MODEL: "mock-model",
           OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
@@ -67,11 +69,13 @@ test("CLI interactive mode preserves history across turns", async () => {
     assert.match(stdout, /assistant: Your name is Ada\./);
   } finally {
     await server.close();
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 
-test("CLI handles local slash commands without calling the model", async () => {
+test("CLI handles local slash commands and rejects unknown slash commands without calling the model", async () => {
   const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
 
   try {
     const cliPath = path.resolve("src/index.ts");
@@ -86,6 +90,7 @@ test("CLI handles local slash commands without calling the model", async () => {
           OPENAI_BASE_URL: server.baseURL,
           OPENAI_MODEL: "mock-model",
           OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
@@ -104,15 +109,62 @@ test("CLI handles local slash commands without calling the model", async () => {
     });
 
     child.stdin.write("/help\n");
+    child.stdin.write("/sessiojn\n");
     child.stdin.end("/exit\n");
 
     const [exitCode] = (await once(child, "close")) as [number | null];
 
     assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
     assert.equal(server.requests.length, 0);
-    assert.match(stdout, /Commands: \/help \/settings \/session \/resume \/forget \/system \/system reset \/clear \/exit/);
+    assert.match(stdout, /Commands: \/help \/settings \/session \/sessions \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
+    assert.match(stderr, /error: Unknown command: \/sessiojn\. Type \/help\./);
   } finally {
     await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI accepts exit aliases in interactive mode", async () => {
+  const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const cliPath = path.resolve("src/index.ts");
+
+    for (const exitCommand of ["exit", "exit()"]) {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", cliPath],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            OPENAI_API_KEY: "test-key",
+            OPENAI_BASE_URL: server.baseURL,
+            OPENAI_MODEL: "mock-model",
+            OPENAI_TIMEOUT_MS: "5000",
+            SUPERRUN_CONFIG_DIR: tempDir,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+
+      child.stdin.end(`${exitCommand}\n`);
+
+      const [exitCode] = (await once(child, "close")) as [number | null];
+      assert.equal(exitCode, 0, stderr || `CLI exited with a non-zero code for ${exitCommand}.`);
+    }
+
+    assert.equal(server.requests.length, 0);
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 
@@ -172,7 +224,7 @@ test("CLI persists a custom system prompt and resets history when it changes", a
       },
       { role: "user", content: "What is my name?" },
     ]);
-    assert.match(stdout, /This prompt controls the agent's behavior on every turn\./);
+    assert.match(stdout, /This prompt controls the default behavior for the current conversation\./);
     assert.match(stdout, /Conversation history cleared so the new behavior starts cleanly\./);
     assert.match(stdout, /This agent will now behave as: You are a strict coding reviewer\. Be terse and skeptical\./);
 
@@ -184,11 +236,14 @@ test("CLI persists a custom system prompt and resets history when it changes", a
   }
 });
 
-test("CLI can resume a saved session across runs and forget it", async () => {
+test("CLI can rename sessions, show previews, and switch by list index", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
   const cliPath = path.resolve("src/index.ts");
 
-  const firstServer = await startMockOpenAIServer(["Hello Ada."]);
+  const firstServer = await startMockOpenAIServer([
+    "Hello Ada.",
+    "Hello Grace.",
+  ]);
 
   try {
     const firstChild = spawn(
@@ -215,6 +270,8 @@ test("CLI can resume a saved session across runs and forget it", async () => {
     });
 
     firstChild.stdin.write("My name is Ada.\n");
+    firstChild.stdin.write("/new\n");
+    firstChild.stdin.write("My name is Grace.\n");
     firstChild.stdin.end("/exit\n");
 
     const [firstExitCode] = (await once(firstChild, "close")) as [number | null];
@@ -222,6 +279,28 @@ test("CLI can resume a saved session across runs and forget it", async () => {
   } finally {
     await firstServer.close();
   }
+
+  const indexPath = path.join(tempDir, "sessions", "index.json");
+  const sessionFiles = await readdir(path.join(tempDir, "sessions"));
+  const storedSessionIds = sessionFiles
+    .filter((name) => name.endsWith(".json") && name !== "index.json")
+    .map((name) => name.replace(/\.json$/, ""));
+  assert.equal(storedSessionIds.length, 2);
+
+  let adaSessionId = "";
+
+  for (const sessionId of storedSessionIds) {
+    const content = await readFile(
+      path.join(tempDir, "sessions", `${sessionId}.json`),
+      "utf8",
+    );
+    if (content.includes("My name is Ada.")) {
+      adaSessionId = sessionId;
+      break;
+    }
+  }
+
+  assert.ok(adaSessionId, "Expected to find a saved session containing Ada.");
 
   const secondServer = await startMockOpenAIServer(["Your name is Ada."]);
 
@@ -255,10 +334,12 @@ test("CLI can resume a saved session across runs and forget it", async () => {
       stderr += chunk;
     });
 
-    secondChild.stdin.write("/session\n");
-    secondChild.stdin.write("/resume\n");
+    secondChild.stdin.write("/sessions\n");
+    secondChild.stdin.write("/switch 2\n");
+    secondChild.stdin.write("/rename Ada Session\n");
     secondChild.stdin.write("What is my name?\n");
-    secondChild.stdin.write("/forget\n");
+    secondChild.stdin.write("/sessions\n");
+    secondChild.stdin.write("/delete Ada Session\n");
     secondChild.stdin.end("/exit\n");
 
     const [secondExitCode] = (await once(secondChild, "close")) as [number | null];
@@ -275,15 +356,18 @@ test("CLI can resume a saved session across runs and forget it", async () => {
       { role: "assistant", content: "Hello Ada." },
       { role: "user", content: "What is my name?" },
     ]);
-    assert.match(stdout, /Saved session available:/);
-    assert.match(stdout, /Saved session: 1 turns, 2 messages, 25 chars\./);
-    assert.match(stdout, /Resumed saved session from /);
-    assert.match(stdout, /Removed saved session at /);
+    assert.match(stdout, new RegExp(`Current session: .*Saved sessions: 2\\.`));
+    assert.match(stdout, /Use "\/switch <index>", "\/switch <id>", or "\/switch <title>" to load a session\./);
+    assert.match(stdout, /\* 1\. My name is Grace\./);
+    assert.match(stdout, / 2\. My name is Ada\./);
+    assert.match(stdout, new RegExp(`Switched to session: My name is Ada\\. \\[${adaSessionId}\\]`));
+    assert.match(stdout, new RegExp(`Renamed session: Ada Session \\[${adaSessionId}\\]`));
+    assert.match(stdout, new RegExp(`\\* 1\\. Ada Session \\[${adaSessionId}\\]`));
+    assert.match(stdout, /Assistant: Your name is Ada\./);
+    assert.match(stdout, new RegExp(`Deleted session: ${adaSessionId}`));
 
-    await assert.rejects(
-      () => readFile(path.join(tempDir, "session.json"), "utf8"),
-      /ENOENT/,
-    );
+    const indexContent = await readFile(indexPath, "utf8");
+    assert.doesNotMatch(indexContent, new RegExp(adaSessionId));
   } finally {
     await secondServer.close();
     await rm(tempDir, { recursive: true, force: true });

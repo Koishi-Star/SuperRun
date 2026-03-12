@@ -11,21 +11,24 @@
 - Runtime: Node.js + TypeScript + ESM.
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `superrun [prompt]`.
-- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, and now provides a lightweight terminal UI in TTY sessions.
-- `src/agent/loop.ts` manages session state, message history, system prompt assembly, and per-turn model calls.
+- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings and session management.
+- `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, and per-turn model calls.
 - `src/prompts/system.ts` centralizes the base system prompt used for each session.
+- `src/config/settings.ts` persists the default system prompt profile used across runs.
+- `src/config/paths.ts` centralizes where local config and session files are stored.
 - `src/llm/types.ts` defines the shared chat message, chat options, and client interface types.
 - `src/llm/router.ts` currently routes all requests to a single OpenAI-compatible client.
 - `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming and proxy support.
 - `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
+- `src/session/store.ts` persists multiple saved sessions, tracks the active session, and restores it across CLI runs.
 - `src/ui/tui.ts` contains the lightweight terminal UI helpers used in TTY interactive sessions.
-- `test/` contains focused tests for env parsing, agent loop history handling, and interactive CLI multi-turn behavior using a local mock OpenAI-compatible server.
+- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, lightweight TTY UI, and focused tests for the current slice.
-- Not done yet: history truncation, prompt override/configuration, session persistence across runs, multi-provider routing, and tool execution.
-- Current maturity: the chat loop is usable for local experiments, but the agent still behaves like a chat CLI rather than a full coding agent.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, lightweight TTY UI, and focused tests for the current slice.
+- Not done yet: session rename, richer `/sessions` previews, search/filter for larger session lists, multi-provider routing, and tool execution.
+- Current maturity: the chat loop is usable for local experiments and saved-session workflows, but the agent still behaves like a chat CLI rather than a full coding agent.
 
 ## Working rules
 
@@ -47,10 +50,10 @@
 
 ## Priorities for upcoming work
 
-1. Improve prompt handling by making the centralized system prompt easier to override and evolve.
-2. Add lightweight history truncation so long chats do not grow without bound.
+1. Improve multi-session UX by adding session rename support and making `/sessions` show human-friendly previews instead of raw ids only.
+2. Decide the minimum session metadata model for that UX slice: manual titles only, or titles plus derived preview text and timestamps.
 3. Expand the lightweight TUI carefully with session metadata, transient status states, and clearer error surfacing.
-4. Decide whether sessions should be in-memory only or optionally persisted across CLI runs.
+4. Refine prompt handling so the centralized system prompt is easier to evolve without confusing saved sessions.
 5. Add router-level coverage once a second provider or selection rule exists.
 6. Only after chat behavior is stable, introduce a narrow tool interface for local command execution or file operations.
 
@@ -71,4 +74,6 @@
 
 - The placeholder assistant output in `src/cli.ts` has already been replaced by a real model call.
 - Multi-turn chat and centralized system prompt assembly are already in place.
+- Saved multi-session workflows are already in place, including active-session restore between runs.
+- System prompt overrides are already persisted locally and reset the current conversation when changed.
 - The project now has a small `node:test` suite executed via `npm test`.
