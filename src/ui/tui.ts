@@ -1,5 +1,6 @@
 import type { Writable } from "node:stream";
 import chalk from "chalk";
+import type { ModePickerViewModel } from "./mode-picker.js";
 import type { SessionPickerViewModel } from "./session-picker.js";
 
 export type TerminalUI = {
@@ -9,6 +10,7 @@ export type TerminalUI = {
   renderCommands: () => void;
   renderAssistantPrefix: () => void;
   renderSectionTitle: (title: string) => void;
+  renderModePicker: (viewModel: ModePickerViewModel) => void;
   renderSessionPicker: (viewModel: SessionPickerViewModel) => void;
   renderInfo: (message: string) => void;
   renderError: (message: string) => void;
@@ -48,6 +50,49 @@ export function createTerminalUI(output: Writable): TerminalUI {
     },
     renderSectionTitle: (title: string) => {
       output.write(`${chalk.bold(title)}\n`);
+    },
+    renderModePicker: (viewModel: ModePickerViewModel) => {
+      const width = getFrameWidth(output);
+      const divider = `+${"-".repeat(width - 2)}+`;
+      const lines: string[] = [
+        divider,
+        formatFrameLine(width, "Mode Picker", "Tool Surface"),
+        divider,
+        formatFrameTextLine(
+          width,
+          "Use arrows to move, Enter to confirm, and q/Esc to return.",
+        ),
+        divider,
+      ];
+
+      for (const [index, option] of viewModel.options.entries()) {
+        const selected = index === viewModel.selectedIndex;
+
+        if (option.kind === "mode") {
+          const suffix = option.isCurrent ? " (current)" : "";
+          lines.push(
+            formatPickerOptionLine(
+              width,
+              `${selected ? ">" : " "} ${option.label}${suffix}`,
+              selected,
+            ),
+          );
+          lines.push(formatFrameTextLine(width, `  ${option.description}`));
+          lines.push(formatFrameTextLine(width, ""));
+          continue;
+        }
+
+        lines.push(
+          formatPickerOptionLine(
+            width,
+            `${selected ? ">" : " "} ${option.label}`,
+            selected,
+          ),
+        );
+      }
+
+      lines.push(divider);
+      output.write(`${lines.join("\n")}\n`);
     },
     renderSessionPicker: (viewModel: SessionPickerViewModel) => {
       const width = getFrameWidth(output);

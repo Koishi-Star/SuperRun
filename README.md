@@ -13,11 +13,14 @@ What works today:
 - OpenAI-compatible chat completion provider
 - process-level agent modes with `default` and opt-in `strict`
 - guarded command execution in default mode
+- a keyboard-driven `/mode` picker in TTY sessions
 - persistent system prompt profiles managed from the interactive UI
 - multi-session storage with switching and deletion commands
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
+- live `@file` suggestions in the TTY prompt, with arrow-key selection and Tab insertion
+- local TTY validation that blocks unresolved `@file` references before they reach the model
 - strict-mode specialized tool support, with `list_files` as the first read-only tool
 - focused tests for env parsing, agent history, and CLI interaction
 
@@ -138,6 +141,14 @@ Mode behavior:
 - `default`: enables guarded `run_command` for inspection, build, lint, and test flows
 - `strict`: hides command execution and exposes only the specialized strict-mode tools
 
+TTY input helpers:
+
+- type `/mode` and press Enter to open the mode picker
+- type `@` followed by part of a path to see matching files under the prompt
+- use `Up` and `Down` to choose a match, then press `Tab` to insert it
+- unresolved `@token` references stay local to the composer and are not sent to the model
+- use `@@` when you need a literal `@` in the TTY composer
+
 The current conversation now works with multiple saved sessions:
 
 - each saved session lives under `sessions/<id>.json`
@@ -215,7 +226,7 @@ npm test
 
 - improve the base system prompt itself and make profiles easier to manage
 - improve multi-session UX with better hints, renaming, and previews
-- expand the TUI carefully without introducing heavy dependencies
+- phase the current imperative TTY composer toward a heavier Ink-based TUI shell
 - add tools only after chat behavior is stable
 
 ## License

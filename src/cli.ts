@@ -32,7 +32,10 @@ import {
   type SessionStoreState,
   type StoredSession,
 } from "./session/store.js";
+import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
+import { runModePickerInteraction } from "./ui/mode-picker-controller.js";
 import { runSessionPickerInteraction } from "./ui/session-picker-controller.js";
+import { readTTYPrompt } from "./ui/tty-prompt.js";
 import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
 export const program = new Command();
@@ -82,6 +85,7 @@ type InteractiveState = {
   currentSessionId: string | null;
   currentSessionTitle: string | null;
   pendingSystemPromptLines: string[] | null;
+  workspaceFiles: string[] | null;
 };
 
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
@@ -104,6 +108,7 @@ async function createInteractiveState(
         currentSessionId,
         currentSessionTitle: storedSession.title,
         pendingSystemPromptLines: null,
+        workspaceFiles: null,
       };
     } catch {
       sessionStore = await setActiveSession(null);
@@ -116,6 +121,7 @@ async function createInteractiveState(
     currentSessionId,
     currentSessionTitle: null,
     pendingSystemPromptLines: null,
+    workspaceFiles: null,
   };
 }
 
@@ -143,7 +149,6 @@ async function runInteractiveSession(
   session: AgentSession,
   state: InteractiveState,
 ): Promise<void> {
-  const rl = createInterface({ input, output });
   const ui = input.isTTY && output.isTTY ? createTerminalUI(output) : null;
 
   if (ui) {
@@ -154,27 +159,32 @@ async function runInteractiveSession(
     renderSessionStoreHint(ui, state);
   }
 
-  try {
-    if (ui) {
+  if (ui) {
+    emitKeypressEvents(input);
+    input.resume();
+
+    try {
       while (true) {
-        let prompt: string;
+        const prompt = (await readTTYPrompt({
+          input,
+          output,
+          promptLabel: ui.promptLabel,
+          workspaceFiles: await ensureWorkspaceFilesLoaded(state),
+        })).trim();
 
-        try {
-          prompt = (await rl.question(ui.promptLabel)).trim();
-        } catch (error) {
-          if (isReadlineClosedError(error)) {
-            break;
-          }
-          throw error;
-        }
-
-        if (!(await handleInteractivePrompt(session, prompt, rl, state, ui))) {
+        if (!(await handleInteractivePrompt(session, prompt, state, ui))) {
           break;
         }
       }
-      return;
+    } finally {
+      input.pause();
     }
 
+    return;
+  }
+
+  const rl = createInterface({ input, output });
+  try {
     for await (const line of rl) {
       if (!(await handlePipedInteractiveLine(session, line, state, ui))) {
         break;
@@ -188,7 +198,6 @@ async function runInteractiveSession(
 async function handleInteractivePrompt(
   session: AgentSession,
   prompt: string,
-  rl: Interface,
   state: InteractiveState,
   ui: TerminalUI | null,
 ): Promise<boolean> {
@@ -211,6 +220,16 @@ async function handleInteractivePrompt(
 
   if (matchesCommand(prompt, "/mode")) {
     const requestedMode = parseCommandArgument(prompt, "/mode");
+
+    if (ui && !requestedMode) {
+      const selectedMode = await runModePicker(ui, session.mode);
+      renderInteractiveShell(ui, session, state);
+      if (selectedMode) {
+        session.mode = selectedMode;
+        renderAgentModeChanged(ui, selectedMode);
+      }
+      return true;
+    }
 
     if (!requestedMode) {
       renderAgentModeSummary(ui, session.mode);
@@ -406,7 +425,7 @@ async function handleInteractivePrompt(
   }
 
   if (prompt === "/system") {
-    await runSystemPromptEditor(session, rl, state, ui);
+    await runSystemPromptEditor(session, state, ui);
     return true;
   }
 
@@ -470,7 +489,7 @@ async function handlePipedInteractiveLine(
     return true;
   }
 
-  return handleInteractivePrompt(session, prompt, null as never, state, ui);
+  return handleInteractivePrompt(session, prompt, state, ui);
 }
 
 async function handlePipedSystemPromptLine(
@@ -512,29 +531,29 @@ async function handlePipedSystemPromptLine(
   return true;
 }
 
-function isReadlineClosedError(error: unknown): boolean {
-  return error instanceof Error && error.message === "readline was closed";
-}
-
 async function runSystemPromptEditor(
   session: AgentSession,
-  rl: Interface,
   state: InteractiveState,
   ui: TerminalUI | null,
 ): Promise<void> {
   renderSystemPromptTips(ui, session.systemPrompt);
+  const rl = createInterface({ input, output });
 
-  const nextPrompt = await readMultilineSystemPrompt(rl, ui);
-  if (nextPrompt === null) {
-    renderInfo(ui, "System prompt update cancelled.");
-    return;
+  try {
+    const nextPrompt = await readMultilineSystemPrompt(rl, ui);
+    if (nextPrompt === null) {
+      renderInfo(ui, "System prompt update cancelled.");
+      return;
+    }
+
+    const settings = await saveSystemPrompt(nextPrompt);
+    state.settings = settings;
+    resetCurrentSession(session, settings.systemPrompt);
+    await persistCurrentSession(session, state, { allowEmpty: true });
+    renderSystemPromptApplied(ui, session, settings, true);
+  } finally {
+    rl.close();
   }
-
-  const settings = await saveSystemPrompt(nextPrompt);
-  state.settings = settings;
-  resetCurrentSession(session, settings.systemPrompt);
-  await persistCurrentSession(session, state, { allowEmpty: true });
-  renderSystemPromptApplied(ui, session, settings, true);
 }
 
 async function readMultilineSystemPrompt(
@@ -1103,6 +1122,33 @@ async function runSessionPicker(
     currentSessionId: state.currentSessionId,
     filterQuery: options?.filterQuery,
   });
+}
+
+async function runModePicker(
+  ui: TerminalUI,
+  currentMode: AgentMode,
+): Promise<AgentMode | null> {
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    return null;
+  }
+
+  emitKeypressEvents(input);
+  return runModePickerInteraction({
+    ui,
+    input,
+    currentMode,
+  });
+}
+
+async function ensureWorkspaceFilesLoaded(
+  state: InteractiveState,
+): Promise<string[]> {
+  if (state.workspaceFiles) {
+    return state.workspaceFiles;
+  }
+
+  state.workspaceFiles = await loadWorkspaceFilePaths(process.cwd());
+  return state.workspaceFiles;
 }
 
 function filterSessionSummaries(
