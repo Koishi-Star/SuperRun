@@ -40,6 +40,7 @@ import type {
   CommandApprovalMode,
   CommandApprovalRequest,
   ToolExecutionContext,
+  WorkspaceEditApprovalRequest,
 } from "./tools/types.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
@@ -68,7 +69,7 @@ program
   .addOption(
     new Option(
       "--approvals <mode>",
-      'command approval mode: "ask" prompts before non-read-only commands, "allow-all" auto-approves, "reject" disables command execution',
+      'approval mode: "ask" prompts before file edits and non-read-only commands, "allow-all" auto-approves, "reject" disables local mutations and command execution',
     )
       .choices(["ask", "allow-all", "reject"])
       .default("ask"),
@@ -769,7 +770,7 @@ function buildInteractiveShellFrame(
     { kind: "body", text: "" },
     {
       kind: "info",
-      text: `Command approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`,
+      text: `Approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`,
     },
     {
       kind: "info",
@@ -785,7 +786,7 @@ function buildInteractiveShellFrame(
     },
     {
       kind: "info",
-      text: 'Use "/approvals" to review command approval behavior.',
+      text: 'Use "/approvals" to review file-edit and command approval behavior.',
     },
     {
       kind: "info",
@@ -848,7 +849,7 @@ function renderSessionPromptHint(
     ui,
     `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
-  renderInfo(ui, 'Use "/approvals" to review command approval behavior.');
+  renderInfo(ui, 'Use "/approvals" to review file-edit and command approval behavior.');
   renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
 }
 
@@ -933,7 +934,7 @@ function renderApprovalSummary(
   ui: InteractiveRenderer | null,
   mode: CommandApprovalMode,
 ): void {
-  renderInfo(ui, `Command approvals: ${getCommandApprovalSummary(mode)}.`);
+  renderInfo(ui, `Approvals: ${getCommandApprovalSummary(mode)}.`);
 }
 
 function renderCurrentSessionSummary(
@@ -957,7 +958,7 @@ function renderCurrentSessionSummary(
     )}`,
   );
   renderInfo(ui, `Mode: ${getAgentModeSummary(session.mode)}.`);
-  renderInfo(ui, `Command approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`);
+  renderInfo(ui, `Approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`);
   renderInfo(
     ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
@@ -1416,8 +1417,8 @@ async function runApprovalPicker(
   ui: InteractiveRenderer,
 ): Promise<CommandApprovalMode | null> {
   const selectedMode = await ui.selectOption({
-    title: "Command Approvals",
-    subtitle: "Choose how shell execution is approved in this process.",
+    title: "Approvals",
+    subtitle: "Choose how file edits and shell execution are approved in this process.",
     helpText: "Up/Down move  Enter apply  Esc cancel",
     options: buildApprovalPickerOptions(currentMode),
   });
@@ -1437,6 +1438,18 @@ function createToolExecutionContext(
       },
       ...(ui ? { requestApproval: (request: CommandApprovalRequest) => promptCommandApproval(request, ui) } : {}),
       ...(state.commandHookRunner ? { runHook: state.commandHookRunner } : {}),
+    },
+    workspaceEditPolicy: {
+      getMode: () => state.commandApprovalMode,
+      setMode: (mode) => {
+        state.commandApprovalMode = mode;
+      },
+      ...(ui
+        ? {
+            requestApproval: (request: WorkspaceEditApprovalRequest) =>
+              promptWorkspaceEditApproval(request, ui),
+          }
+        : {}),
     },
   };
 }
@@ -1476,6 +1489,41 @@ async function promptCommandApproval(
   return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
 }
 
+async function promptWorkspaceEditApproval(
+  request: WorkspaceEditApprovalRequest,
+  ui: InteractiveRenderer,
+): Promise<CommandApprovalDecision> {
+  const { assessment } = request;
+  const reasonSummary = assessment.reasons.join(" ");
+  const selectedDecision = await ui.selectOption({
+    title: `Approve ${assessment.tool}?`,
+    subtitle: `${assessment.summary}: ${assessment.path}`,
+    helpText: "Up/Down move  Enter choose  Esc reject",
+    options: [
+      {
+        value: "once",
+        label: "Approve once",
+        description: `${assessment.summary}. ${reasonSummary}`,
+        tone: "accent",
+      },
+      {
+        value: "always",
+        label: "Allow all this session",
+        description: "Switch approvals to allow-all for later file edits and commands in this process.",
+        tone: "default",
+      },
+      {
+        value: "reject",
+        label: "Reject",
+        description: `Block this edit: ${assessment.path}`,
+        tone: "danger",
+      },
+    ],
+  });
+
+  return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
+}
+
 function buildApprovalPickerOptions(
   currentMode: CommandApprovalMode,
 ): RendererPickerOption[] {
@@ -1483,19 +1531,19 @@ function buildApprovalPickerOptions(
     {
       value: "ask",
       label: currentMode === "ask" ? "ask (current)" : "ask",
-      description: "Auto-run read-only commands and prompt before other shell execution.",
+      description: "Auto-run read-only tools and prompt before file edits or other shell execution.",
       tone: currentMode === "ask" ? "accent" : "default",
     },
     {
       value: "allow-all",
       label: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
-      description: "Auto-approve command execution for the current process.",
+      description: "Auto-approve file edits and command execution for the current process.",
       tone: currentMode === "allow-all" ? "accent" : "default",
     },
     {
       value: "reject",
       label: currentMode === "reject" ? "reject (current)" : "reject",
-      description: "Block run_command entirely for the current process.",
+      description: "Block file edits and run_command for the current process.",
       tone: currentMode === "reject" ? "accent" : "default",
     },
     {

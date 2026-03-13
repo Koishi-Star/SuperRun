@@ -123,14 +123,14 @@ export function getCommandApprovalSummary(
   mode: (typeof COMMAND_APPROVAL_MODES)[number],
 ): string {
   if (mode === "allow-all") {
-    return "allow-all (auto-approve command execution for this session)";
+    return "allow-all (auto-approve file edits and command execution for this session)";
   }
 
   if (mode === "reject") {
-    return "reject (deny command execution)";
+    return "reject (deny file edits and command execution)";
   }
 
-  return "ask (prompt before non-read-only command execution)";
+  return "ask (prompt before file edits or non-read-only command execution)";
 }
 
 export function classifyCommand(

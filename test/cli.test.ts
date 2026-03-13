@@ -133,3 +133,50 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("CLI single-turn write_file tool calls also require Ink approval in ask mode", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "write_file",
+          arguments: JSON.stringify({
+            path: "note.txt",
+            content: "hello\n",
+          }),
+        },
+      ],
+    },
+    "The write was blocked pending interactive approval.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const result = await spawnCLI(
+      ["Create a note."],
+      {
+        ...process.env,
+        OPENAI_API_KEY: "test-key",
+        OPENAI_BASE_URL: server.baseURL,
+        OPENAI_MODEL: "mock-model",
+        OPENAI_TIMEOUT_MS: "5000",
+        SUPERRUN_CONFIG_DIR: tempDir,
+      },
+    );
+
+    assert.equal(result.exitCode, 0, result.stderr || "CLI exited with a non-zero code.");
+    assert.equal(server.requests.length, 2);
+    assert.match(result.stdout, /assistant: The write was blocked pending interactive approval\./);
+
+    const toolMessage = server.requests[1]?.messages.at(-1);
+    assert.equal(toolMessage?.role, "tool");
+    assert.match(
+      String(toolMessage?.content ?? ""),
+      /write_file requires approval\. Re-run in the Ink TTY shell or switch approvals to allow-all\./,
+    );
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

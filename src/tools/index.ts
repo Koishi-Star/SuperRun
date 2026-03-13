@@ -1,11 +1,21 @@
 import type { AgentMode } from "../agent/mode.js";
 import type { ToolCall, ToolDefinition } from "../llm/types.js";
+import { deleteFileTool } from "./delete_file.js";
 import { listFilesTool } from "./list_files.js";
+import { readFileTool } from "./read_file.js";
+import { restoreDeletedFileTool } from "./restore_deleted_file.js";
 import { runCommandTool } from "./run_command.js";
 import type { ToolExecutionContext } from "./types.js";
+import { writeFileTool } from "./write_file.js";
 
-const defaultModeTools = [runCommandTool] as const;
-const strictModeTools = [listFilesTool] as const;
+const defaultModeTools = [
+  runCommandTool,
+  readFileTool,
+  writeFileTool,
+  deleteFileTool,
+  restoreDeletedFileTool,
+] as const;
+const strictModeTools = [listFilesTool, readFileTool] as const;
 
 export function getAgentToolDefinitions(mode: AgentMode): ToolDefinition[] {
   return getAgentTools(mode).map((tool) => tool.definition);

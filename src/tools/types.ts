@@ -23,6 +23,19 @@ export type CommandApprovalRequest = {
   approvalMode: CommandApprovalMode;
 };
 
+export type WorkspaceEditAssessment = {
+  tool: "write_file" | "delete_file" | "restore_deleted_file";
+  path: string;
+  summary: string;
+  reasons: string[];
+  approvalRequired: boolean;
+};
+
+export type WorkspaceEditApprovalRequest = {
+  assessment: WorkspaceEditAssessment;
+  approvalMode: CommandApprovalMode;
+};
+
 export type CommandHookEvent =
   | {
       stage: "before";
@@ -54,6 +67,15 @@ export type CommandPolicyContext = {
   runHook?: (event: CommandHookEvent) => Promise<CommandHookResult | void>;
 };
 
+export type WorkspaceEditPolicyContext = {
+  getMode: () => CommandApprovalMode;
+  setMode: (mode: CommandApprovalMode) => void;
+  requestApproval?: (
+    request: WorkspaceEditApprovalRequest,
+  ) => Promise<CommandApprovalDecision>;
+};
+
 export type ToolExecutionContext = {
   commandPolicy?: CommandPolicyContext;
+  workspaceEditPolicy?: WorkspaceEditPolicyContext;
 };

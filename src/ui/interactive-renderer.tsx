@@ -235,7 +235,7 @@ export function createInteractiveRenderer(options: {
       appendLines("section", "Available commands");
       appendLines("body", "/help  Show command help");
       appendLines("body", "/mode     Show or switch the active tool mode (default|strict)");
-      appendLines("body", "/approvals Show or switch the command approval mode (ask|allow-all|reject)");
+      appendLines("body", "/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|reject)");
       appendLines("body", "/settings Show the active system prompt and persistence path");
       appendLines("body", "/session  Show current session status");
       appendLines("body", "/history  Show the current or selected session transcript");
