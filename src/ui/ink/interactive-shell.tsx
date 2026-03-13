@@ -177,7 +177,11 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
         </Box>
       );
     case "warning":
-      return <Text color="yellowBright">{text}</Text>;
+      return (
+        <Text bold color="yellowBright">
+          {text}
+        </Text>
+      );
     case "assistant":
       return (
         <Box flexDirection="row">

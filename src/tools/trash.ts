@@ -4,7 +4,9 @@ import {
   copyFile,
   lstat,
   mkdir,
+  readdir,
   readFile,
+  rm,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -109,6 +111,78 @@ export async function restoreWorkspaceFileFromTrash(
   };
 }
 
+export async function listWorkspaceTrashEntries(): Promise<{
+  entries: DeletedFileEntry[];
+  status: DeleteAreaStatus;
+}> {
+  const trashPaths = getWorkspaceTrashPaths(process.cwd());
+  const index = await loadTrashIndex(trashPaths.indexPath);
+
+  return {
+    entries: [...index.entries].sort((left, right) => right.deletedAt.localeCompare(left.deletedAt)),
+    status: summarizeTrashIndex(index),
+  };
+}
+
+export async function purgeWorkspaceFileFromTrash(
+  id: string,
+): Promise<{
+  entry: DeletedFileEntry;
+  status: DeleteAreaStatus;
+}> {
+  const trashPaths = getWorkspaceTrashPaths(process.cwd());
+  const index = await loadTrashIndex(trashPaths.indexPath);
+  const entry = index.entries.find((candidate) => candidate.id === id);
+
+  if (!entry) {
+    throw new Error(`Deleted file does not exist: ${id}`);
+  }
+
+  await unlink(path.join(trashPaths.filesDirectoryPath, entry.storedFileName));
+  index.entries = index.entries.filter((candidate) => candidate.id !== id);
+  await saveTrashIndex(trashPaths.indexPath, index);
+
+  return {
+    entry,
+    status: summarizeTrashIndex(index),
+  };
+}
+
+export async function emptyWorkspaceTrash(): Promise<{
+  purgedCount: number;
+  status: DeleteAreaStatus;
+}> {
+  const trashPaths = getWorkspaceTrashPaths(process.cwd());
+  const index = await loadTrashIndex(trashPaths.indexPath);
+  const purgedCount = index.entries.length;
+
+  for (const entry of index.entries) {
+    const storedPath = path.join(trashPaths.filesDirectoryPath, entry.storedFileName);
+    try {
+      await unlink(storedPath);
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  index.entries = [];
+  await saveTrashIndex(trashPaths.indexPath, index);
+  await pruneEmptyTrashDirectories(trashPaths.filesDirectoryPath);
+
+  return {
+    purgedCount,
+    status: summarizeTrashIndex(index),
+  };
+}
+
+export async function getWorkspaceDeleteAreaStatus(): Promise<DeleteAreaStatus> {
+  const trashPaths = getWorkspaceTrashPaths(process.cwd());
+  const index = await loadTrashIndex(trashPaths.indexPath);
+  return summarizeTrashIndex(index);
+}
+
 async function chooseRestorePath(
   workspaceRoot: string,
   originalPath: string,
@@ -203,6 +277,19 @@ async function loadTrashIndex(indexPath: string): Promise<TrashIndex> {
 async function saveTrashIndex(indexPath: string, index: TrashIndex): Promise<void> {
   await mkdir(path.dirname(indexPath), { recursive: true });
   await writeFile(`${indexPath}`, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+}
+
+async function pruneEmptyTrashDirectories(filesDirectoryPath: string): Promise<void> {
+  try {
+    const remainingFiles = await readdir(filesDirectoryPath);
+    if (remainingFiles.length === 0) {
+      await rm(filesDirectoryPath, { recursive: true, force: true });
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
 }
 
 function summarizeTrashIndex(index: TrashIndex): DeleteAreaStatus {

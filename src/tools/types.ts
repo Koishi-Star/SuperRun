@@ -24,7 +24,14 @@ export type CommandApprovalRequest = {
 };
 
 export type WorkspaceEditAssessment = {
-  tool: "write_file" | "delete_file" | "restore_deleted_file";
+  tool:
+    | "write_file"
+    | "replace_lines"
+    | "insert_lines"
+    | "delete_file"
+    | "restore_deleted_file"
+    | "purge_deleted_file"
+    | "empty_delete_area";
   path: string;
   summary: string;
   reasons: string[];

@@ -35,6 +35,7 @@ import {
   parseCommandApprovalMode,
 } from "./tools/command_policy.js";
 import { createEnvCommandHookRunner } from "./tools/command_hooks.js";
+import { getWorkspaceDeleteAreaStatus } from "./tools/trash.js";
 import type {
   CommandApprovalDecision,
   CommandApprovalMode,
@@ -107,6 +108,7 @@ program
           pendingDeleteAllConfirmation: false,
           pendingSystemPromptLines: null,
           workspaceFiles: null,
+          deleteAreaStatus: await getWorkspaceDeleteAreaStatus(),
         });
         return;
       }
@@ -135,6 +137,10 @@ type InteractiveState = {
   pendingDeleteAllConfirmation: boolean;
   pendingSystemPromptLines: string[] | null;
   workspaceFiles: string[] | null;
+  deleteAreaStatus: {
+    fileCount: number;
+    totalBytes: number;
+  };
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
 };
@@ -149,6 +155,7 @@ async function createInteractiveState(
   let sessionStore = await loadSessionStore();
   let currentSessionId: string | null = null;
   const commandHookRunner = createEnvCommandHookRunner();
+  const deleteAreaStatus = await getWorkspaceDeleteAreaStatus();
 
   if (sessionStore.activeSessionId) {
     try {
@@ -163,6 +170,7 @@ async function createInteractiveState(
         pendingDeleteAllConfirmation: false,
         pendingSystemPromptLines: null,
         workspaceFiles: null,
+        deleteAreaStatus,
         commandApprovalMode: approvalMode,
         commandHookRunner,
       };
@@ -179,6 +187,7 @@ async function createInteractiveState(
     pendingDeleteAllConfirmation: false,
     pendingSystemPromptLines: null,
     workspaceFiles: null,
+    deleteAreaStatus,
     commandApprovalMode: approvalMode,
     commandHookRunner,
   };
@@ -215,6 +224,7 @@ async function runInteractiveSession(
 
   try {
     while (true) {
+      await refreshDeleteAreaBanner(session, state, ui);
       const prompt = await ui.readPrompt({
         promptLabel: getTTYPromptLabel(ui, state),
         workspaceFiles: state.pendingSystemPromptLines
@@ -569,6 +579,7 @@ async function handleInteractivePrompt(
   });
 
   await persistCurrentSession(session, state);
+  await refreshDeleteAreaBanner(session, state, ui);
 
   if (!reply) {
     if (ui) {
@@ -767,6 +778,7 @@ function buildInteractiveShellFrame(
       kind: "warning",
       text: "Recommendation: initialize git in the workspace so you have a recovery path for your files.",
     },
+    ...buildDeleteAreaBannerLines(state),
     { kind: "body", text: "" },
     {
       kind: "info",
@@ -824,6 +836,33 @@ function buildInteractiveShellFrame(
   return lines;
 }
 
+function buildDeleteAreaBannerLines(
+  state: InteractiveState,
+): Array<Omit<RendererLine, "id">> {
+  const bannerText = getDeleteAreaBannerText(state.deleteAreaStatus);
+  if (!bannerText) {
+    return [];
+  }
+
+  return [
+    {
+      kind: "warning",
+      text: bannerText,
+    },
+  ];
+}
+
+export function getDeleteAreaBannerText(status: {
+  fileCount: number;
+  totalBytes: number;
+}): string | null {
+  if (status.fileCount === 0) {
+    return null;
+  }
+
+  return `Delete area now has ${status.fileCount} file${status.fileCount === 1 ? "" : "s"} (about ${formatDeleteAreaKilobytes(status.totalBytes)} KB). Ask SuperRun to use list_deleted_files, restore_deleted_file, purge_deleted_file, or empty_delete_area.`;
+}
+
 function renderInteractiveShell(
   ui: InteractiveRenderer,
   session: AgentSession,
@@ -831,6 +870,17 @@ function renderInteractiveShell(
 ): void {
   ui.clearScreen();
   ui.setShellFrame(buildInteractiveShellFrame(session, state));
+}
+
+async function refreshDeleteAreaBanner(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<void> {
+  state.deleteAreaStatus = await getWorkspaceDeleteAreaStatus();
+  if (ui) {
+    ui.setShellFrame(buildInteractiveShellFrame(session, state));
+  }
 }
 
 function renderSessionPromptHint(
@@ -1266,6 +1316,14 @@ function formatTimestamp(timestamp: string): string {
   }
 
   return parsed.toISOString().replace("T", " ").slice(0, 16);
+}
+
+function formatDeleteAreaKilobytes(totalBytes: number): number {
+  if (totalBytes <= 0) {
+    return 0;
+  }
+
+  return Math.max(1, Math.round(totalBytes / 1024));
 }
 
 function restoreStoredSession(

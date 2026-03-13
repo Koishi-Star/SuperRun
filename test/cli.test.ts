@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import test from "node:test";
+import { getDeleteAreaBannerText } from "../src/cli.js";
 import { startMockOpenAIServer } from "./helpers/mock-openai-server.js";
 
 async function spawnCLI(args: string[], env: NodeJS.ProcessEnv) {
@@ -179,4 +180,15 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     await server.close();
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("delete area banner text appears only when the delete area is non-empty", () => {
+  assert.equal(
+    getDeleteAreaBannerText({ fileCount: 0, totalBytes: 0 }),
+    null,
+  );
+  assert.match(
+    getDeleteAreaBannerText({ fileCount: 2, totalBytes: 4096 }) ?? "",
+    /Delete area now has 2 files \(about 4 KB\)\. Ask SuperRun to use list_deleted_files, restore_deleted_file, purge_deleted_file, or empty_delete_area\./,
+  );
 });
