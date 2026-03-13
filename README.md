@@ -12,15 +12,16 @@ What works today:
 - streaming assistant output
 - OpenAI-compatible chat completion provider
 - process-level agent modes with `default` and opt-in `strict`
-- guarded command execution in default mode
-- a keyboard-driven `/mode` picker in TTY sessions
+- shell-based command execution in default mode, with approval modes and command classification
+- command hooks for audit and policy interception
+- a packaged `/mode` picker in TTY sessions
 - persistent system prompt profiles managed from the interactive UI
 - multi-session storage with switching and deletion commands
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
-- live `@file` suggestions in the TTY prompt, with arrow-key selection and Tab insertion
-- local TTY validation that blocks unresolved `@file` references before they reach the model
+- packaged TTY prompts with post-submit `@file` resolution
+- local prompt validation that blocks unresolved `@file` references before they reach the model
 - strict-mode specialized tool support, with `list_files` as the first read-only tool
 - focused tests for env parsing, agent history, and CLI interaction
 
@@ -29,7 +30,7 @@ What does not exist yet:
 - structured file-writing/editing support
 - a second strict-mode file-reading tool
 - multiple providers
-- advanced approval/policy controls for command execution
+- persistent workspace trust settings or organization-managed policy packs
 - advanced TUI
 
 ## Conversation Model
@@ -85,6 +86,8 @@ Environment variables:
 - `OPENAI_BASE_URL`: optional, defaults to `https://api.openai.com/v1`
 - `OPENAI_MODEL`: optional, defaults to `gpt-4o-mini`
 - `OPENAI_TIMEOUT_MS`: optional, defaults to `120000`
+- `SUPERRUN_PRE_COMMAND_HOOK`: optional shell command invoked before `run_command`; it receives one JSON object on stdin and may return `{"action":"block","message":"..."}` to stop execution
+- `SUPERRUN_POST_COMMAND_HOOK`: optional shell command invoked after `run_command`; it receives one JSON object on stdin for audit/logging
 
 ## Usage
 
@@ -112,6 +115,12 @@ Interactive multi-turn mode in strict mode:
 npm run dev -- --mode strict
 ```
 
+Interactive multi-turn mode with fully automatic command approvals:
+
+```bash
+npm run dev -- --approvals allow-all
+```
+
 Run compiled output directly:
 
 ```bash
@@ -125,6 +134,7 @@ In interactive mode, these local commands are supported:
 
 - `/help`
 - `/mode [default|strict]`
+- `/approvals [ask|allow-all|reject]`
 - `/settings`
 - `/session`
 - `/sessions`
@@ -138,16 +148,28 @@ In interactive mode, these local commands are supported:
 
 Mode behavior:
 
-- `default`: enables guarded `run_command` for inspection, build, lint, and test flows
+- `default`: enables shell-based `run_command`
 - `strict`: hides command execution and exposes only the specialized strict-mode tools
+
+Command approval behavior:
+
+- `ask`: auto-runs read-oriented commands and prompts before write, execute, network, or high-risk shell commands
+- `allow-all`: auto-approves shell execution for the current process
+- `reject`: blocks `run_command`
+
+Command hooks:
+
+- `SUPERRUN_PRE_COMMAND_HOOK` runs before `run_command` and can block execution
+- `SUPERRUN_POST_COMMAND_HOOK` runs after `run_command` and is intended for audit logging
+- both hooks receive a JSON payload on stdin describing the command, cwd, category, and approval mode
 
 TTY input helpers:
 
 - type `/mode` and press Enter to open the mode picker
-- type `@` followed by part of a path to see matching files under the prompt
-- use `Up` and `Down` to choose a match, then press `Tab` to insert it
-- unresolved `@token` references stay local to the composer and are not sent to the model
-- use `@@` when you need a literal `@` in the TTY composer
+- type `@` followed by part of a path in the prompt
+- when a submitted prompt still contains an unresolved `@token`, SuperRun opens a packaged resolver prompt to map it to a workspace file
+- unresolved `@token` references stay local and are not sent to the model until they are resolved
+- use `@@` when you need a literal `@` in the prompt
 
 The current conversation now works with multiple saved sessions:
 
@@ -226,7 +248,7 @@ npm test
 
 - improve the base system prompt itself and make profiles easier to manage
 - improve multi-session UX with better hints, renaming, and previews
-- phase the current imperative TTY composer toward a heavier Ink-based TUI shell
+- continue reducing bespoke TTY logic in favor of packaged terminal components
 - add tools only after chat behavior is stable
 
 ## License

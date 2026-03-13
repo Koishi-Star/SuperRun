@@ -1,65 +1,92 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
-import type { Key } from "node:readline";
 import test from "node:test";
-import { readTTYPrompt } from "../src/ui/tty-prompt.js";
+import { Writable } from "node:stream";
+import { readTTYPrompt, type TTYPromptInput } from "../src/ui/tty-prompt.js";
 
-class FakeTTYInput extends EventEmitter {
-  isRaw = false;
-  rawModeChanges: boolean[] = [];
+test("readTTYPrompt resumes the input stream before listening for keys", async () => {
+  let keypressListener:
+    | ((value: string, key: { name?: string; ctrl?: boolean }) => void)
+    | null = null;
+  let rawMode = false;
+  let resumeCount = 0;
 
-  setRawMode(mode: boolean): void {
-    this.isRaw = mode;
-    this.rawModeChanges.push(mode);
-  }
-
-  sendKey(name: Key["name"], value = "", options?: Partial<Key>): void {
-    this.emit("keypress", value, {
-      name,
-      ...options,
-    } as Key);
-  }
-
-  sendText(value: string): void {
-    for (const char of value) {
-      this.sendKey(char, char);
-    }
-  }
-}
-
-test("readTTYPrompt keeps unresolved @tokens local instead of submitting them", async () => {
-  const input = new FakeTTYInput();
-  const output = new PassThrough();
-  let rendered = "";
-
-  output.setEncoding("utf8");
-  output.on("data", (chunk: string) => {
-    rendered += chunk;
+  const input: TTYPromptInput = {
+    get isRaw() {
+      return rawMode;
+    },
+    resume: () => {
+      resumeCount += 1;
+    },
+    setRawMode: (mode) => {
+      rawMode = mode;
+    },
+    on: (_event, listener) => {
+      keypressListener = listener;
+    },
+    off: (_event, listener) => {
+      if (keypressListener === listener) {
+        keypressListener = null;
+      }
+    },
+  };
+  const output = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
   });
 
   const promptPromise = readTTYPrompt({
     input,
     output,
     promptLabel: "you > ",
-    workspaceFiles: ["src/agent/loop.ts"],
+    workspaceFiles: [],
   });
 
-  input.sendText("@loop");
-  input.sendKey("return");
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(resumeCount, 1);
+  assert.equal(rawMode, true);
+  keypressListener?.("h", { name: "h" });
+  keypressListener?.("", { name: "return" });
 
-  let resolved = false;
-  void promptPromise.then(() => {
-    resolved = true;
+  assert.equal(await promptPromise, "h");
+  assert.equal(rawMode, false);
+});
+
+test("readTTYPrompt keeps the default prompt on a single line without divider chrome", async () => {
+  let keypressListener:
+    | ((value: string, key: { name?: string; ctrl?: boolean }) => void)
+    | null = null;
+  let renderedOutput = "";
+
+  const input: TTYPromptInput = {
+    isRaw: false,
+    resume: () => {},
+    setRawMode: () => {},
+    on: (_event, listener) => {
+      keypressListener = listener;
+    },
+    off: (_event, listener) => {
+      if (keypressListener === listener) {
+        keypressListener = null;
+      }
+    },
+  };
+  const output = new Writable({
+    write(chunk, _encoding, callback) {
+      renderedOutput += chunk.toString();
+      callback();
+    },
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
 
-  assert.equal(resolved, false);
-  assert.match(rendered, /Resolve file reference "@loop" before sending\./);
+  const promptPromise = readTTYPrompt({
+    input,
+    output,
+    promptLabel: "you > ",
+    workspaceFiles: [],
+  });
 
-  input.sendKey("c", "", { ctrl: true });
-  const value = await promptPromise;
-  assert.equal(value, "/exit");
-  assert.deepEqual(input.rawModeChanges, [true, false]);
+  keypressListener?.("/", { name: "/" });
+  keypressListener?.("", { name: "return" });
+
+  assert.equal(await promptPromise, "/");
+  assert.equal(renderedOutput.includes("\u2500"), false);
 });

@@ -3,8 +3,11 @@ import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
+import type { ToolExecutionContext } from "../tools/types.js";
 
-export type AgentTurnOptions = ChatOptions;
+export type AgentTurnOptions = ChatOptions & {
+  toolContext?: ToolExecutionContext;
+};
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
 const MAX_TOOL_CALL_ROUNDS = 3;
 
@@ -161,7 +164,11 @@ async function resolveAgentReply(
     });
 
     for (const toolCall of response.toolCalls) {
-      const toolResult = await executeAgentTool(toolCall, mode);
+      const toolResult = await executeAgentTool(
+        toolCall,
+        mode,
+        options?.toolContext,
+      );
       messages.push({
         role: "tool",
         toolCallId: toolCall.id,

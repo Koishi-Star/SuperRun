@@ -4,7 +4,6 @@ import {
   applySelectedComposerSuggestion,
   createComposerState,
   insertComposerText,
-  moveComposerSuggestionSelection,
   submitComposer,
 } from "../src/ui/composer-state.js";
 
@@ -27,15 +26,6 @@ test("composer blocks submit when an @token has matches but is not resolved to o
   );
 });
 
-test("composer shows a not-found error when an @token has no matches", () => {
-  let state = createComposerState();
-  state = insertComposerText(state, "@missing", workspaceFiles);
-
-  const result = submitComposer(state, workspaceFiles);
-  assert.equal(result.submittedText, null);
-  assert.match(result.state.errorMessage ?? "", /No files match "@missing"\./);
-});
-
 test("composer treats @@ as a literal @ and allows submit", () => {
   let state = createComposerState();
   state = insertComposerText(state, "Mention @@loop literally", workspaceFiles);
@@ -52,13 +42,4 @@ test("composer tab-completes the selected file reference without corrupting surr
 
   assert.equal(state.buffer, "Open @src/cli.ts ");
   assert.equal(state.errorMessage, null);
-});
-
-test("composer keeps the input intact when tab is pressed with no file matches", () => {
-  let state = createComposerState();
-  state = insertComposerText(state, "@missing", workspaceFiles);
-  state = applySelectedComposerSuggestion(state, workspaceFiles);
-
-  assert.equal(state.buffer, "@missing");
-  assert.match(state.errorMessage ?? "", /No files match "@missing"\./);
 });

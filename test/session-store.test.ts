@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, mkdir, writeFile } from "node:fs/promises";
 import test from "node:test";
 import {
   createSession,
+  deleteAllSessions,
   deleteSession,
   loadSession,
   loadSessionStore,
@@ -106,6 +107,36 @@ test("saveSession updates an existing session and deleteSession promotes the nex
   }
 });
 
+test("deleteAllSessions clears saved files and resets the active session", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-session-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    await createSession({
+      systemPrompt: "You are a reviewer.",
+      history: [{ role: "user", content: "First" }],
+      maxHistoryTurns: 10,
+    });
+    await createSession({
+      systemPrompt: "You are a reviewer.",
+      history: [{ role: "user", content: "Second" }],
+      maxHistoryTurns: 10,
+    });
+
+    const cleared = await deleteAllSessions();
+    assert.equal(cleared.sessions.length, 0);
+    assert.equal(cleared.activeSessionId, null);
+
+    const sessionsDir = path.join(tempDir, "sessions");
+    const entries = await readdir(sessionsDir);
+    assert.deepEqual(entries.sort(), ["index.json"]);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("loadSessionStore hydrates legacy session summaries from stored files", async () => {
   const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-session-"));
@@ -140,9 +171,6 @@ test("loadSessionStore hydrates legacy session summaries from stored files", asy
           sessions: [
             {
               id: sessionId,
-              updatedAt: "2026-03-12T09:36:22.000Z",
-              turnCount: 1,
-              charCount: 25,
             },
           ],
         },
@@ -155,6 +183,9 @@ test("loadSessionStore hydrates legacy session summaries from stored files", asy
     const store = await loadSessionStore();
     assert.equal(store.sessions[0]?.title, "My name is Ada.");
     assert.equal(store.sessions[0]?.preview, "Assistant: Hello Ada.");
+    assert.equal(store.sessions[0]?.updatedAt, "2026-03-12T09:36:22.000Z");
+    assert.equal(store.sessions[0]?.turnCount, 1);
+    assert.equal(store.sessions[0]?.charCount, 25);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

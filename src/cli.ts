@@ -1,9 +1,8 @@
 import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
-import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
-import type { Interface } from "node:readline/promises";
 import { Command, Option } from "commander";
+import { select } from "@inquirer/prompts";
 import {
   type AgentSession,
   createAgentSession,
@@ -23,6 +22,7 @@ import {
 } from "./config/settings.js";
 import {
   createSession,
+  deleteAllSessions,
   deleteSession,
   loadSession,
   loadSessionStore,
@@ -32,11 +32,27 @@ import {
   type SessionStoreState,
   type StoredSession,
 } from "./session/store.js";
+import {
+  getCommandApprovalSummary,
+  parseCommandApprovalMode,
+} from "./tools/command_policy.js";
+import { createEnvCommandHookRunner } from "./tools/command_hooks.js";
+import type {
+  CommandApprovalDecision,
+  CommandApprovalMode,
+  CommandApprovalRequest,
+  ToolExecutionContext,
+} from "./tools/types.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
+import { editSystemPromptExternally } from "./ui/external-editor.js";
+import {
+  createInteractiveRenderer,
+  type InteractiveRenderer,
+  type RendererLine,
+} from "./ui/interactive-renderer.js";
+import { isPromptExitError } from "./ui/inquirer-errors.js";
 import { runModePickerInteraction } from "./ui/mode-picker-controller.js";
 import { runSessionPickerInteraction } from "./ui/session-picker-controller.js";
-import { readTTYPrompt } from "./ui/tty-prompt.js";
-import { createTerminalUI, type TerminalUI } from "./ui/tui.js";
 
 export const program = new Command();
 
@@ -51,13 +67,24 @@ program
       .choices(["default", "strict"])
       .default("default"),
   )
+  .addOption(
+    new Option(
+      "--approvals <mode>",
+      'command approval mode: "ask" prompts before non-read-only commands, "allow-all" auto-approves, "reject" disables command execution',
+    )
+      .choices(["ask", "allow-all", "reject"])
+      .default("ask"),
+  )
   .argument("[prompt]", "prompt to send to the model")
   .action(async (prompt?: string) => {
     try {
       const settings = await loadSettings();
-      const mode = parseAgentMode(
-        program.opts<{ mode: AgentMode }>().mode,
-      );
+      const options = program.opts<{
+        mode: AgentMode;
+        approvals: CommandApprovalMode;
+      }>();
+      const mode = parseAgentMode(options.mode);
+      const approvalMode = parseCommandApprovalMode(options.approvals);
       const session = createAgentSession({
         mode,
         systemPrompt: settings.systemPrompt,
@@ -65,11 +92,31 @@ program
       const trimmedPrompt = prompt?.trim();
 
       if (trimmedPrompt) {
-        await runSingleTurn(session, trimmedPrompt);
+        renderRiskNotice();
+        await runSingleTurn(session, trimmedPrompt, {
+          commandApprovalMode: approvalMode,
+          commandHookRunner: createEnvCommandHookRunner(),
+          settings,
+          sessionStore: {
+            sessions: [],
+            activeSessionId: null,
+            indexFilePath: "",
+            sessionsDirectoryPath: "",
+          },
+          currentSessionId: null,
+          currentSessionTitle: null,
+          pendingDeleteAllConfirmation: false,
+          pendingSystemPromptLines: null,
+          workspaceFiles: null,
+        });
         return;
       }
 
-      const state = await createInteractiveState(settings, session);
+      if (!(input.isTTY && output.isTTY)) {
+        renderRiskNotice();
+      }
+
+      const state = await createInteractiveState(settings, session, approvalMode);
       await runInteractiveSession(session, state);
     } catch (error) {
       const message =
@@ -84,8 +131,11 @@ type InteractiveState = {
   sessionStore: SessionStoreState;
   currentSessionId: string | null;
   currentSessionTitle: string | null;
+  pendingDeleteAllConfirmation: boolean;
   pendingSystemPromptLines: string[] | null;
   workspaceFiles: string[] | null;
+  commandApprovalMode: CommandApprovalMode;
+  commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
 };
 
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
@@ -93,9 +143,11 @@ const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 async function createInteractiveState(
   settings: SuperRunSettings,
   session: AgentSession,
+  approvalMode: CommandApprovalMode,
 ): Promise<InteractiveState> {
   let sessionStore = await loadSessionStore();
   let currentSessionId: string | null = null;
+  const commandHookRunner = createEnvCommandHookRunner();
 
   if (sessionStore.activeSessionId) {
     try {
@@ -107,8 +159,11 @@ async function createInteractiveState(
         sessionStore,
         currentSessionId,
         currentSessionTitle: storedSession.title,
+        pendingDeleteAllConfirmation: false,
         pendingSystemPromptLines: null,
         workspaceFiles: null,
+        commandApprovalMode: approvalMode,
+        commandHookRunner,
       };
     } catch {
       sessionStore = await setActiveSession(null);
@@ -120,19 +175,24 @@ async function createInteractiveState(
     sessionStore,
     currentSessionId,
     currentSessionTitle: null,
+    pendingDeleteAllConfirmation: false,
     pendingSystemPromptLines: null,
     workspaceFiles: null,
+    commandApprovalMode: approvalMode,
+    commandHookRunner,
   };
 }
 
 async function runSingleTurn(
   session: AgentSession,
   prompt: string,
+  state: InteractiveState,
 ): Promise<void> {
   console.log("user:", prompt);
   process.stdout.write("assistant: ");
 
   const reply = await runAgentTurn(session, prompt, {
+    toolContext: createToolExecutionContext(state, null),
     onChunk: (chunk) => {
       process.stdout.write(chunk);
     },
@@ -149,35 +209,35 @@ async function runInteractiveSession(
   session: AgentSession,
   state: InteractiveState,
 ): Promise<void> {
-  const ui = input.isTTY && output.isTTY ? createTerminalUI(output) : null;
+  const ui = input.isTTY && output.isTTY
+    ? createInteractiveRenderer({ input, output })
+    : null;
 
   if (ui) {
     renderInteractiveShell(ui, session, state);
   } else {
     console.log('Interactive mode. Type "/exit" to quit.');
+    renderApprovalSummary(ui, state.commandApprovalMode);
     renderSessionPromptHint(ui, session, state.settings);
     renderSessionStoreHint(ui, state);
   }
 
   if (ui) {
-    emitKeypressEvents(input);
-    input.resume();
-
     try {
       while (true) {
-        const prompt = (await readTTYPrompt({
-          input,
-          output,
-          promptLabel: ui.promptLabel,
-          workspaceFiles: await ensureWorkspaceFilesLoaded(state),
-        })).trim();
+        const prompt = await ui.readPrompt({
+        promptLabel: getTTYPromptLabel(ui, state),
+        workspaceFiles: state.pendingSystemPromptLines
+          ? []
+          : await ensureWorkspaceFilesLoaded(state),
+      });
 
-        if (!(await handleInteractivePrompt(session, prompt, state, ui))) {
+        if (!(await handleInteractiveInput(session, prompt, state, ui))) {
           break;
         }
       }
     } finally {
-      input.pause();
+      ui.dispose();
     }
 
     return;
@@ -186,7 +246,7 @@ async function runInteractiveSession(
   const rl = createInterface({ input, output });
   try {
     for await (const line of rl) {
-      if (!(await handlePipedInteractiveLine(session, line, state, ui))) {
+      if (!(await handleInteractiveInput(session, line, state, ui))) {
         break;
       }
     }
@@ -195,11 +255,36 @@ async function runInteractiveSession(
   }
 }
 
+async function handleInteractiveInput(
+  session: AgentSession,
+  line: string,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<boolean> {
+  if (state.pendingDeleteAllConfirmation) {
+    return handleDeleteAllConfirmationLine(session, line, state, ui);
+  }
+
+  // Keep `/system` editing in the main input loop so TTY and piped flows behave the same way.
+  if (state.pendingSystemPromptLines) {
+    return handleSystemPromptEditorLine(session, line, state, ui);
+  }
+
+  const prompt = line.trim();
+  if (prompt === "/system") {
+    state.pendingSystemPromptLines = [];
+    renderSystemPromptTips(ui, session.systemPrompt, "inline");
+    return true;
+  }
+
+  return handleInteractivePrompt(session, prompt, state, ui);
+}
+
 async function handleInteractivePrompt(
   session: AgentSession,
   prompt: string,
   state: InteractiveState,
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
 ): Promise<boolean> {
   if (!prompt) {
     return true;
@@ -213,7 +298,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -222,7 +307,7 @@ async function handleInteractivePrompt(
     const requestedMode = parseCommandArgument(prompt, "/mode");
 
     if (ui && !requestedMode) {
-      const selectedMode = await runModePicker(ui, session.mode);
+      const selectedMode = await runModePicker(session.mode, ui);
       renderInteractiveShell(ui, session, state);
       if (selectedMode) {
         session.mode = selectedMode;
@@ -246,8 +331,36 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  if (matchesCommand(prompt, "/approvals")) {
+    const requestedMode = parseCommandArgument(prompt, "/approvals");
+
+    if (ui && !requestedMode) {
+      const selectedMode = await runApprovalPicker(state.commandApprovalMode, ui);
+      renderInteractiveShell(ui, session, state);
+      if (selectedMode) {
+        state.commandApprovalMode = selectedMode;
+        renderApprovalSummary(ui, state.commandApprovalMode);
+      }
+      return true;
+    }
+
+    if (!requestedMode) {
+      renderApprovalSummary(ui, state.commandApprovalMode);
+      return true;
+    }
+
+    try {
+      state.commandApprovalMode = parseCommandApprovalMode(requestedMode);
+      renderApprovalSummary(ui, state.commandApprovalMode);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to change approvals.");
+    }
+    return true;
+  }
+
   if (prompt === "/settings") {
     renderSettingsSummary(ui, session, state.settings);
+    renderApprovalSummary(ui, state.commandApprovalMode);
     return true;
   }
 
@@ -289,7 +402,7 @@ async function handleInteractivePrompt(
     );
 
     if (ui) {
-      const selectedSession = await runSessionPicker(ui, state, {
+      const selectedSession = await runSessionPicker(state, ui, {
         sessions: filteredSessions,
         filterQuery,
       });
@@ -380,6 +493,17 @@ async function handleInteractivePrompt(
 
   if (matchesCommand(prompt, "/delete")) {
     const sessionSelector = parseCommandArgument(prompt, "/delete");
+    if (sessionSelector.toLowerCase() === "all") {
+      if (state.sessionStore.sessions.length === 0) {
+        renderInfo(ui, "No saved sessions to delete.");
+        return true;
+      }
+
+      state.pendingDeleteAllConfirmation = true;
+      renderDeleteAllConfirmationPrompt(ui, state.sessionStore.sessions.length);
+      return true;
+    }
+
     let targetSessionId = state.currentSessionId;
     if (sessionSelector) {
       try {
@@ -424,8 +548,8 @@ async function handleInteractivePrompt(
     return true;
   }
 
-  if (prompt === "/system") {
-    await runSystemPromptEditor(session, state, ui);
+  if (prompt === "/editor") {
+    await runExternalSystemPromptEditor(session, state, ui);
     return true;
   }
 
@@ -457,7 +581,13 @@ async function handleInteractivePrompt(
   }
 
   const reply = await runAgentTurn(session, prompt, {
+    toolContext: createToolExecutionContext(state, ui),
     onChunk: (chunk) => {
+      if (ui) {
+        ui.appendAssistantChunk(chunk);
+        return;
+      }
+
       process.stdout.write(chunk);
     },
   });
@@ -465,38 +595,57 @@ async function handleInteractivePrompt(
   await persistCurrentSession(session, state);
 
   if (!reply) {
-    process.stdout.write("(empty response)");
+    if (ui) {
+      ui.appendAssistantChunk("(empty response)");
+    } else {
+      process.stdout.write("(empty response)");
+    }
   }
 
-  process.stdout.write("\n");
+  if (!ui) {
+    process.stdout.write("\n");
+  }
   return true;
 }
 
-async function handlePipedInteractiveLine(
+async function handleDeleteAllConfirmationLine(
   session: AgentSession,
   line: string,
   state: InteractiveState,
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
 ): Promise<boolean> {
-  if (state.pendingSystemPromptLines) {
-    return handlePipedSystemPromptLine(session, line, state, ui);
-  }
+  state.pendingDeleteAllConfirmation = false;
+  const confirmation = line.trim();
 
-  const prompt = line.trim();
-  if (prompt === "/system") {
-    state.pendingSystemPromptLines = [];
-    renderSystemPromptTips(ui, session.systemPrompt);
+  if (confirmation === "/cancel") {
+    renderInfo(ui, "Delete-all cancelled.");
     return true;
   }
 
-  return handleInteractivePrompt(session, prompt, state, ui);
+  if (confirmation !== "YES") {
+    renderInfo(ui, 'Delete-all cancelled. Type "YES" exactly to confirm.');
+    return true;
+  }
+
+  const deletedCount = state.sessionStore.sessions.length;
+  const deletedCurrentSession = state.currentSessionId !== null;
+  state.sessionStore = await deleteAllSessions();
+
+  if (deletedCurrentSession) {
+    resetCurrentSession(session, state.settings.systemPrompt);
+    state.currentSessionId = null;
+    state.currentSessionTitle = null;
+  }
+
+  renderAllSessionsDeleted(ui, deletedCount, deletedCurrentSession);
+  return true;
 }
 
-async function handlePipedSystemPromptLine(
+async function handleSystemPromptEditorLine(
   session: AgentSession,
   line: string,
   state: InteractiveState,
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
 ): Promise<boolean> {
   const pendingLines = state.pendingSystemPromptLines;
   if (!pendingLines) {
@@ -508,6 +657,18 @@ async function handlePipedSystemPromptLine(
   if (trimmedLine === "/cancel") {
     state.pendingSystemPromptLines = null;
     renderInfo(ui, "System prompt update cancelled.");
+    return true;
+  }
+
+  if (trimmedLine === "/editor") {
+    if (!input.isTTY || !output.isTTY) {
+      renderError(ui, '"/editor" requires an interactive terminal.');
+      return true;
+    }
+
+    const draftPrompt = getPendingSystemPromptDraft(pendingLines, session.systemPrompt);
+    state.pendingSystemPromptLines = null;
+    await runExternalSystemPromptEditor(session, state, ui, draftPrompt);
     return true;
   }
 
@@ -531,56 +692,49 @@ async function handlePipedSystemPromptLine(
   return true;
 }
 
-async function runSystemPromptEditor(
+async function runExternalSystemPromptEditor(
   session: AgentSession,
   state: InteractiveState,
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
+  initialPrompt = session.systemPrompt,
 ): Promise<void> {
-  renderSystemPromptTips(ui, session.systemPrompt);
-  const rl = createInterface({ input, output });
+  if (!input.isTTY || !output.isTTY) {
+    renderError(ui, '"/editor" requires an interactive terminal.');
+    return;
+  }
+
+  renderSystemPromptTips(ui, initialPrompt, "external");
 
   try {
-    const nextPrompt = await readMultilineSystemPrompt(rl, ui);
-    if (nextPrompt === null) {
-      renderInfo(ui, "System prompt update cancelled.");
+    const result = ui
+      ? await runWithSuspendedRenderer(ui, () => editSystemPromptExternally(initialPrompt))
+      : await editSystemPromptExternally(initialPrompt);
+    if (ui) {
+      renderInteractiveShell(ui, session, state);
+    }
+
+    if (result.status === "unchanged") {
+      renderInfo(ui, "System prompt unchanged. Keeping current behavior.");
       return;
     }
 
-    const settings = await saveSystemPrompt(nextPrompt);
+    const settings = await saveSystemPrompt(result.value);
     state.settings = settings;
     resetCurrentSession(session, settings.systemPrompt);
     await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
-  } finally {
-    rl.close();
-  }
-}
-
-async function readMultilineSystemPrompt(
-  rl: Interface,
-  ui: TerminalUI | null,
-): Promise<string | null> {
-  const lines: string[] = [];
-
-  while (true) {
-    const line = await rl.question(ui ? ui.editorPromptLabel : "");
-    const trimmedLine = line.trim();
-
-    if (trimmedLine === "/cancel") {
-      return null;
+  } catch (error) {
+    if (ui) {
+      renderInteractiveShell(ui, session, state);
     }
 
-    if (trimmedLine === "/save") {
-      const prompt = lines.join("\n").trim();
-      if (!prompt) {
-        renderError(ui, "System prompt must not be empty. Keep typing or use /cancel.");
-        continue;
-      }
-
-      return prompt;
-    }
-
-    lines.push(line);
+    renderError(
+      ui,
+      error instanceof Error
+        ? error.message
+        : "Failed to update the system prompt from the external editor.",
+    );
+    return;
   }
 }
 
@@ -592,19 +746,119 @@ function resetCurrentSession(
   session.history = [];
 }
 
+function getTTYPromptLabel(
+  ui: InteractiveRenderer,
+  state: InteractiveState,
+): string {
+  return state.pendingSystemPromptLines
+    ? ui.editorPromptLabel
+    : ui.promptLabel;
+}
+
+function getPendingSystemPromptDraft(
+  lines: string[],
+  currentPrompt: string,
+): string {
+  const draft = lines.join("\n").trim();
+  return draft || currentPrompt;
+}
+
+function buildInteractiveShellFrame(
+  session: AgentSession,
+  state: InteractiveState,
+): Array<Omit<RendererLine, "id">> {
+  const stats = getAgentSessionStats(session);
+  const source = state.settings.hasStoredSystemPrompt
+    ? "saved profile"
+    : "built-in default";
+  const lines: Array<Omit<RendererLine, "id">> = [
+    { kind: "section", text: "SuperRun" },
+    { kind: "info", text: "Local coding agent interactive mode" },
+    {
+      kind: "info",
+      text: "Commands: /help /mode /approvals /history /sessions /new /switch /rename /delete /system /editor /clear /exit",
+    },
+    { kind: "body", text: "" },
+    {
+      kind: "warning",
+      text: "Risk notice: this agent may read, run, modify, delete, or create files in the workspace. Keep backups.",
+    },
+    {
+      kind: "warning",
+      text: "Using SuperRun means you accept that risk. It will try to approve and intercept risky actions, but it cannot guarantee complete safety.",
+    },
+    {
+      kind: "warning",
+      text: "Recommendation: initialize git in the workspace so you have a recovery path for your files.",
+    },
+    { kind: "body", text: "" },
+    {
+      kind: "info",
+      text: `Command approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`,
+    },
+    {
+      kind: "info",
+      text: `Tool mode: ${getAgentModeSummary(session.mode)}.`,
+    },
+    {
+      kind: "info",
+      text: `Active behavior (${source}): ${summarizePrompt(session.systemPrompt)}`,
+    },
+    {
+      kind: "info",
+      text: `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+    },
+    {
+      kind: "info",
+      text: 'Use "/approvals" to review command approval behavior.',
+    },
+    {
+      kind: "info",
+      text: 'Use "/system" to change the default behavior for new work.',
+    },
+    { kind: "body", text: "" },
+  ];
+
+  if (state.currentSessionId) {
+    lines.push({
+      kind: "info",
+      text: `Current session: ${formatSessionLabel(state.currentSessionTitle, state.currentSessionId)}. Saved sessions: ${state.sessionStore.sessions.length}.`,
+    });
+    lines.push({
+      kind: "info",
+      text: 'Use "/sessions" to browse saved work, or "/new" to start fresh.',
+    });
+  } else if (state.sessionStore.sessions.length === 0) {
+    lines.push({
+      kind: "info",
+      text: 'No saved sessions yet. Start chatting or use "/new" to create one now.',
+    });
+  } else {
+    lines.push({
+      kind: "info",
+      text: `Saved sessions: ${state.sessionStore.sessions.length}. Active session is not loaded.`,
+    });
+    lines.push({
+      kind: "info",
+      text: 'Use "/sessions" to browse them or "/switch <index>" to load one.',
+    });
+  }
+
+  lines.push({ kind: "body", text: "" });
+  return lines;
+}
+
 function renderInteractiveShell(
-  ui: TerminalUI,
+  ui: InteractiveRenderer,
   session: AgentSession,
   state: InteractiveState,
 ): void {
   ui.clearScreen();
-  ui.renderWelcome();
-  renderSessionPromptHint(ui, session, state.settings);
-  renderSessionStoreHint(ui, state);
+  ui.setShellFrame(buildInteractiveShellFrame(session, state));
 }
 
 function renderSessionPromptHint(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: Pick<SuperRunSettings, "systemPrompt" | "hasStoredSystemPrompt">,
 ): void {
@@ -619,14 +873,12 @@ function renderSessionPromptHint(
     ui,
     `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
+  renderInfo(ui, 'Use "/approvals" to review command approval behavior.');
   renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
-  if (ui) {
-    output.write("\n");
-  }
 }
 
 function renderSessionStoreHint(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   state: InteractiveState,
 ): void {
   const currentSessionId = state.currentSessionId;
@@ -637,17 +889,11 @@ function renderSessionStoreHint(
       `Current session: ${formatSessionLabel(state.currentSessionTitle, currentSessionId)}. Saved sessions: ${state.sessionStore.sessions.length}.`,
     );
     renderInfo(ui, 'Use "/sessions" to browse saved work, or "/new" to start fresh.');
-    if (ui) {
-      output.write("\n");
-    }
     return;
   }
 
   if (state.sessionStore.sessions.length === 0) {
     renderInfo(ui, 'No saved sessions yet. Start chatting or use "/new" to create one now.');
-    if (ui) {
-      output.write("\n");
-    }
     return;
   }
 
@@ -656,13 +902,10 @@ function renderSessionStoreHint(
     `Saved sessions: ${state.sessionStore.sessions.length}. Active session is not loaded.`,
   );
   renderInfo(ui, 'Use "/sessions" to browse them or "/switch <index>" to load one.');
-  if (ui) {
-    output.write("\n");
-  }
 }
 
 function renderSettingsSummary(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: SuperRunSettings,
 ): void {
@@ -690,16 +933,36 @@ function renderSettingsSummary(
   renderInfo(ui, "This text defines how the agent should behave on every turn.");
   renderInfo(ui, "Changing it clears the current conversation and updates the default for new work.");
 
-  const body = `${settings.systemPrompt}\n`;
-  if (ui) {
-    output.write(body);
-  } else {
-    process.stdout.write(body);
+  for (const line of settings.systemPrompt.split(/\r?\n/)) {
+    writeBodyLine(ui, line);
   }
 }
 
+function renderRiskNotice(ui: InteractiveRenderer | null = null): void {
+  const write = ui
+    ? (message: string) => ui.renderWarning(message)
+    : (message: string) => console.log(message);
+
+  write(
+    "Risk notice: this agent may read, run, modify, delete, or create files in the workspace. Keep backups.",
+  );
+  write(
+    "Using SuperRun means you accept that risk. It will try to approve and intercept risky actions, but it cannot guarantee complete safety.",
+  );
+  write(
+    "Recommendation: initialize git in the workspace so you have a recovery path for your files.",
+  );
+}
+
+function renderApprovalSummary(
+  ui: InteractiveRenderer | null,
+  mode: CommandApprovalMode,
+): void {
+  renderInfo(ui, `Command approvals: ${getCommandApprovalSummary(mode)}.`);
+}
+
 function renderCurrentSessionSummary(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   session: AgentSession,
   state: InteractiveState,
 ): void {
@@ -719,6 +982,7 @@ function renderCurrentSessionSummary(
     )}`,
   );
   renderInfo(ui, `Mode: ${getAgentModeSummary(session.mode)}.`);
+  renderInfo(ui, `Command approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`);
   renderInfo(
     ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
@@ -729,7 +993,7 @@ function renderCurrentSessionSummary(
 }
 
 function renderSessionList(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   state: InteractiveState,
   options?: {
     sessions?: SessionSummary[];
@@ -781,7 +1045,7 @@ function renderSessionList(
 }
 
 function renderHistory(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   options: {
     label: string;
     history: AgentSession["history"];
@@ -822,8 +1086,9 @@ function renderHistory(
 }
 
 function renderSystemPromptTips(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   currentPrompt: string,
+  mode: "inline" | "external",
 ): void {
   if (ui) {
     ui.renderSectionTitle("System Prompt Editor");
@@ -833,12 +1098,17 @@ function renderSystemPromptTips(
 
   renderInfo(ui, "This prompt controls the default behavior for the current conversation.");
   renderInfo(ui, "Saving clears the current conversation and updates the default for future sessions.");
-  renderInfo(ui, 'Type the new prompt below. Use "/save" on its own line to persist or "/cancel" to abort.');
+  renderInfo(
+    ui,
+    mode === "external"
+      ? "An external editor will open with the current prompt. Close it to auto-apply non-empty changes; leaving the text unchanged cancels the update."
+      : 'Type the new prompt below. Use "/save" on its own line to persist or "/cancel" to abort. Use "/editor" to open your external editor, which auto-applies non-empty changes when it closes.',
+  );
   renderInfo(ui, `Current behavior: ${summarizePrompt(currentPrompt)}`);
 }
 
 function renderSystemPromptApplied(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: SuperRunSettings,
   historyCleared: boolean,
@@ -856,7 +1126,7 @@ function renderSystemPromptApplied(
 }
 
 function renderNewSessionCreated(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   storedSession: StoredSession,
 ): void {
   renderInfo(
@@ -867,7 +1137,7 @@ function renderNewSessionCreated(
 }
 
 function renderSessionSwitched(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   storedSession: StoredSession,
   mode: AgentMode,
 ): void {
@@ -894,14 +1164,35 @@ function renderSessionSwitched(
 }
 
 function renderSessionDeleted(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   sessionId: string,
 ): void {
   renderInfo(ui, `Deleted session: ${sessionId}`);
 }
 
+function renderDeleteAllConfirmationPrompt(
+  ui: InteractiveRenderer | null,
+  sessionCount: number,
+): void {
+  renderInfo(
+    ui,
+    `Delete all saved sessions (${sessionCount})? Type "YES" to confirm or "/cancel" to abort.`,
+  );
+}
+
+function renderAllSessionsDeleted(
+  ui: InteractiveRenderer | null,
+  deletedCount: number,
+  clearedCurrentSession: boolean,
+): void {
+  renderInfo(ui, `Deleted all saved sessions: ${deletedCount}`);
+  if (clearedCurrentSession) {
+    renderInfo(ui, "Current conversation reset because its saved session was deleted.");
+  }
+}
+
 function renderSessionDeletedAndSwitched(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   deletedSessionId: string,
   nextSession: StoredSession,
   mode: AgentMode,
@@ -911,7 +1202,7 @@ function renderSessionDeletedAndSwitched(
 }
 
 function renderSessionRenamed(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   state: InteractiveState,
 ): void {
   renderInfo(
@@ -924,7 +1215,7 @@ function renderSessionRenamed(
 }
 
 function renderAgentModeSummary(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   mode: AgentMode,
 ): void {
   renderInfo(ui, `Current tool mode: ${getAgentModeSummary(mode)}.`);
@@ -935,13 +1226,13 @@ function renderAgentModeSummary(
 }
 
 function renderAgentModeChanged(
-  ui: TerminalUI | null,
+  ui: InteractiveRenderer | null,
   mode: AgentMode,
 ): void {
   renderInfo(ui, `Tool mode changed to ${getAgentModeSummary(mode)}.`);
 }
 
-function renderInfo(ui: TerminalUI | null, message: string): void {
+function renderInfo(ui: InteractiveRenderer | null, message: string): void {
   if (ui) {
     ui.renderInfo(message);
     return;
@@ -950,7 +1241,7 @@ function renderInfo(ui: TerminalUI | null, message: string): void {
   console.log(message);
 }
 
-function renderError(ui: TerminalUI | null, message: string): void {
+function renderError(ui: InteractiveRenderer | null, message: string): void {
   if (ui) {
     ui.renderError(message);
     return;
@@ -959,9 +1250,9 @@ function renderError(ui: TerminalUI | null, message: string): void {
   console.error(`error: ${message}`);
 }
 
-function writeBodyLine(ui: TerminalUI | null, message: string): void {
+function writeBodyLine(ui: InteractiveRenderer | null, message: string): void {
   if (ui) {
-    output.write(`${message}\n`);
+    ui.writeBodyLine(message);
     return;
   }
 
@@ -1103,41 +1394,163 @@ function resolveSessionSelector(
 }
 
 async function runSessionPicker(
-  ui: TerminalUI,
   state: InteractiveState,
+  ui: InteractiveRenderer,
   options?: {
     sessions?: SessionSummary[];
     filterQuery?: string | undefined;
   },
 ): Promise<SessionSummary | null> {
-  if (!input.isTTY || typeof input.setRawMode !== "function") {
+  if (!input.isTTY || !output.isTTY) {
     return null;
   }
 
-  emitKeypressEvents(input);
-  return runSessionPickerInteraction({
-    ui,
-    input,
-    sessions: options?.sessions ?? state.sessionStore.sessions,
-    currentSessionId: state.currentSessionId,
-    filterQuery: options?.filterQuery,
-  });
+  return runWithSuspendedRenderer(ui, () =>
+    runSessionPickerInteraction({
+      sessions: options?.sessions ?? state.sessionStore.sessions,
+      currentSessionId: state.currentSessionId,
+      filterQuery: options?.filterQuery,
+    }),
+  );
 }
 
 async function runModePicker(
-  ui: TerminalUI,
   currentMode: AgentMode,
+  ui: InteractiveRenderer,
 ): Promise<AgentMode | null> {
-  if (!input.isTTY || typeof input.setRawMode !== "function") {
+  if (!input.isTTY || !output.isTTY) {
     return null;
   }
 
-  emitKeypressEvents(input);
-  return runModePickerInteraction({
-    ui,
-    input,
-    currentMode,
+  return runWithSuspendedRenderer(ui, () =>
+    runModePickerInteraction({
+      currentMode,
+    }),
+  );
+}
+
+async function runApprovalPicker(
+  currentMode: CommandApprovalMode,
+  ui: InteractiveRenderer,
+): Promise<CommandApprovalMode | null> {
+  if (!input.isTTY || !output.isTTY) {
+    return null;
+  }
+
+  return runWithSuspendedRenderer(ui, async () => {
+    try {
+      return await select<CommandApprovalMode | null>({
+        message: "Choose the command approval mode",
+        choices: [
+          {
+            value: "ask",
+            name: currentMode === "ask" ? "ask (current)" : "ask",
+            description: "Auto-run read-only commands and prompt before other shell execution.",
+          },
+          {
+            value: "allow-all",
+            name: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
+            description: "Auto-approve command execution for the current process.",
+          },
+          {
+            value: "reject",
+            name: currentMode === "reject" ? "reject (current)" : "reject",
+            description: "Block run_command entirely for the current process.",
+          },
+          {
+            value: null,
+            name: "Keep current approvals",
+            description: "Return to chat without changing the approval mode.",
+          },
+        ],
+        pageSize: 4,
+      });
+    } catch (error) {
+      if (isPromptExitError(error)) {
+        return null;
+      }
+
+      throw error;
+    }
   });
+}
+
+function createToolExecutionContext(
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): ToolExecutionContext {
+  const requestApproval =
+    input.isTTY && output.isTTY
+      ? (request: CommandApprovalRequest) => promptCommandApproval(request, ui)
+      : undefined;
+
+  return {
+    commandPolicy: {
+      getMode: () => state.commandApprovalMode,
+      setMode: (mode) => {
+        state.commandApprovalMode = mode;
+      },
+      ...(requestApproval ? { requestApproval } : {}),
+      ...(state.commandHookRunner ? { runHook: state.commandHookRunner } : {}),
+    },
+  };
+}
+
+async function promptCommandApproval(
+  request: CommandApprovalRequest,
+  ui: InteractiveRenderer | null,
+): Promise<CommandApprovalDecision> {
+  const { assessment } = request;
+  const reasonSummary = assessment.reasons.join(" ");
+  const runPrompt = async () => {
+    try {
+      return await select<CommandApprovalDecision>({
+        message: `Approve ${assessment.category} command?`,
+        choices: [
+          {
+            value: "once",
+            name: "Approve once",
+            description: `${assessment.summary}. ${reasonSummary}`,
+          },
+          {
+            value: "always",
+            name: "Allow all this session",
+            description: "Switch approvals to allow-all for subsequent commands in this process.",
+          },
+          {
+            value: "reject",
+            name: "Reject",
+            description: `Block this command: ${assessment.command}`,
+          },
+        ],
+        pageSize: 3,
+      });
+    } catch (error) {
+      if (isPromptExitError(error)) {
+        return "reject";
+      }
+
+      throw error;
+    }
+  };
+
+  if (ui) {
+    return runWithSuspendedRenderer(ui, runPrompt);
+  }
+
+  return runPrompt();
+}
+
+async function runWithSuspendedRenderer<T>(
+  ui: InteractiveRenderer,
+  action: () => Promise<T>,
+): Promise<T> {
+  ui.suspend();
+  try {
+    return await action();
+  } finally {
+    ui.resume();
+  }
 }
 
 async function ensureWorkspaceFilesLoaded(

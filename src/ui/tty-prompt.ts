@@ -1,7 +1,6 @@
 import type { Key } from "node:readline";
 import type { Writable } from "node:stream";
 import chalk from "chalk";
-import type { SessionPickerInput } from "./session-picker-controller.js";
 import {
   applySelectedComposerSuggestion,
   backspaceComposerText,
@@ -16,8 +15,22 @@ import {
 } from "./composer-state.js";
 import { getDisplayWidth } from "./text-width.js";
 
+export type TTYPromptInput = {
+  isRaw?: boolean;
+  resume?: () => void;
+  setRawMode: (mode: boolean) => void;
+  on: (
+    event: "keypress",
+    listener: (value: string, key: Key) => void,
+  ) => void;
+  off: (
+    event: "keypress",
+    listener: (value: string, key: Key) => void,
+  ) => void;
+};
+
 export async function readTTYPrompt(options: {
-  input: SessionPickerInput;
+  input: TTYPromptInput;
   output: Writable;
   promptLabel: string;
   workspaceFiles: string[];
@@ -28,6 +41,10 @@ export async function readTTYPrompt(options: {
   let renderedPromptLineIndex = 0;
   const previousRawMode = input.isRaw === true;
 
+  // Inquirer closes its readline interface after pickers finish, which can
+  // leave stdin paused. Resume before every composer read so TTY mode stays
+  // alive after commands like /sessions and /mode.
+  input.resume?.();
   render();
 
   return new Promise((resolve) => {
@@ -166,11 +183,7 @@ function formatComposerLines(options: {
   activeQuery: string | null;
   selectedSuggestionIndex: number;
 }): string[] {
-  const width = getComposerWidth(options.output);
-  const divider = chalk.dim("\u2500".repeat(width));
-
   return [
-    divider,
     `${options.promptLabel}${options.promptText}`,
     ...formatErrorLine(options.errorMessage),
     ...formatSuggestionLines(
@@ -178,7 +191,6 @@ function formatComposerLines(options: {
       options.activeQuery,
       options.selectedSuggestionIndex,
     ),
-    divider,
   ];
 }
 

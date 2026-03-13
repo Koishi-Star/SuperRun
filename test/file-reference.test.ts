@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import {
   applyFileSuggestion,
   findActiveFileReference,
   getUnresolvedFileReferences,
+  loadWorkspaceFilePaths,
   matchWorkspaceFiles,
   normalizeFileReferenceEscapes,
 } from "../src/ui/file-reference.js";
@@ -82,4 +86,25 @@ test("normalizeFileReferenceEscapes collapses @@ into literal @ characters", () 
     normalizeFileReferenceEscapes("Use @@mention and @@src/cli.ts"),
     "Use @mention and @src/cli.ts",
   );
+});
+
+test("loadWorkspaceFilePaths respects gitignore and common generated directories", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-file-ref-"));
+
+  try {
+    await mkdir(path.join(tempDir, "src"), { recursive: true });
+    await mkdir(path.join(tempDir, "dist"), { recursive: true });
+    await mkdir(path.join(tempDir, "node_modules", "pkg"), { recursive: true });
+    await writeFile(path.join(tempDir, ".gitignore"), "ignored.txt\n");
+    await writeFile(path.join(tempDir, "src", "keep.ts"), "export {};\n");
+    await writeFile(path.join(tempDir, "ignored.txt"), "skip\n");
+    await writeFile(path.join(tempDir, "dist", "bundle.js"), "skip\n");
+    await writeFile(path.join(tempDir, "node_modules", "pkg", "index.js"), "skip\n");
+
+    const filePaths = await loadWorkspaceFilePaths(tempDir);
+
+    assert.deepEqual(filePaths, ["src/keep.ts"]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

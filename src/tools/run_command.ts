@@ -3,6 +3,13 @@ import { lstat } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
 import {
+  authorizeCommand,
+  classifyCommand,
+  runAfterCommandHook,
+} from "./command_policy.js";
+import { getPlatformShellCommand } from "./shell.js";
+import type { CommandAssessment, ToolExecutionContext } from "./types.js";
+import {
   normalizeRelativeWorkspacePath,
   resolveWorkspacePath,
 } from "./workspace.js";
@@ -29,56 +36,6 @@ type RunCommandResult = {
   timedOut: boolean;
   truncated: boolean;
 };
-
-const BLOCKED_COMMAND_RULES: Array<{
-  pattern: RegExp;
-  reason: string;
-}> = [
-  {
-    pattern: /(?:^|[^\S\r\n])\d*>>?\s*/i,
-    reason: "output redirection is not allowed.",
-  },
-  {
-    pattern: /\|\s*tee\b/i,
-    reason: "tee-style output capture can write files.",
-  },
-  {
-    pattern:
-      /\b(?:rm|del|erase|rmdir|rd|remove-item|move-item|rename-item|copy-item|set-content|add-content|out-file|new-item|clear-content|set-item|touch|mkdir|mktemp|cp|mv|install)\b/i,
-    reason: "file-modifying commands are blocked in default mode.",
-  },
-  {
-    pattern:
-      /\bgit\s+(?:add|am|apply|bisect|checkout|cherry-pick|clean|clone|commit|fetch|merge|pull|push|rebase|reset|restore|revert|stash|switch|tag|worktree)\b/i,
-    reason: "git state-changing commands are blocked in default mode.",
-  },
-  {
-    pattern:
-      /\b(?:npm|pnpm|yarn|bun)\s+(?:add|create|dlx|exec|install|link|publish|remove|run\s+prepare|set|uninstall|unlink|update|upgrade)\b/i,
-    reason: "package-management commands that change the workspace are blocked.",
-  },
-  {
-    pattern:
-      /\b(?:bash|sh|zsh|fish|pwsh|powershell(?:\.exe)?|cmd(?:\.exe)?)\b\s+(?:-c|-Command|\/c)\b/i,
-    reason: "nested shell execution is blocked.",
-  },
-  {
-    pattern: /\bnode\s+-e\b/i,
-    reason: "inline Node.js execution is blocked.",
-  },
-  {
-    pattern: /\bpython(?:3(?:\.\d+)?)?\s+-c\b/i,
-    reason: "inline Python execution is blocked.",
-  },
-  {
-    pattern: /\bsed\b[^\r\n]*\s-i(?:\s|$)/i,
-    reason: "in-place file editing is blocked.",
-  },
-  {
-    pattern: /\bperl\b[^\r\n]*\s-pi(?:\s|$)/i,
-    reason: "in-place file editing is blocked.",
-  },
-];
 
 export const runCommandTool = {
   definition: {
@@ -110,10 +67,13 @@ export const runCommandTool = {
       additionalProperties: false,
     },
   } satisfies ToolDefinition,
-  async execute(rawArguments: string): Promise<string> {
+  async execute(
+    rawArguments: string,
+    context?: ToolExecutionContext,
+  ): Promise<string> {
     try {
       const parsedArgs = parseRunCommandArgs(rawArguments);
-      const result = await runWorkspaceCommand(parsedArgs);
+      const result = await runWorkspaceCommand(parsedArgs, context);
 
       return JSON.stringify({
         ok: !result.timedOut,
@@ -132,6 +92,7 @@ export const runCommandTool = {
 
 export async function runWorkspaceCommand(
   args: RunCommandArgs,
+  context?: ToolExecutionContext,
 ): Promise<RunCommandResult> {
   const workspaceRoot = process.cwd();
   const relativeCwd = normalizeRelativeWorkspacePath(COMMAND_NAME, args.cwd);
@@ -147,13 +108,16 @@ export async function runWorkspaceCommand(
   }
 
   const command = args.command.trim();
-  validateCommandSafety(command);
+  const assessment = classifyCommand(command, relativeCwd);
+  await authorizeCommand(assessment, context?.commandPolicy);
 
   return executeShellCommand(
     command,
     absoluteCwd,
     relativeCwd,
     args.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    assessment,
+    context,
   );
 }
 
@@ -162,25 +126,15 @@ function parseRunCommandArgs(rawArguments: string): RunCommandArgs {
   return runCommandArgsSchema.parse(parsed);
 }
 
-function validateCommandSafety(command: string): void {
-  if (/[\r\n]/.test(command)) {
-    throw new Error("run_command must be a single-line command.");
-  }
-
-  for (const rule of BLOCKED_COMMAND_RULES) {
-    if (rule.pattern.test(command)) {
-      throw new Error(`run_command rejected: ${rule.reason}`);
-    }
-  }
-}
-
 function executeShellCommand(
   command: string,
   absoluteCwd: string,
   relativeCwd: string,
   timeoutMs: number,
+  assessment: CommandAssessment,
+  context?: ToolExecutionContext,
 ): Promise<RunCommandResult> {
-  const shell = getShellCommand(command);
+  const shell = getPlatformShellCommand(command);
 
   return new Promise((resolve, reject) => {
     const child = spawn(shell.file, shell.args, {
@@ -222,7 +176,7 @@ function executeShellCommand(
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({
+      const result = {
         command,
         cwd: relativeCwd,
         exitCode: code,
@@ -230,7 +184,22 @@ function executeShellCommand(
         stderr: stderr.trim(),
         timedOut,
         truncated,
-      });
+      };
+
+      void runAfterCommandHook(context?.commandPolicy, {
+        stage: "after",
+        approvalMode: context?.commandPolicy?.getMode() ?? "allow-all",
+        assessment,
+        result: {
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          truncated: result.truncated,
+        },
+      })
+        .then(() => {
+          resolve(result);
+        })
+        .catch(reject);
     });
   });
 }
@@ -261,20 +230,5 @@ function appendOutput(
   return {
     nextValue: currentValue + text.slice(0, remaining),
     truncated: true,
-  };
-}
-
-function getShellCommand(command: string): { file: string; args: string[] } {
-  if (process.platform === "win32") {
-    return {
-      file: "powershell.exe",
-      args: ["-NoLogo", "-NoProfile", "-Command", command],
-    };
-  }
-
-  const shellPath = process.env["SHELL"] || "/bin/sh";
-  return {
-    file: shellPath,
-    args: ["-lc", command],
   };
 }

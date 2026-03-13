@@ -4,6 +4,14 @@ import path from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import test from "node:test";
 import { executeAgentTool } from "../src/tools/index.js";
+import type { CommandApprovalMode } from "../src/tools/types.js";
+
+function createCommandPolicyContext(mode: CommandApprovalMode) {
+  return {
+    getMode: () => mode,
+    setMode: () => undefined,
+  };
+}
 
 test("run_command executes a safe workspace command in default mode", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-command-tool-"));
@@ -55,6 +63,9 @@ test("run_command rejects obviously file-modifying commands", async () => {
         }),
       },
       "default",
+      {
+        commandPolicy: createCommandPolicyContext("ask"),
+      },
     ),
   ) as {
     ok: boolean;
@@ -62,7 +73,61 @@ test("run_command rejects obviously file-modifying commands", async () => {
   };
 
   assert.equal(result.ok, false);
-  assert.match(result.error ?? "", /rejected/i);
+  assert.match(result.error ?? "", /requires approval/i);
+});
+
+test("run_command respects reject mode before execution", async () => {
+  const result = JSON.parse(
+    await executeAgentTool(
+      {
+        id: "call_4",
+        name: "run_command",
+        arguments: JSON.stringify({
+          command: "node -p \"process.cwd()\"",
+        }),
+      },
+      "default",
+      {
+        commandPolicy: createCommandPolicyContext("reject"),
+      },
+    ),
+  ) as {
+    ok: boolean;
+    error?: string;
+  };
+
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /rejected by policy/i);
+});
+
+test("run_command lets hooks block execution", async () => {
+  const result = JSON.parse(
+    await executeAgentTool(
+      {
+        id: "call_5",
+        name: "run_command",
+        arguments: JSON.stringify({
+          command: "git status",
+        }),
+      },
+      "default",
+      {
+        commandPolicy: {
+          ...createCommandPolicyContext("allow-all"),
+          runHook: async () => ({
+            action: "block",
+            message: "blocked for audit",
+          }),
+        },
+      },
+    ),
+  ) as {
+    ok: boolean;
+    error?: string;
+  };
+
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /blocked for audit/);
 });
 
 test("strict mode does not expose run_command", async () => {

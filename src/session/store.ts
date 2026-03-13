@@ -1,5 +1,5 @@
 import path from "node:path";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import type { ConversationMessage } from "../llm/types.js";
 import { getConfigFilePath } from "../config/paths.js";
 
@@ -57,6 +57,10 @@ export type SessionStoreState = {
   activeSessionId: string | null;
   indexFilePath: string;
   sessionsDirectoryPath: string;
+};
+
+type HydratableSessionSummary = SessionSummary & {
+  needsHydration?: boolean;
 };
 
 export async function loadSessionStore(): Promise<SessionStoreState> {
@@ -229,6 +233,40 @@ export async function deleteSession(
   });
 }
 
+export async function deleteAllSessions(): Promise<SessionStoreState> {
+  const currentStore = await loadSessionStore();
+  const indexFileName = path.basename(currentStore.indexFilePath);
+
+  try {
+    const entries = await readdir(currentStore.sessionsDirectoryPath, {
+      withFileTypes: true,
+    });
+
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      if (!entry.name.endsWith(".json") || entry.name === indexFileName) {
+        continue;
+      }
+
+      await unlink(path.join(currentStore.sessionsDirectoryPath, entry.name));
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
+
+  return writeSessionIndex({
+    sessions: [],
+    activeSessionId: null,
+    indexFilePath: currentStore.indexFilePath,
+    sessionsDirectoryPath: currentStore.sessionsDirectoryPath,
+  });
+}
+
 export async function setActiveSession(
   sessionId: string | null,
 ): Promise<SessionStoreState> {
@@ -288,32 +326,41 @@ function parseSessionSummaries(
       typeof summary.title === "string" ? normalizeOptionalText(summary.title) : "";
     const preview =
       typeof summary.preview === "string" ? normalizeOptionalText(summary.preview) : "";
-    const updatedAt =
-      typeof summary.updatedAt === "string" ? summary.updatedAt.trim() : "";
-    const turnCount =
-      typeof summary.turnCount === "number" ? summary.turnCount : NaN;
-    const charCount =
-      typeof summary.charCount === "number" ? summary.charCount : NaN;
-
-    if (
-      !id ||
-      !updatedAt ||
-      !Number.isInteger(turnCount) ||
-      turnCount < 0 ||
-      !Number.isInteger(charCount) ||
-      charCount < 0
-    ) {
+    if (!id) {
       throw new Error(`Session index has an invalid summary entry: ${indexFilePath}`);
     }
 
-    return {
+    const updatedAt =
+      typeof summary.updatedAt === "string" ? summary.updatedAt.trim() : "";
+    const hasValidUpdatedAt = updatedAt.length > 0;
+    const hasValidTurnCount =
+      typeof summary.turnCount === "number" &&
+      Number.isInteger(summary.turnCount) &&
+      summary.turnCount >= 0;
+    const hasValidCharCount =
+      typeof summary.charCount === "number" &&
+      Number.isInteger(summary.charCount) &&
+      summary.charCount >= 0;
+    const parsedSummary: HydratableSessionSummary = {
       id,
       title: title || getFallbackSessionTitle(id),
       preview: preview || "No preview yet.",
-      updatedAt,
-      turnCount,
-      charCount,
+      updatedAt: hasValidUpdatedAt ? updatedAt : "",
+      turnCount: hasValidTurnCount ? Number(summary.turnCount) : 0,
+      charCount: hasValidCharCount ? Number(summary.charCount) : 0,
     };
+
+    if (
+      !title ||
+      !preview ||
+      !hasValidUpdatedAt ||
+      !hasValidTurnCount ||
+      !hasValidCharCount
+    ) {
+      parsedSummary.needsHydration = true;
+    }
+
+    return parsedSummary;
   });
 }
 
@@ -429,13 +476,22 @@ async function hydrateSessionStoreSummaries(
 
     try {
       const storedSession = await loadSession(summary.id);
-      const hydratedSummary = {
-        ...summary,
+      const hydratedSummary: SessionSummary = {
+        id: summary.id,
         title: storedSession.title,
         preview: storedSession.preview,
+        updatedAt: storedSession.updatedAt,
+        turnCount: countTurns(storedSession.history),
+        charCount: countChars(storedSession.history),
       };
       hydratedSessions.push(hydratedSummary);
-      changed ||= hydratedSummary.title !== summary.title || hydratedSummary.preview !== summary.preview;
+      changed ||= (
+        hydratedSummary.title !== summary.title ||
+        hydratedSummary.preview !== summary.preview ||
+        hydratedSummary.updatedAt !== summary.updatedAt ||
+        hydratedSummary.turnCount !== summary.turnCount ||
+        hydratedSummary.charCount !== summary.charCount
+      );
     } catch {
       hydratedSessions.push(summary);
     }
@@ -543,7 +599,12 @@ function getFallbackSessionTitle(sessionId: string): string {
 }
 
 function needsSummaryHydration(summary: SessionSummary): boolean {
-  return summary.preview === "No preview yet." || isGeneratedSessionTitle(summary.title, summary.id);
+  return (
+    (summary as HydratableSessionSummary).needsHydration === true ||
+    !summary.updatedAt ||
+    summary.preview === "No preview yet." ||
+    isGeneratedSessionTitle(summary.title, summary.id)
+  );
 }
 
 function isGeneratedSessionTitle(title: string, sessionId: string): boolean {

@@ -2,6 +2,7 @@ import path from "node:path";
 import { lstat, readdir } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import type { ToolExecutionContext } from "./types.js";
 import {
   normalizeRelativeWorkspacePath,
   resolveWorkspacePath,
@@ -47,7 +48,10 @@ export const listFilesTool = {
       additionalProperties: false,
     },
   } satisfies ToolDefinition,
-  async execute(rawArguments: string): Promise<string> {
+  async execute(
+    rawArguments: string,
+    _context?: ToolExecutionContext,
+  ): Promise<string> {
     try {
       const parsedArgs = parseListFilesArgs(rawArguments);
       const result = await listWorkspaceFiles(parsedArgs);

@@ -1,7 +1,6 @@
 import path from "node:path";
-import { readdir } from "node:fs/promises";
+import { globby } from "globby";
 
-const IGNORED_DIRECTORIES = new Set([".git", "node_modules"]);
 const MAX_WORKSPACE_FILES = 5000;
 const MAX_FILE_MATCHES = 6;
 
@@ -122,11 +121,22 @@ export function normalizeFileReferenceEscapes(input: string): string {
 export async function loadWorkspaceFilePaths(
   workspaceRoot: string,
 ): Promise<string[]> {
-  const filePaths: string[] = [];
+  const filePaths = await globby(["**/*"], {
+    cwd: workspaceRoot,
+    onlyFiles: true,
+    gitignore: true,
+    ignore: [
+      ".git/**",
+      "node_modules/**",
+      "dist/**",
+    ],
+    followSymbolicLinks: false,
+  });
 
-  await walkWorkspaceDirectory(workspaceRoot, ".", filePaths);
-  filePaths.sort((left, right) => left.localeCompare(right));
-  return filePaths;
+  return filePaths
+    .map((filePath) => filePath.replace(/\\/g, "/"))
+    .sort((left, right) => left.localeCompare(right))
+    .slice(0, MAX_WORKSPACE_FILES);
 }
 
 function findFileReferences(input: string): ActiveFileReference[] {
@@ -218,47 +228,6 @@ function isResolvedFileReference(query: string, filePaths: string[]): boolean {
 
 function normalizeFileReferenceQuery(query: string): string {
   return query.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
-}
-
-async function walkWorkspaceDirectory(
-  workspaceRoot: string,
-  relativePath: string,
-  filePaths: string[],
-): Promise<void> {
-  if (filePaths.length >= MAX_WORKSPACE_FILES) {
-    return;
-  }
-
-  const absolutePath =
-    relativePath === "."
-      ? workspaceRoot
-      : path.join(workspaceRoot, relativePath);
-  const entries = await readdir(absolutePath, { withFileTypes: true });
-  entries.sort((left, right) => left.name.localeCompare(right.name));
-
-  for (const entry of entries) {
-    if (filePaths.length >= MAX_WORKSPACE_FILES) {
-      return;
-    }
-
-    if (entry.isDirectory() && IGNORED_DIRECTORIES.has(entry.name)) {
-      continue;
-    }
-
-    const childRelativePath =
-      relativePath === "."
-        ? entry.name
-        : path.posix.join(relativePath, entry.name);
-
-    if (entry.isDirectory()) {
-      await walkWorkspaceDirectory(workspaceRoot, childRelativePath, filePaths);
-      continue;
-    }
-
-    if (entry.isFile()) {
-      filePaths.push(childRelativePath);
-    }
-  }
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

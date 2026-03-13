@@ -64,6 +64,7 @@ test("CLI interactive mode preserves history across turns", async () => {
       { role: "assistant", content: "Hello Ada." },
       { role: "user", content: "What is my name?" },
     ]);
+    assert.match(stdout, /Risk notice: this agent may read, run, modify, delete, or create files in the workspace\./);
     assert.match(stdout, /Interactive mode\. Type "\/exit" to quit\./);
     assert.match(stdout, /assistant: Hello Ada\./);
     assert.match(stdout, /assistant: Your name is Ada\./);
@@ -116,8 +117,158 @@ test("CLI handles local slash commands and rejects unknown slash commands withou
 
     assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
     assert.equal(server.requests.length, 0);
-    assert.match(stdout, /Commands: \/help \/mode \[default\|strict\] \/settings \/session \/history \[id\|index\|title\] \/sessions \[query\] \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
+    assert.match(stdout, /Commands: \/help \/mode \[default\|strict\] \/approvals \[ask\|allow-all\|reject\] \/settings \/session \/history \[id\|index\|title\] \/sessions \[query\] \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\|all\] \/system \/editor \/system reset \/clear \/exit/);
     assert.match(stderr, /error: Unknown command: \/sessiojn\. Type \/help\./);
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI rejects /editor outside an interactive terminal", async () => {
+  const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const cliPath = path.resolve("src/index.ts");
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: server.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.stdin.write("/editor\n");
+    child.stdin.end("/exit\n");
+
+    const [exitCode] = (await once(child, "close")) as [number | null];
+
+    assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.match(stderr, /error: "\/editor" requires an interactive terminal\./);
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI keeps running after /system is cancelled", async () => {
+  const server = await startMockOpenAIServer(["Still here."]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const cliPath = path.resolve("src/index.ts");
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: server.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.stdin.write("/system\n");
+    child.stdin.write("/cancel\n");
+    child.stdin.write("Are you still there?\n");
+    child.stdin.end("/exit\n");
+
+    const [exitCode] = (await once(child, "close")) as [number | null];
+
+    assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(server.requests.length, 1);
+    assert.match(stdout, /System prompt update cancelled\./);
+    assert.match(stdout, /assistant: Still here\./);
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI keeps inline /system editing active when /editor is unavailable", async () => {
+  const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const cliPath = path.resolve("src/index.ts");
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: server.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.stdin.write("/system\n");
+    child.stdin.write("/editor\n");
+    child.stdin.write("You are concise.\n");
+    child.stdin.write("/save\n");
+    child.stdin.end("/exit\n");
+
+    const [exitCode] = (await once(child, "close")) as [number | null];
+
+    assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(server.requests.length, 0);
+    assert.match(stderr, /error: "\/editor" requires an interactive terminal\./);
+    assert.match(stdout, /Saved system prompt to .*settings\.json/);
+
+    const settingsContent = await readFile(path.join(tempDir, "settings.json"), "utf8");
+    assert.match(settingsContent, /You are concise\./);
   } finally {
     await server.close();
     await rm(tempDir, { recursive: true, force: true });
@@ -629,6 +780,110 @@ test("CLI can filter saved sessions by title or preview text", async () => {
     assert.match(stdout, /Volcanology note\./);
     assert.match(stdout, /Assistant: Basalt flow\./);
     assert.match(stdout, /No saved sessions match "missing-term"\./);
+  } finally {
+    await secondServer.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI requires typing YES before deleting all saved sessions", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+  const cliPath = path.resolve("src/index.ts");
+  const firstServer = await startMockOpenAIServer([
+    "Hello Ada.",
+    "Hello Grace.",
+  ]);
+
+  try {
+    const firstChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: firstServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let firstStderr = "";
+    firstChild.stderr.setEncoding("utf8");
+    firstChild.stderr.on("data", (chunk: string) => {
+      firstStderr += chunk;
+    });
+
+    firstChild.stdin.write("My name is Ada.\n");
+    firstChild.stdin.write("/new\n");
+    firstChild.stdin.write("My name is Grace.\n");
+    firstChild.stdin.end("/exit\n");
+
+    const [firstExitCode] = (await once(firstChild, "close")) as [number | null];
+    assert.equal(firstExitCode, 0, firstStderr || "CLI exited with a non-zero code.");
+  } finally {
+    await firstServer.close();
+  }
+
+  const secondServer = await startMockOpenAIServer([]);
+
+  try {
+    const secondChild = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: secondServer.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    secondChild.stdout.setEncoding("utf8");
+    secondChild.stderr.setEncoding("utf8");
+    secondChild.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    secondChild.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    secondChild.stdin.write("/delete all\n");
+    secondChild.stdin.write("no\n");
+    secondChild.stdin.write("/sessions\n");
+    secondChild.stdin.write("/delete all\n");
+    secondChild.stdin.write("YES\n");
+    secondChild.stdin.write("/sessions\n");
+    secondChild.stdin.end("/exit\n");
+
+    const [secondExitCode] = (await once(secondChild, "close")) as [number | null];
+
+    assert.equal(secondExitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(secondServer.requests.length, 0);
+    assert.match(stdout, /Delete all saved sessions \(2\)\? Type "YES" to confirm or "\/cancel" to abort\./);
+    assert.match(stdout, /Delete-all cancelled\. Type "YES" exactly to confirm\./);
+    assert.match(stdout, /Current session: My name is Grace\./);
+    assert.match(stdout, /Deleted all saved sessions: 2/);
+    assert.match(stdout, /No saved sessions\./);
+
+    const indexContent = await readFile(path.join(tempDir, "sessions", "index.json"), "utf8");
+    assert.match(indexContent, /"sessions": \[\]/);
+
+    const sessionFiles = await readdir(path.join(tempDir, "sessions"));
+    assert.deepEqual(sessionFiles.sort(), ["index.json"]);
   } finally {
     await secondServer.close();
     await rm(tempDir, { recursive: true, force: true });
