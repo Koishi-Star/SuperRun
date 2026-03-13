@@ -1,5 +1,5 @@
 import type { Writable } from "node:stream";
-import { render, type Instance, type Key } from "ink";
+import { render, type Instance } from "ink";
 import React from "react";
 import {
   applySelectedComposerSuggestion,
@@ -15,6 +15,7 @@ import {
   type ComposerState,
 } from "./composer-state.js";
 import { InteractiveShell } from "./ink/interactive-shell.js";
+import { normalizeInkInput } from "./input-events.js";
 
 export type RendererLine = {
   id: string;
@@ -28,6 +29,37 @@ export type RendererPrompt = {
     text: string;
   };
   state: ComposerState;
+};
+
+export type RendererPickerOption = {
+  value: string | null;
+  label: string;
+  description: string;
+  tone?: "default" | "accent" | "danger";
+};
+
+export type RendererSelectOptions = {
+  title: string;
+  subtitle?: string;
+  helpText?: string;
+  emptyMessage?: string;
+  options: RendererPickerOption[];
+};
+
+export type RendererOverlayOption = {
+  value: string | null;
+  label: string;
+  description: string;
+  tone: "default" | "accent" | "danger";
+};
+
+export type RendererOverlay = {
+  title: string;
+  subtitle: string | null;
+  helpText: string | null;
+  emptyMessage: string | null;
+  options: RendererOverlayOption[];
+  selectedIndex: number;
 };
 
 export type InteractiveRenderer = {
@@ -47,24 +79,37 @@ export type InteractiveRenderer = {
     promptLabel: string;
     workspaceFiles: string[];
   }) => Promise<string>;
+  selectOption: (options: RendererSelectOptions) => Promise<string | null>;
   getSnapshot: () => InteractiveRendererSnapshot;
   suspend: () => void;
   resume: () => void;
   dispose: () => void;
 };
 
+type RendererInputMode = "inactive" | "prompt" | "overlay";
+
 type RendererState = {
   headerLines: RendererLine[];
   logLines: RendererLine[];
   prompt: RendererPrompt;
-  inputActive: boolean;
+  inputMode: RendererInputMode;
+  overlay: RendererOverlay | null;
 };
 
-export type InteractiveRendererSnapshot = RendererState;
+export type InteractiveRendererSnapshot = {
+  headerLines: RendererLine[];
+  logLines: RendererLine[];
+  prompt: RendererPrompt;
+  inputMode: RendererInputMode;
+  inputActive: boolean;
+  overlay: RendererOverlay | null;
+  statusText: string;
+};
 
 export function createInteractiveRenderer(options: {
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
+  enableInput?: boolean;
 }): InteractiveRenderer {
   const promptLabel = "you > ";
   const editorPromptLabel = "system > ";
@@ -72,6 +117,7 @@ export function createInteractiveRenderer(options: {
   let activeAssistantLineId: string | null = null;
   let promptWorkspaceFiles: string[] = [];
   let promptResolver: ((value: string) => void) | null = null;
+  let overlayResolver: ((value: string | null) => void) | null = null;
   let instance: Instance | null = null;
   let state: RendererState = {
     headerLines: [],
@@ -83,7 +129,8 @@ export function createInteractiveRenderer(options: {
       },
       state: createComposerState(),
     },
-    inputActive: false,
+    inputMode: "inactive",
+    overlay: null,
   };
 
   const mount = () => {
@@ -117,7 +164,10 @@ export function createInteractiveRenderer(options: {
       logLines={state.logLines}
       prompt={state.prompt}
       divider={buildDivider(options.output)}
-      inputActive={state.inputActive}
+      inputEnabled={options.enableInput ?? true}
+      inputMode={state.inputMode}
+      overlay={state.overlay}
+      statusText={buildStatusText(state)}
       onInput={handleInput}
     />
   );
@@ -139,6 +189,29 @@ export function createInteractiveRenderer(options: {
       ],
     };
     rerender();
+  };
+
+  const resolvePrompt = (value: string) => {
+    const resolver = promptResolver;
+    promptResolver = null;
+    state = {
+      ...state,
+      inputMode: "inactive",
+    };
+    rerender();
+    resolver?.(value);
+  };
+
+  const resolveOverlay = (value: string | null) => {
+    const resolver = overlayResolver;
+    overlayResolver = null;
+    state = {
+      ...state,
+      inputMode: "inactive",
+      overlay: null,
+    };
+    rerender();
+    resolver?.(value);
   };
 
   const renderer: InteractiveRenderer = {
@@ -241,13 +314,19 @@ export function createInteractiveRenderer(options: {
       rerender();
     },
     readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
-      // Picker flows can leave stdin paused after they tear down readline.
+      if (promptResolver || overlayResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      // External terminal tools can leave stdin paused after they tear down readline.
       // Resume before each prompt so Ink can receive keypresses again.
       options.input.resume?.();
       promptWorkspaceFiles = workspaceFiles;
       activeAssistantLineId = null;
       state = {
         ...state,
+        inputMode: "prompt",
+        overlay: null,
         prompt: {
           label: {
             kind: nextLabel === editorPromptLabel ? "editor" : "user",
@@ -255,20 +334,40 @@ export function createInteractiveRenderer(options: {
           },
           state: syncComposerState(createComposerState(), workspaceFiles),
         },
-        inputActive: true,
       };
       rerender();
 
       return new Promise<string>((resolve) => {
-        promptResolver = (value) => {
-          promptResolver = null;
-          state = {
-            ...state,
-            inputActive: false,
-          };
-          rerender();
-          resolve(value);
-        };
+        promptResolver = resolve;
+      });
+    },
+    selectOption: async (selection) => {
+      if (promptResolver || overlayResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      const overlayOptions = selection.options.map((option) => ({
+        ...option,
+        tone: option.tone ?? "default",
+      }));
+      const defaultIndex = overlayOptions.findIndex((option) => option.value !== null);
+
+      state = {
+        ...state,
+        inputMode: "overlay",
+        overlay: {
+          title: selection.title,
+          subtitle: selection.subtitle ?? null,
+          helpText: selection.helpText ?? null,
+          emptyMessage: selection.emptyMessage ?? null,
+          options: overlayOptions,
+          selectedIndex: defaultIndex >= 0 ? defaultIndex : 0,
+        },
+      };
+      rerender();
+
+      return new Promise<string | null>((resolve) => {
+        overlayResolver = resolve;
       });
     },
     getSnapshot: () => ({
@@ -278,7 +377,15 @@ export function createInteractiveRenderer(options: {
         label: { ...state.prompt.label },
         state: { ...state.prompt.state },
       },
-      inputActive: state.inputActive,
+      inputMode: state.inputMode,
+      inputActive: state.inputMode !== "inactive",
+      overlay: state.overlay
+        ? {
+            ...state.overlay,
+            options: [...state.overlay.options],
+          }
+        : null,
+      statusText: buildStatusText(state),
     }),
     suspend: () => {
       if (!instance) {
@@ -303,26 +410,95 @@ export function createInteractiveRenderer(options: {
     },
   };
 
-  const handleInput = (inputValue: string, key: Key) => {
-    if (!state.inputActive || !promptResolver) {
+  const handleInput = (inputValue: string, key: Parameters<typeof normalizeInkInput>[1]) => {
+    const event = normalizeInkInput(inputValue, key);
+    if (!event) {
+      return;
+    }
+
+    if (state.inputMode === "overlay" && state.overlay) {
+      handleOverlayInput(event);
+      return;
+    }
+
+    if (state.inputMode !== "prompt" || !promptResolver) {
+      return;
+    }
+
+    handlePromptInput(event);
+  };
+
+  const handleOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
+    if (!event || !state.overlay || !overlayResolver) {
+      return;
+    }
+
+    if (event.type === "interrupt" || event.type === "cancel") {
+      resolveOverlay(null);
+      return;
+    }
+
+    if (event.type === "submit") {
+      const selectedOption = state.overlay.options[state.overlay.selectedIndex] ?? null;
+      resolveOverlay(selectedOption?.value ?? null);
+      return;
+    }
+
+    if (event.type === "move_up") {
+      state = {
+        ...state,
+        overlay: moveOverlaySelection(state.overlay, -1),
+      };
+      rerender();
+      return;
+    }
+
+    if (event.type === "move_down") {
+      state = {
+        ...state,
+        overlay: moveOverlaySelection(state.overlay, 1),
+      };
+      rerender();
+      return;
+    }
+
+    if (event.type === "move_home") {
+      state = {
+        ...state,
+        overlay: {
+          ...state.overlay,
+          selectedIndex: 0,
+        },
+      };
+      rerender();
+      return;
+    }
+
+    if (event.type === "move_end") {
+      state = {
+        ...state,
+        overlay: {
+          ...state.overlay,
+          selectedIndex: Math.max(0, state.overlay.options.length - 1),
+        },
+      };
+      rerender();
+    }
+  };
+
+  const handlePromptInput = (event: ReturnType<typeof normalizeInkInput>) => {
+    if (!event) {
       return;
     }
 
     let nextComposerState = state.prompt.state;
 
-    if (key.ctrl && inputValue === "c") {
-      const resolver = promptResolver;
-      promptResolver = null;
-      state = {
-        ...state,
-        inputActive: false,
-      };
-      rerender();
-      resolver("/exit");
+    if (event.type === "interrupt") {
+      resolvePrompt("/exit");
       return;
     }
 
-    if (key.return) {
+    if (event.type === "submit") {
       const submission = submitComposer(nextComposerState, promptWorkspaceFiles);
       nextComposerState = submission.state;
       state = {
@@ -335,54 +511,69 @@ export function createInteractiveRenderer(options: {
       rerender();
 
       if (submission.submittedText !== null) {
-        const resolver = promptResolver;
-        promptResolver = null;
-        state = {
-          ...state,
-          inputActive: false,
-        };
-        rerender();
-        resolver(submission.submittedText);
+        resolvePrompt(submission.submittedText);
       }
       return;
     }
 
-    if (key.backspace) {
-      nextComposerState = backspaceComposerText(nextComposerState, promptWorkspaceFiles);
-    } else if (key.delete) {
-      nextComposerState = deleteComposerText(nextComposerState, promptWorkspaceFiles);
-    } else if (key.leftArrow) {
-      nextComposerState = moveComposerCursor(
-        nextComposerState,
-        nextComposerState.cursorIndex - 1,
-        promptWorkspaceFiles,
-      );
-    } else if (key.rightArrow) {
-      nextComposerState = moveComposerCursor(
-        nextComposerState,
-        nextComposerState.cursorIndex + 1,
-        promptWorkspaceFiles,
-      );
-    } else if (key.home || (key.ctrl && inputValue === "a")) {
-      nextComposerState = moveComposerCursor(nextComposerState, 0, promptWorkspaceFiles);
-    } else if (key.end || (key.ctrl && inputValue === "e")) {
-      nextComposerState = moveComposerCursor(
-        nextComposerState,
-        nextComposerState.buffer.length,
-        promptWorkspaceFiles,
-      );
-    } else if (nextComposerState.suggestions.length > 0 && key.upArrow) {
-      nextComposerState = moveComposerSuggestionSelection(nextComposerState, "up", promptWorkspaceFiles);
-    } else if (nextComposerState.suggestions.length > 0 && key.downArrow) {
-      nextComposerState = moveComposerSuggestionSelection(nextComposerState, "down", promptWorkspaceFiles);
-    } else if (key.escape) {
-      nextComposerState = clearComposerError(nextComposerState, promptWorkspaceFiles);
-    } else if (key.tab) {
-      nextComposerState = applySelectedComposerSuggestion(nextComposerState, promptWorkspaceFiles);
-    } else if (!key.ctrl && !key.escape && inputValue) {
-      nextComposerState = insertComposerText(nextComposerState, inputValue, promptWorkspaceFiles);
-    } else {
-      return;
+    switch (event.type) {
+      case "backspace":
+        nextComposerState = backspaceComposerText(nextComposerState, promptWorkspaceFiles);
+        break;
+      case "delete":
+        nextComposerState = shouldTreatDeleteAsBackspace(nextComposerState)
+          ? backspaceComposerText(nextComposerState, promptWorkspaceFiles)
+          : deleteComposerText(nextComposerState, promptWorkspaceFiles);
+        break;
+      case "move_left":
+        nextComposerState = moveComposerCursor(
+          nextComposerState,
+          nextComposerState.cursorIndex - 1,
+          promptWorkspaceFiles,
+        );
+        break;
+      case "move_right":
+        nextComposerState = moveComposerCursor(
+          nextComposerState,
+          nextComposerState.cursorIndex + 1,
+          promptWorkspaceFiles,
+        );
+        break;
+      case "move_home":
+        nextComposerState = moveComposerCursor(nextComposerState, 0, promptWorkspaceFiles);
+        break;
+      case "move_end":
+        nextComposerState = moveComposerCursor(
+          nextComposerState,
+          nextComposerState.buffer.length,
+          promptWorkspaceFiles,
+        );
+        break;
+      case "move_up":
+        if (nextComposerState.suggestions.length > 0) {
+          nextComposerState = moveComposerSuggestionSelection(nextComposerState, "up", promptWorkspaceFiles);
+        } else {
+          return;
+        }
+        break;
+      case "move_down":
+        if (nextComposerState.suggestions.length > 0) {
+          nextComposerState = moveComposerSuggestionSelection(nextComposerState, "down", promptWorkspaceFiles);
+        } else {
+          return;
+        }
+        break;
+      case "cancel":
+        nextComposerState = clearComposerError(nextComposerState, promptWorkspaceFiles);
+        break;
+      case "apply_suggestion":
+        nextComposerState = applySelectedComposerSuggestion(nextComposerState, promptWorkspaceFiles);
+        break;
+      case "insert_text":
+        nextComposerState = insertComposerText(nextComposerState, event.text, promptWorkspaceFiles);
+        break;
+      default:
+        return;
     }
 
     state = {
@@ -399,11 +590,48 @@ export function createInteractiveRenderer(options: {
   return renderer;
 }
 
+function moveOverlaySelection(
+  overlay: RendererOverlay,
+  delta: number,
+): RendererOverlay {
+  if (overlay.options.length === 0) {
+    return overlay;
+  }
+
+  const nextIndex =
+    (overlay.selectedIndex + delta + overlay.options.length) % overlay.options.length;
+
+  return {
+    ...overlay,
+    selectedIndex: nextIndex,
+  };
+}
+
+function buildStatusText(state: RendererState): string {
+  if (state.inputMode === "overlay") {
+    return state.overlay?.helpText ?? "Up/Down move  Enter select  Esc cancel";
+  }
+
+  if (state.prompt.state.activeReference) {
+    return "Tab insert file  Up/Down choose  Enter submit  Esc clear";
+  }
+
+  return "Enter submit  Ctrl+C exit";
+}
+
+function shouldTreatDeleteAsBackspace(state: ComposerState): boolean {
+  return (
+    process.platform === "win32" &&
+    state.cursorIndex === state.buffer.length &&
+    state.buffer.length > 0
+  );
+}
+
 function buildDivider(output: Writable): string {
   const columns =
     "columns" in output && typeof output.columns === "number"
       ? output.columns
       : 80;
   const width = Math.min(Math.max(columns, 40), 120);
-  return "─".repeat(width);
+  return "-".repeat(width);
 }

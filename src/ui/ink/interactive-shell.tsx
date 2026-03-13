@@ -1,14 +1,21 @@
 import React from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import type { ComposerState } from "../composer-state.js";
-import type { RendererLine, RendererPrompt } from "../interactive-renderer.js";
+import type {
+  RendererLine,
+  RendererOverlay,
+  RendererPrompt,
+} from "../interactive-renderer.js";
 
 export type InteractiveShellProps = {
   headerLines: RendererLine[];
   logLines: RendererLine[];
   prompt: RendererPrompt;
   divider: string;
-  inputActive: boolean;
+  inputEnabled?: boolean;
+  inputMode: "inactive" | "prompt" | "overlay";
+  overlay: RendererOverlay | null;
+  statusText: string;
   onInput: (input: string, key: Key) => void;
 };
 
@@ -17,36 +24,46 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
     (input, key) => {
       props.onInput(input, key);
     },
-    { isActive: props.inputActive },
+    { isActive: (props.inputEnabled ?? true) && props.inputMode !== "inactive" },
   );
 
   return (
     <Box flexDirection="column">
-      <LineBlock lines={props.headerLines} />
-      <LineBlock lines={props.logLines} />
+      <HeaderRegion lines={props.headerLines} />
+      <LogRegion lines={props.logLines} />
+      {props.overlay ? <OverlayPicker overlay={props.overlay} /> : null}
       <Composer
         prompt={props.prompt}
         divider={props.divider}
-        inputActive={props.inputActive}
+        inputMode={props.inputMode}
       />
+      <StatusBar text={props.statusText} />
     </Box>
   );
 }
 
+function HeaderRegion(props: { lines: RendererLine[] }): React.JSX.Element {
+  return <LineBlock lines={props.lines} />;
+}
+
+function LogRegion(props: { lines: RendererLine[] }): React.JSX.Element {
+  return <LineBlock lines={props.lines} />;
+}
+
 function LineBlock(props: { lines: RendererLine[] }): React.JSX.Element {
   return (
-    <>
+    <Box flexDirection="column">
       {props.lines.map((line) => (
         <StyledLine key={line.id} line={line} />
       ))}
-    </>
+    </Box>
   );
 }
 
 function Composer(props: {
   prompt: RendererPrompt;
   divider: string;
-  inputActive: boolean;
+  inputMode: InteractiveShellProps["inputMode"];
 }): React.JSX.Element {
   return (
     <Box flexDirection="column">
@@ -54,14 +71,14 @@ function Composer(props: {
       <PromptLine
         label={props.prompt.label}
         state={props.prompt.state}
-        isActive={props.inputActive}
+        isActive={props.inputMode === "prompt"}
       />
       {props.prompt.state.errorMessage ? (
         <Text color="redBright">{`  ${props.prompt.state.errorMessage}`}</Text>
       ) : null}
       {renderSuggestionLines(props.prompt.state).map((line, index) => (
         <Text
-          key={`suggestion-${index}`}
+          key={`suggestion-${line.text}-${index}`}
           dimColor={!line.selected}
           inverse={line.selected}
         >
@@ -88,21 +105,61 @@ function PromptLine(props: {
     : "";
 
   return (
-    <Text>
+    <Box flexDirection="row">
       <Text bold color={props.label.kind === "editor" ? "yellow" : "cyan"}>
         {props.label.text}
       </Text>
       {props.isActive
         ? (
-            <>
+            <Text>
               {beforeCursor}
-              <Text inverse>{cursorCharacter || " "}</Text>
-              {afterCursor}
-            </>
+            </Text>
           )
-        : props.state.buffer}
-    </Text>
+        : <Text>{props.state.buffer}</Text>}
+      {props.isActive ? <Text inverse>{cursorCharacter || " "}</Text> : null}
+      {props.isActive ? <Text>{afterCursor}</Text> : null}
+    </Box>
   );
+}
+
+function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      marginTop={1}
+      paddingX={1}
+      paddingY={0}
+    >
+      <Text bold color="cyan">
+        {props.overlay.title}
+      </Text>
+      {props.overlay.subtitle ? <Text dimColor>{props.overlay.subtitle}</Text> : null}
+      {props.overlay.options.length === 0 && props.overlay.emptyMessage ? (
+        <Text dimColor>{props.overlay.emptyMessage}</Text>
+      ) : null}
+      {props.overlay.options.map((option, index) => (
+        <Box
+          key={`overlay-${option.value ?? "cancel"}-${option.label}-${index}`}
+          flexDirection="column"
+          marginTop={index === 0 ? 1 : 0}
+        >
+          <Text
+            color={getOverlayToneColor(option.tone)}
+            inverse={index === props.overlay.selectedIndex}
+          >
+            {`${index === props.overlay.selectedIndex ? ">" : " "} ${option.label}`}
+          </Text>
+          <Text dimColor>{`  ${option.description}`}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+function StatusBar(props: { text: string }): React.JSX.Element {
+  return <Text dimColor>{props.text}</Text>;
 }
 
 function StyledLine(props: { line: RendererLine }): React.JSX.Element {
@@ -112,23 +169,23 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
       return <Text bold>{text}</Text>;
     case "error":
       return (
-        <Text>
+        <Box flexDirection="row">
           <Text bold color="redBright">
             error:
           </Text>
-          {text ? ` ${text}` : ""}
-        </Text>
+          {text ? <Text>{` ${text}`}</Text> : null}
+        </Box>
       );
     case "warning":
       return <Text color="yellowBright">{text}</Text>;
     case "assistant":
       return (
-        <Text>
+        <Box flexDirection="row">
           <Text bold color="green">
             superrun &gt;{" "}
           </Text>
-          {text}
-        </Text>
+          <Text>{text}</Text>
+        </Box>
       );
     case "body":
       return <Text>{text}</Text>;
@@ -160,4 +217,18 @@ function renderSuggestionLines(state: ComposerState): Array<{
       selected: index === state.selectedSuggestionIndex,
     })),
   ];
+}
+
+function getOverlayToneColor(
+  tone: RendererOverlay["options"][number]["tone"],
+): "white" | "cyan" | "redBright" {
+  switch (tone) {
+    case "accent":
+      return "cyan";
+    case "danger":
+      return "redBright";
+    case "default":
+    default:
+      return "white";
+  }
 }

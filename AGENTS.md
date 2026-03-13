@@ -27,27 +27,26 @@
 - `src/ui/tui.ts` contains lightweight terminal formatting helpers and command/help rendering used by the interactive flows.
 - `src/ui/tty-prompt.ts` retains the older imperative TTY composer path used by tests and transitional utilities while the main interactive loop moves behind Ink.
 - `src/ui/composer-state.ts` centralizes the shared composer state machine used by both the Ink renderer and the legacy imperative prompt path.
+- `src/ui/input-events.ts` normalizes Ink key/input payloads into semantic composer and overlay events so the UI stops depending on library-specific key flags.
 - `src/ui/file-reference.ts` handles workspace file indexing plus `@file` query parsing, escape handling, validation, and matching.
 - `src/ui/session-picker.ts` models the paged `/sessions` picker state, navigation, and view data for TTY mode.
-- `src/ui/session-picker-controller.ts` handles keyboard-driven `/sessions` picker interaction, including raw-mode lifecycle and cancel/confirm behavior.
-- `src/ui/mode-picker.ts` and `src/ui/mode-picker-controller.ts` provide the keyboard-driven `/mode` picker used in TTY mode.
+- `src/ui/mode-picker.ts` provides the option list shown by the `/mode` picker in TTY mode.
 - `src/ui/external-editor.ts` opens an external text editor (resolved from `VISUAL`/`EDITOR` env vars) so users can edit the system prompt in a temp file, diffing before/after to detect changes.
-- `src/ui/inquirer-errors.ts` centralizes detection of abort/cancel/exit errors from `@inquirer/prompts` so callers can handle user cancellation uniformly.
-- `src/ui/interactive-renderer.tsx` provides a React + Ink-based renderer that manages the interactive TTY surface: log lines, prompt input, and real-time file-suggestion updates.
+- `src/ui/interactive-renderer.tsx` provides a React + Ink-based renderer that manages the interactive TTY surface: log lines, prompt input, overlay pickers, Windows-aware backspace/delete handling, and real-time file-suggestion updates.
 - `src/ui/text-width.ts` re-exports terminal display-width utilities from `terminal_format` for measuring multi-byte/wide character widths.
-- `src/ui/ink/interactive-shell.tsx` is the top-level Ink React component that composes the full interactive shell: header, log lines, composer prompt with suggestions and error display.
+- `src/ui/ink/interactive-shell.tsx` is the top-level Ink React component that composes the full interactive shell: header, log lines, overlay picker, composer prompt with suggestions and error display, and status bar.
 - `src/agent/mode.ts` defines the agent mode enum (`default` | `strict`), parsing helpers, and mode summary strings used throughout the agent loop and UI.
 - `src/tools/types.ts` defines TypeScript types for the command policy system: approval modes, risk categories, command assessment, hooks, and tool execution context.
 - `src/tools/command_policy.ts` implements risk assessment for shell commands, classifying them as high-risk, network, write, or read using regex pattern matching.
 - `src/tools/command_hooks.ts` runs pre/post command hooks from `SUPERRUN_PRE_COMMAND_HOOK` / `SUPERRUN_POST_COMMAND_HOOK` env vars; hooks can return JSON actions to allow or block execution.
 - `src/tools/shell.ts` provides a cross-platform shell wrapper that returns PowerShell arguments on Windows and sh/bash on Unix, abstracting shell differences for `run_command`.
 - `src/tools/index.ts` is the tool system entry point: exports tool definitions and routes tool calls based on the active agent mode.
-- `test/` contains focused tests for env parsing, system prompt settings and external editing, session store behavior, picker/controller rendering and interaction, command policy and hooks, interactive renderer behavior, provider reasoning-content passthrough, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
+- `test/` contains focused tests for env parsing, system prompt settings and external editing, session store behavior, picker rendering, command policy and hooks, semantic input normalization, interactive renderer behavior, provider reasoning-content passthrough, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a paged keyboard-driven TTY `/sessions` picker, a keyboard-driven TTY `/mode` picker, process-level agent modes (`default` and opt-in `strict`), command approval modes (`ask`, `allow-all`, `reject`), guarded `run_command` in default mode, strict-mode-only specialized tools, provider `reasoning_content` passthrough across tool rounds, local `@file` validation/suggestions, command risk classification via `command_policy.ts`, pre/post command hook execution via `command_hooks.ts`, cross-platform shell abstraction, external editor support for system prompt editing, and an Ink-rendered interactive shell that now drives the main TTY prompt loop.
-- Not done yet: structured file writing/editing, a second strict-mode read-only tool for file content inspection, prompt/version handling for evolving system prompts, richer TTY session actions beyond switching, stronger long-term command policy/trust controls, multi-provider routing, and finishing the remaining consolidation from separate picker flows and legacy prompt helpers into one cohesive Ink shell.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, Ink-owned `/sessions` `/mode` `/approvals` overlay pickers, process-level agent modes (`default` and opt-in `strict`), command approval modes (`ask`, `allow-all`, `reject`), guarded `run_command` in default mode, strict-mode-only specialized tools, provider `reasoning_content` passthrough across tool rounds, local `@file` validation/suggestions, a semantic Ink input layer, command risk classification via `command_policy.ts`, pre/post command hook execution via `command_hooks.ts`, cross-platform shell abstraction, external editor support for system prompt editing, and an Ink-rendered interactive shell that now drives the main TTY prompt loop.
+- Not done yet: structured file writing/editing, a second strict-mode read-only tool for file content inspection, prompt/version handling for evolving system prompts, richer TTY session actions beyond switching, stronger long-term command policy/trust controls, multi-provider routing, fully retiring the remaining readline/legacy TTY fallbacks, and a broader visual polish pass for the Ink shell.
 - Current maturity: the chat loop is now viable as an early coding agent because default mode can inspect and verify work through commands and can pause for approval before non-read-only shell execution, but write-path design and policy hardening are still intentionally incomplete.
 
 ## Working rules
@@ -71,11 +70,11 @@
 
 ## Priorities for upcoming work
 
-1. Continue consolidating interactive TTY flows around the Ink shell, including picker flows and remaining legacy composer pieces, while keeping non-TTY flows unchanged.
+1. Continue consolidating interactive TTY flows around the Ink shell by retiring the remaining readline/legacy TTY fallbacks and moving platform-specific key normalization behind one semantic input adapter.
 2. Design the write path explicitly instead of letting it leak through ad hoc shell usage. Keep command execution and file editing as separate capabilities.
 3. Harden default-mode command policy beyond the current heuristic classifier, approval modes, and hook points with clearer trust boundaries and better surfaced failures.
 4. Add the second strict-mode read-only tool, likely line-bounded file reading, so strict mode remains useful without command access.
-5. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
+5. Build out the Ink shell layout and visual language only after the TTY lifecycle is fully owned by one runtime path.
 
 ## Implementation preferences
 
@@ -98,5 +97,7 @@
 - Session titles, previews, rename, history inspection, and `/sessions [query]` filtering are already in place for the current saved-session UX slice.
 - System prompt overrides are already persisted locally and reset the current conversation when changed.
 - Command approvals, command hooks, and external-editor-based system prompt editing are already wired through the CLI.
-- The current TTY shell is already running through Ink, although picker flows and some helper modules are still split across separate surfaces.
+- The current TTY shell is already running through Ink, and the main picker flows now render as Ink overlays instead of separate prompt systems.
+- Remaining terminal-state boundaries are intentionally narrow: non-TTY readline fallback, no-UI command approval fallback, the legacy `tty-prompt` test helper, and the external-editor handoff used by `/editor`.
+- `useInput` can emit a duplicate-key warning inside `node:test` even when runtime keys are unique; renderer tests disable live Ink input hooks to keep the suite signal clean.
 - The project now has a small `node:test` suite executed via `npm test`.

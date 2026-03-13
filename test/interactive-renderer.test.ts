@@ -21,10 +21,12 @@ class FakeTTYOutput extends PassThrough {
   rows = 24;
 }
 
-test("interactive renderer appends log lines and streams assistant chunks into one entry", () => {
+test("interactive renderer appends log lines and streams assistant chunks into one entry", {
+  concurrency: false,
+}, async () => {
   const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
   const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
-  const renderer = createInteractiveRenderer({ input, output });
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
 
   try {
     renderer.setShellFrame([
@@ -56,10 +58,12 @@ test("interactive renderer appends log lines and streams assistant chunks into o
   }
 });
 
-test("interactive renderer keeps state across suspend/resume and clearScreen only clears logs", () => {
+test("interactive renderer keeps state across suspend/resume and clearScreen only clears logs", {
+  concurrency: false,
+}, () => {
   const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
   const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
-  const renderer = createInteractiveRenderer({ input, output });
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
 
   try {
     renderer.setShellFrame([
@@ -94,12 +98,15 @@ test("interactive renderer keeps state across suspend/resume and clearScreen onl
   }
 });
 
-test("interactive renderer switches prompt labels when reading inline editor input", () => {
+test("interactive renderer switches prompt labels when reading inline editor input", {
+  concurrency: false,
+}, () => {
   const input = new FakeTTYInput();
   const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
   const renderer = createInteractiveRenderer({
     input: input as unknown as NodeJS.ReadStream,
     output,
+    enableInput: false,
   });
 
   try {

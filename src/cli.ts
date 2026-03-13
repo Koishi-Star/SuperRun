@@ -2,7 +2,6 @@ import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { Command, Option } from "commander";
-import { select } from "@inquirer/prompts";
 import {
   type AgentSession,
   createAgentSession,
@@ -48,11 +47,11 @@ import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
   createInteractiveRenderer,
   type InteractiveRenderer,
+  type RendererPickerOption,
   type RendererLine,
 } from "./ui/interactive-renderer.js";
-import { isPromptExitError } from "./ui/inquirer-errors.js";
-import { runModePickerInteraction } from "./ui/mode-picker-controller.js";
-import { runSessionPickerInteraction } from "./ui/session-picker-controller.js";
+import { buildModePickerChoices } from "./ui/mode-picker.js";
+import { buildSessionPickerChoices } from "./ui/session-picker.js";
 
 export const program = new Command();
 
@@ -1401,78 +1400,53 @@ async function runSessionPicker(
     filterQuery?: string | undefined;
   },
 ): Promise<SessionSummary | null> {
-  if (!input.isTTY || !output.isTTY) {
-    return null;
-  }
+  const sessions = options?.sessions ?? state.sessionStore.sessions;
+  const selectedSessionId = await ui.selectOption({
+    title: "Saved Sessions",
+    subtitle: buildSessionPickerSubtitle(sessions.length, options?.filterQuery),
+    helpText: "Up/Down move  Enter switch  Esc cancel",
+    options: buildSessionPickerChoices(sessions, state.currentSessionId).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.value === state.currentSessionId ? "accent" : "default",
+    })),
+  });
 
-  return runWithSuspendedRenderer(ui, () =>
-    runSessionPickerInteraction({
-      sessions: options?.sessions ?? state.sessionStore.sessions,
-      currentSessionId: state.currentSessionId,
-      filterQuery: options?.filterQuery,
-    }),
-  );
+  return sessions.find((session) => session.id === selectedSessionId) ?? null;
 }
 
 async function runModePicker(
   currentMode: AgentMode,
   ui: InteractiveRenderer,
 ): Promise<AgentMode | null> {
-  if (!input.isTTY || !output.isTTY) {
-    return null;
-  }
+  const selectedMode = await ui.selectOption({
+    title: "Tool Mode",
+    subtitle: "Choose how the agent can inspect and execute local work.",
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildModePickerChoices(currentMode).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.value === currentMode ? "accent" : "default",
+    })),
+  });
 
-  return runWithSuspendedRenderer(ui, () =>
-    runModePickerInteraction({
-      currentMode,
-    }),
-  );
+  return selectedMode ? parseAgentMode(selectedMode) : null;
 }
 
 async function runApprovalPicker(
   currentMode: CommandApprovalMode,
   ui: InteractiveRenderer,
 ): Promise<CommandApprovalMode | null> {
-  if (!input.isTTY || !output.isTTY) {
-    return null;
-  }
-
-  return runWithSuspendedRenderer(ui, async () => {
-    try {
-      return await select<CommandApprovalMode | null>({
-        message: "Choose the command approval mode",
-        choices: [
-          {
-            value: "ask",
-            name: currentMode === "ask" ? "ask (current)" : "ask",
-            description: "Auto-run read-only commands and prompt before other shell execution.",
-          },
-          {
-            value: "allow-all",
-            name: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
-            description: "Auto-approve command execution for the current process.",
-          },
-          {
-            value: "reject",
-            name: currentMode === "reject" ? "reject (current)" : "reject",
-            description: "Block run_command entirely for the current process.",
-          },
-          {
-            value: null,
-            name: "Keep current approvals",
-            description: "Return to chat without changing the approval mode.",
-          },
-        ],
-        pageSize: 4,
-      });
-    } catch (error) {
-      if (isPromptExitError(error)) {
-        return null;
-      }
-
-      throw error;
-    }
+  const selectedMode = await ui.selectOption({
+    title: "Command Approvals",
+    subtitle: "Choose how shell execution is approved in this process.",
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildApprovalPickerOptions(currentMode),
   });
+
+  return selectedMode ? parseCommandApprovalMode(selectedMode) : null;
 }
 
 function createToolExecutionContext(
@@ -1502,43 +1476,81 @@ async function promptCommandApproval(
 ): Promise<CommandApprovalDecision> {
   const { assessment } = request;
   const reasonSummary = assessment.reasons.join(" ");
-  const runPrompt = async () => {
-    try {
-      return await select<CommandApprovalDecision>({
-        message: `Approve ${assessment.category} command?`,
-        choices: [
-          {
-            value: "once",
-            name: "Approve once",
-            description: `${assessment.summary}. ${reasonSummary}`,
-          },
-          {
-            value: "always",
-            name: "Allow all this session",
-            description: "Switch approvals to allow-all for subsequent commands in this process.",
-          },
-          {
-            value: "reject",
-            name: "Reject",
-            description: `Block this command: ${assessment.command}`,
-          },
-        ],
-        pageSize: 3,
-      });
-    } catch (error) {
-      if (isPromptExitError(error)) {
-        return "reject";
-      }
-
-      throw error;
-    }
-  };
 
   if (ui) {
-    return runWithSuspendedRenderer(ui, runPrompt);
+    const selectedDecision = await ui.selectOption({
+      title: `Approve ${assessment.category} command?`,
+      subtitle: assessment.summary,
+      helpText: "Up/Down move  Enter choose  Esc reject",
+      options: [
+        {
+          value: "once",
+          label: "Approve once",
+          description: `${assessment.summary}. ${reasonSummary}`,
+          tone: "accent",
+        },
+        {
+          value: "always",
+          label: "Allow all this session",
+          description: "Switch approvals to allow-all for later commands in this process.",
+          tone: "default",
+        },
+        {
+          value: "reject",
+          label: "Reject",
+          description: `Block this command: ${assessment.command}`,
+          tone: "danger",
+        },
+      ],
+    });
+
+    return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
   }
 
-  return runPrompt();
+  return promptCommandApprovalInTTY(request);
+}
+
+function buildApprovalPickerOptions(
+  currentMode: CommandApprovalMode,
+): RendererPickerOption[] {
+  return [
+    {
+      value: "ask",
+      label: currentMode === "ask" ? "ask (current)" : "ask",
+      description: "Auto-run read-only commands and prompt before other shell execution.",
+      tone: currentMode === "ask" ? "accent" : "default",
+    },
+    {
+      value: "allow-all",
+      label: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
+      description: "Auto-approve command execution for the current process.",
+      tone: currentMode === "allow-all" ? "accent" : "default",
+    },
+    {
+      value: "reject",
+      label: currentMode === "reject" ? "reject (current)" : "reject",
+      description: "Block run_command entirely for the current process.",
+      tone: currentMode === "reject" ? "accent" : "default",
+    },
+    {
+      value: null,
+      label: "Keep current approvals",
+      description: "Return to chat without changing the approval mode.",
+      tone: "default",
+    },
+  ];
+}
+
+function buildSessionPickerSubtitle(
+  sessionCount: number,
+  filterQuery?: string,
+): string {
+  const trimmedFilter = filterQuery?.trim();
+  if (!trimmedFilter) {
+    return `${sessionCount} saved session${sessionCount === 1 ? "" : "s"} available.`;
+  }
+
+  return `Filter: "${trimmedFilter}" (${sessionCount} match${sessionCount === 1 ? "" : "es"}).`;
 }
 
 async function runWithSuspendedRenderer<T>(
@@ -1546,10 +1558,57 @@ async function runWithSuspendedRenderer<T>(
   action: () => Promise<T>,
 ): Promise<T> {
   ui.suspend();
+  // Ink disables raw mode and unreferences stdin on unmount. Re-attach the
+  // shared TTY before handing control to Inquirer or other terminal UIs so the
+  // process does not exit underneath the nested prompt on Windows.
+  input.resume?.();
+  input.ref?.();
   try {
     return await action();
   } finally {
+    input.unref?.();
     ui.resume();
+  }
+}
+
+async function promptCommandApprovalInTTY(
+  request: CommandApprovalRequest,
+): Promise<CommandApprovalDecision> {
+  const { assessment } = request;
+  const rl = createInterface({ input, output });
+
+  try {
+    while (true) {
+      const answer = (
+        await rl.question(
+          [
+            `Approve ${assessment.category} command?`,
+            `1. Approve once: ${assessment.summary}. ${assessment.reasons.join(" ")}`,
+            "2. Allow all this session: Switch approvals to allow-all for later commands in this process.",
+            `3. Reject: ${assessment.command}`,
+            "Select 1/2/3 (default 3): ",
+          ].join("\n"),
+        )
+      ).trim().toLowerCase();
+
+      if (!answer || answer === "3" || answer === "reject" || answer === "r" || answer === "n" || answer === "no") {
+        return "reject";
+      }
+
+      if (answer === "1" || answer === "once" || answer === "o" || answer === "y" || answer === "yes") {
+        return "once";
+      }
+
+      if (answer === "2" || answer === "always" || answer === "a" || answer === "allow-all") {
+        return "always";
+      }
+
+      console.log('Enter "1", "2", or "3".');
+    }
+  } catch {
+    return "reject";
+  } finally {
+    rl.close();
   }
 }
 
