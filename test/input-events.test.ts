@@ -42,6 +42,25 @@ test("normalizeInkInput maps raw backspace bytes to a semantic backspace event",
   );
 });
 
+test("normalizeInkInput maps Windows delete-at-end to semantic backspace in prompt context", () => {
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ delete: true }), {
+      platform: "win32",
+      promptBufferLength: 3,
+      promptCursorIndex: 3,
+    }),
+    { type: "backspace" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ delete: true }), {
+      platform: "win32",
+      promptBufferLength: 3,
+      promptCursorIndex: 1,
+    }),
+    { type: "delete" },
+  );
+});
+
 test("normalizeInkInput preserves printable text insertion", () => {
   assert.deepEqual(
     normalizeInkInput("abc", createKey()),
@@ -65,5 +84,17 @@ test("normalizeInkInput maps navigation and submit keys to semantic events", () 
   assert.deepEqual(
     normalizeInkInput("", createKey({ escape: true })),
     { type: "cancel" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ leftArrow: true })),
+    { type: "move_left" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ rightArrow: true })),
+    { type: "move_right" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ tab: true })),
+    { type: "apply_suggestion" },
   );
 });

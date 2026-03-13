@@ -81,6 +81,10 @@ export type InteractiveRenderer = {
   }) => Promise<string>;
   selectOption: (options: RendererSelectOptions) => Promise<string | null>;
   getSnapshot: () => InteractiveRendererSnapshot;
+  dispatchInput: (
+    inputValue: string,
+    key: Parameters<typeof normalizeInkInput>[1],
+  ) => void;
   suspend: () => void;
   resume: () => void;
   dispose: () => void;
@@ -387,6 +391,9 @@ export function createInteractiveRenderer(options: {
         : null,
       statusText: buildStatusText(state),
     }),
+    dispatchInput: (inputValue, key) => {
+      handleInput(inputValue, key);
+    },
     suspend: () => {
       if (!instance) {
         return;
@@ -411,7 +418,11 @@ export function createInteractiveRenderer(options: {
   };
 
   const handleInput = (inputValue: string, key: Parameters<typeof normalizeInkInput>[1]) => {
-    const event = normalizeInkInput(inputValue, key);
+    const event = normalizeInkInput(inputValue, key, {
+      platform: process.platform,
+      promptBufferLength: state.prompt.state.buffer.length,
+      promptCursorIndex: state.prompt.state.cursorIndex,
+    });
     if (!event) {
       return;
     }
@@ -521,9 +532,7 @@ export function createInteractiveRenderer(options: {
         nextComposerState = backspaceComposerText(nextComposerState, promptWorkspaceFiles);
         break;
       case "delete":
-        nextComposerState = shouldTreatDeleteAsBackspace(nextComposerState)
-          ? backspaceComposerText(nextComposerState, promptWorkspaceFiles)
-          : deleteComposerText(nextComposerState, promptWorkspaceFiles);
+        nextComposerState = deleteComposerText(nextComposerState, promptWorkspaceFiles);
         break;
       case "move_left":
         nextComposerState = moveComposerCursor(
@@ -617,14 +626,6 @@ function buildStatusText(state: RendererState): string {
   }
 
   return "Enter submit  Ctrl+C exit";
-}
-
-function shouldTreatDeleteAsBackspace(state: ComposerState): boolean {
-  return (
-    process.platform === "win32" &&
-    state.cursorIndex === state.buffer.length &&
-    state.buffer.length > 0
-  );
 }
 
 function buildDivider(output: Writable): string {

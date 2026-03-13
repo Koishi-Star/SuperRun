@@ -15,9 +15,16 @@ export type SemanticInputEvent =
   | { type: "apply_suggestion" }
   | { type: "insert_text"; text: string };
 
+export type SemanticInputContext = {
+  platform?: NodeJS.Platform;
+  promptBufferLength?: number;
+  promptCursorIndex?: number;
+};
+
 export function normalizeInkInput(
   inputValue: string,
   key: Key,
+  context: SemanticInputContext = {},
 ): SemanticInputEvent | null {
   if (key.ctrl && inputValue === "c") {
     return { type: "interrupt" };
@@ -42,6 +49,10 @@ export function normalizeInkInput(
   }
 
   if (key.delete) {
+    if (shouldTreatDeleteAsBackspace(context)) {
+      return { type: "backspace" };
+    }
+
     return { type: "delete" };
   }
 
@@ -85,4 +96,18 @@ export function normalizeInkInput(
   }
 
   return null;
+}
+
+function shouldTreatDeleteAsBackspace(
+  context: SemanticInputContext,
+): boolean {
+  const platform = context.platform ?? process.platform;
+  const bufferLength = context.promptBufferLength ?? 0;
+  const cursorIndex = context.promptCursorIndex ?? 0;
+
+  return (
+    platform === "win32" &&
+    bufferLength > 0 &&
+    cursorIndex === bufferLength
+  );
 }

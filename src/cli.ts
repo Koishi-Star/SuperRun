@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
-import { createInterface } from "node:readline/promises";
 import { Command, Option } from "commander";
 import {
   type AgentSession,
@@ -112,7 +111,9 @@ program
       }
 
       if (!(input.isTTY && output.isTTY)) {
-        renderRiskNotice();
+        throw new Error(
+          'Interactive mode requires a TTY. Run `superrun "<prompt>"` for single-turn use, or start SuperRun from an interactive terminal to use the Ink chat shell.',
+        );
       }
 
       const state = await createInteractiveState(settings, session, approvalMode);
@@ -208,49 +209,24 @@ async function runInteractiveSession(
   session: AgentSession,
   state: InteractiveState,
 ): Promise<void> {
-  const ui = input.isTTY && output.isTTY
-    ? createInteractiveRenderer({ input, output })
-    : null;
+  const ui = createInteractiveRenderer({ input, output });
+  renderInteractiveShell(ui, session, state);
 
-  if (ui) {
-    renderInteractiveShell(ui, session, state);
-  } else {
-    console.log('Interactive mode. Type "/exit" to quit.');
-    renderApprovalSummary(ui, state.commandApprovalMode);
-    renderSessionPromptHint(ui, session, state.settings);
-    renderSessionStoreHint(ui, state);
-  }
-
-  if (ui) {
-    try {
-      while (true) {
-        const prompt = await ui.readPrompt({
+  try {
+    while (true) {
+      const prompt = await ui.readPrompt({
         promptLabel: getTTYPromptLabel(ui, state),
         workspaceFiles: state.pendingSystemPromptLines
           ? []
           : await ensureWorkspaceFilesLoaded(state),
       });
 
-        if (!(await handleInteractiveInput(session, prompt, state, ui))) {
-          break;
-        }
-      }
-    } finally {
-      ui.dispose();
-    }
-
-    return;
-  }
-
-  const rl = createInterface({ input, output });
-  try {
-    for await (const line of rl) {
-      if (!(await handleInteractiveInput(session, line, state, ui))) {
+      if (!(await handleInteractiveInput(session, prompt, state, ui))) {
         break;
       }
     }
   } finally {
-    rl.close();
+    ui.dispose();
   }
 }
 
@@ -1453,18 +1429,13 @@ function createToolExecutionContext(
   state: InteractiveState,
   ui: InteractiveRenderer | null,
 ): ToolExecutionContext {
-  const requestApproval =
-    input.isTTY && output.isTTY
-      ? (request: CommandApprovalRequest) => promptCommandApproval(request, ui)
-      : undefined;
-
   return {
     commandPolicy: {
       getMode: () => state.commandApprovalMode,
       setMode: (mode) => {
         state.commandApprovalMode = mode;
       },
-      ...(requestApproval ? { requestApproval } : {}),
+      ...(ui ? { requestApproval: (request: CommandApprovalRequest) => promptCommandApproval(request, ui) } : {}),
       ...(state.commandHookRunner ? { runHook: state.commandHookRunner } : {}),
     },
   };
@@ -1472,42 +1443,37 @@ function createToolExecutionContext(
 
 async function promptCommandApproval(
   request: CommandApprovalRequest,
-  ui: InteractiveRenderer | null,
+  ui: InteractiveRenderer,
 ): Promise<CommandApprovalDecision> {
   const { assessment } = request;
   const reasonSummary = assessment.reasons.join(" ");
+  const selectedDecision = await ui.selectOption({
+    title: `Approve ${assessment.category} command?`,
+    subtitle: assessment.summary,
+    helpText: "Up/Down move  Enter choose  Esc reject",
+    options: [
+      {
+        value: "once",
+        label: "Approve once",
+        description: `${assessment.summary}. ${reasonSummary}`,
+        tone: "accent",
+      },
+      {
+        value: "always",
+        label: "Allow all this session",
+        description: "Switch approvals to allow-all for later commands in this process.",
+        tone: "default",
+      },
+      {
+        value: "reject",
+        label: "Reject",
+        description: `Block this command: ${assessment.command}`,
+        tone: "danger",
+      },
+    ],
+  });
 
-  if (ui) {
-    const selectedDecision = await ui.selectOption({
-      title: `Approve ${assessment.category} command?`,
-      subtitle: assessment.summary,
-      helpText: "Up/Down move  Enter choose  Esc reject",
-      options: [
-        {
-          value: "once",
-          label: "Approve once",
-          description: `${assessment.summary}. ${reasonSummary}`,
-          tone: "accent",
-        },
-        {
-          value: "always",
-          label: "Allow all this session",
-          description: "Switch approvals to allow-all for later commands in this process.",
-          tone: "default",
-        },
-        {
-          value: "reject",
-          label: "Reject",
-          description: `Block this command: ${assessment.command}`,
-          tone: "danger",
-        },
-      ],
-    });
-
-    return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
-  }
-
-  return promptCommandApprovalInTTY(request);
+  return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
 }
 
 function buildApprovalPickerOptions(
@@ -1558,9 +1524,8 @@ async function runWithSuspendedRenderer<T>(
   action: () => Promise<T>,
 ): Promise<T> {
   ui.suspend();
-  // Ink disables raw mode and unreferences stdin on unmount. Re-attach the
-  // shared TTY before handing control to Inquirer or other terminal UIs so the
-  // process does not exit underneath the nested prompt on Windows.
+  // Re-attach the shared TTY before handing control to an external editor so
+  // stdin stays alive across the suspend/resume handoff on Windows.
   input.resume?.();
   input.ref?.();
   try {
@@ -1568,47 +1533,6 @@ async function runWithSuspendedRenderer<T>(
   } finally {
     input.unref?.();
     ui.resume();
-  }
-}
-
-async function promptCommandApprovalInTTY(
-  request: CommandApprovalRequest,
-): Promise<CommandApprovalDecision> {
-  const { assessment } = request;
-  const rl = createInterface({ input, output });
-
-  try {
-    while (true) {
-      const answer = (
-        await rl.question(
-          [
-            `Approve ${assessment.category} command?`,
-            `1. Approve once: ${assessment.summary}. ${assessment.reasons.join(" ")}`,
-            "2. Allow all this session: Switch approvals to allow-all for later commands in this process.",
-            `3. Reject: ${assessment.command}`,
-            "Select 1/2/3 (default 3): ",
-          ].join("\n"),
-        )
-      ).trim().toLowerCase();
-
-      if (!answer || answer === "3" || answer === "reject" || answer === "r" || answer === "n" || answer === "no") {
-        return "reject";
-      }
-
-      if (answer === "1" || answer === "once" || answer === "o" || answer === "y" || answer === "yes") {
-        return "once";
-      }
-
-      if (answer === "2" || answer === "always" || answer === "a" || answer === "allow-all") {
-        return "always";
-      }
-
-      console.log('Enter "1", "2", or "3".');
-    }
-  } catch {
-    return "reject";
-  } finally {
-    rl.close();
   }
 }
 

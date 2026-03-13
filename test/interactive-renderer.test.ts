@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import type { Key } from "ink";
 import { createInteractiveRenderer } from "../src/ui/interactive-renderer.js";
 
 class FakeTTYInput extends PassThrough {
@@ -19,6 +20,26 @@ class FakeTTYOutput extends PassThrough {
   isTTY = true;
   columns = 80;
   rows = 24;
+}
+
+function createKey(overrides: Partial<Key> = {}): Key {
+  return {
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageDown: false,
+    pageUp: false,
+    return: false,
+    escape: false,
+    ctrl: false,
+    shift: false,
+    tab: false,
+    backspace: false,
+    delete: false,
+    meta: false,
+    ...overrides,
+  };
 }
 
 test("interactive renderer appends log lines and streams assistant chunks into one entry", {
@@ -120,6 +141,80 @@ test("interactive renderer switches prompt labels when reading inline editor inp
     assert.equal(snapshot.inputActive, true);
     assert.equal(snapshot.prompt.label.kind, "editor");
     assert.equal(snapshot.prompt.label.text, renderer.editorPromptLabel);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer handles backspace and left/right cursor movement through semantic input", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const promptPromise = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: [],
+    });
+
+    renderer.dispatchInput("ab", createKey());
+    renderer.dispatchInput("", createKey({ leftArrow: true }));
+    renderer.dispatchInput("", createKey({ backspace: true }));
+    renderer.dispatchInput("", createKey({ rightArrow: true }));
+
+    const snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.buffer, "b");
+    assert.equal(snapshot.prompt.state.cursorIndex, 1);
+
+    renderer.dispatchInput("", createKey({ return: true }));
+    assert.equal(await promptPromise, "b");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer applies file suggestions with Tab and clears submit errors with Escape", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const suggestionPrompt = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: ["src/ui/input-events.ts"],
+    });
+
+    renderer.dispatchInput("@src/ui/inp", createKey());
+    renderer.dispatchInput("", createKey({ tab: true }));
+
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.buffer, "@src/ui/input-events.ts ");
+    assert.equal(snapshot.prompt.state.activeReference, null);
+
+    renderer.dispatchInput("", createKey({ return: true }));
+    assert.equal(await suggestionPrompt, "@src/ui/input-events.ts ");
+
+    const errorPrompt = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: ["src/ui/input-events.ts"],
+    });
+
+    renderer.dispatchInput("@missing", createKey());
+    renderer.dispatchInput("", createKey({ return: true }));
+
+    snapshot = renderer.getSnapshot();
+    assert.match(snapshot.prompt.state.errorMessage ?? "", /No files match "@missing"\./);
+
+    renderer.dispatchInput("", createKey({ escape: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.errorMessage, null);
+
+    renderer.dispatchInput("c", createKey({ ctrl: true }));
+    assert.equal(await errorPrompt, "/exit");
   } finally {
     renderer.dispose();
   }
