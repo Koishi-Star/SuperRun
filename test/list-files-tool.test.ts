@@ -17,11 +17,14 @@ test("list_files lists workspace files with bounded recursion", async () => {
     process.chdir(tempDir);
 
     const result = JSON.parse(
-      await executeAgentTool({
-        id: "call_1",
-        name: "list_files",
-        arguments: JSON.stringify({ path: ".", depth: 1 }),
-      }),
+      await executeAgentTool(
+        {
+          id: "call_1",
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 1 }),
+        },
+        "strict",
+      ),
     ) as {
       ok: boolean;
       entries?: Array<{ path: string; type: string }>;
@@ -44,11 +47,14 @@ test("list_files lists workspace files with bounded recursion", async () => {
 
 test("list_files rejects paths outside the workspace root", async () => {
   const result = JSON.parse(
-    await executeAgentTool({
-      id: "call_2",
-      name: "list_files",
-      arguments: JSON.stringify({ path: "../outside" }),
-    }),
+    await executeAgentTool(
+      {
+        id: "call_2",
+        name: "list_files",
+        arguments: JSON.stringify({ path: "../outside" }),
+      },
+      "strict",
+    ),
   ) as {
     ok: boolean;
     error?: string;

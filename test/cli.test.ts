@@ -116,8 +116,61 @@ test("CLI handles local slash commands and rejects unknown slash commands withou
 
     assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
     assert.equal(server.requests.length, 0);
-    assert.match(stdout, /Commands: \/help \/settings \/session \/history \[id\|index\|title\] \/sessions \[query\] \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
+    assert.match(stdout, /Commands: \/help \/mode \[default\|strict\] \/settings \/session \/history \[id\|index\|title\] \/sessions \[query\] \/new \/switch <id\|index\|title> \/rename <title> \/delete \[id\|index\|title\] \/system \/system reset \/clear \/exit/);
     assert.match(stderr, /error: Unknown command: \/sessiojn\. Type \/help\./);
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI starts in strict mode only when requested and can switch back to default mode", async () => {
+  const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const cliPath = path.resolve("src/index.ts");
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliPath, "--mode", "strict"],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          OPENAI_API_KEY: "test-key",
+          OPENAI_BASE_URL: server.baseURL,
+          OPENAI_MODEL: "mock-model",
+          OPENAI_TIMEOUT_MS: "5000",
+          SUPERRUN_CONFIG_DIR: tempDir,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.stdin.write("/mode\n");
+    child.stdin.write("/mode default\n");
+    child.stdin.write("/mode\n");
+    child.stdin.end("/exit\n");
+
+    const [exitCode] = (await once(child, "close")) as [number | null];
+
+    assert.equal(exitCode, 0, stderr || "CLI exited with a non-zero code.");
+    assert.equal(server.requests.length, 0);
+    assert.match(stdout, /Current tool mode: strict \(specialized read-only tools only\)\./);
+    assert.match(stdout, /Tool mode changed to default \(command execution enabled\)\./);
+    assert.match(stdout, /Current tool mode: default \(command execution enabled\)\./);
   } finally {
     await server.close();
     await rm(tempDir, { recursive: true, force: true });

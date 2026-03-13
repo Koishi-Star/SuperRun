@@ -3,13 +3,18 @@ import { stdin as input, stdout as output } from "node:process";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import type { Interface } from "node:readline/promises";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import {
   type AgentSession,
   createAgentSession,
   getAgentSessionStats,
   runAgentTurn,
 } from "./agent/loop.js";
+import {
+  getAgentModeSummary,
+  parseAgentMode,
+  type AgentMode,
+} from "./agent/mode.js";
 import {
   loadSettings,
   resetSystemPrompt,
@@ -35,11 +40,23 @@ export const program = new Command();
 program
   .name("superrun")
   .description("A coding agent CLI")
+  .addOption(
+    new Option(
+      "--mode <mode>",
+      'agent tool mode: "default" enables guarded command execution, "strict" keeps only specialized read-only tools',
+    )
+      .choices(["default", "strict"])
+      .default("default"),
+  )
   .argument("[prompt]", "prompt to send to the model")
   .action(async (prompt?: string) => {
     try {
       const settings = await loadSettings();
+      const mode = parseAgentMode(
+        program.opts<{ mode: AgentMode }>().mode,
+      );
       const session = createAgentSession({
+        mode,
         systemPrompt: settings.systemPrompt,
       });
       const trimmedPrompt = prompt?.trim();
@@ -187,7 +204,25 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title] /system /system reset /clear /exit");
+    }
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/mode")) {
+    const requestedMode = parseCommandArgument(prompt, "/mode");
+
+    if (!requestedMode) {
+      renderAgentModeSummary(ui, session.mode);
+      return true;
+    }
+
+    try {
+      const nextMode = parseAgentMode(requestedMode);
+      session.mode = nextMode;
+      renderAgentModeChanged(ui, nextMode);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to change mode.");
     }
     return true;
   }
@@ -248,7 +283,7 @@ async function handleInteractivePrompt(
           state.currentSessionTitle = storedSession.title;
           state.sessionStore = await setActiveSession(storedSession.id);
           renderInteractiveShell(ui, session, state);
-          renderSessionSwitched(ui, storedSession);
+          renderSessionSwitched(ui, storedSession, session.mode);
           return true;
         }
 
@@ -297,7 +332,7 @@ async function handleInteractivePrompt(
       state.currentSessionId = storedSession.id;
       state.currentSessionTitle = storedSession.title;
       state.sessionStore = await setActiveSession(storedSession.id);
-      renderSessionSwitched(ui, storedSession);
+      renderSessionSwitched(ui, storedSession, session.mode);
     } catch (error) {
       renderError(ui, error instanceof Error ? error.message : "Failed to switch session.");
     }
@@ -350,7 +385,12 @@ async function handleInteractivePrompt(
         restoreStoredSession(session, activeSession);
         state.currentSessionId = activeSession.id;
         state.currentSessionTitle = activeSession.title;
-        renderSessionDeletedAndSwitched(ui, targetSessionId, activeSession);
+        renderSessionDeletedAndSwitched(
+          ui,
+          targetSessionId,
+          activeSession,
+          session.mode,
+        );
         return true;
       }
 
@@ -551,6 +591,7 @@ function renderSessionPromptHint(
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
+  renderInfo(ui, `Tool mode: ${getAgentModeSummary(session.mode)}.`);
   renderInfo(
     ui,
     `Active behavior (${source}): ${summarizePrompt(session.systemPrompt)}`,
@@ -617,6 +658,7 @@ function renderSettingsSummary(
 
   renderInfo(ui, `Source: ${source}`);
   renderInfo(ui, `Path: ${settings.filePath}`);
+  renderInfo(ui, `Tool mode: ${getAgentModeSummary(session.mode)}.`);
   renderInfo(
     ui,
     `History policy: keep the most recent ${stats.maxHistoryTurns} turns.`,
@@ -657,6 +699,7 @@ function renderCurrentSessionSummary(
       state.currentSessionId,
     )}`,
   );
+  renderInfo(ui, `Mode: ${getAgentModeSummary(session.mode)}.`);
   renderInfo(
     ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
@@ -807,9 +850,11 @@ function renderNewSessionCreated(
 function renderSessionSwitched(
   ui: TerminalUI | null,
   storedSession: StoredSession,
+  mode: AgentMode,
 ): void {
   const stats = getAgentSessionStats(
     createAgentSession({
+      mode,
       systemPrompt: storedSession.systemPrompt,
       history: storedSession.history,
       maxHistoryTurns: storedSession.maxHistoryTurns,
@@ -824,6 +869,7 @@ function renderSessionSwitched(
     ui,
     `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
   );
+  renderInfo(ui, `Mode: ${getAgentModeSummary(mode)}.`);
   renderInfo(ui, storedSession.preview);
   renderInfo(ui, `This agent will now behave as: ${summarizePrompt(storedSession.systemPrompt)}`);
 }
@@ -839,9 +885,10 @@ function renderSessionDeletedAndSwitched(
   ui: TerminalUI | null,
   deletedSessionId: string,
   nextSession: StoredSession,
+  mode: AgentMode,
 ): void {
   renderInfo(ui, `Deleted session: ${deletedSessionId}`);
-  renderSessionSwitched(ui, nextSession);
+  renderSessionSwitched(ui, nextSession, mode);
 }
 
 function renderSessionRenamed(
@@ -855,6 +902,24 @@ function renderSessionRenamed(
       state.currentSessionId,
     )}`,
   );
+}
+
+function renderAgentModeSummary(
+  ui: TerminalUI | null,
+  mode: AgentMode,
+): void {
+  renderInfo(ui, `Current tool mode: ${getAgentModeSummary(mode)}.`);
+  renderInfo(
+    ui,
+    'Use "/mode strict" for specialized read-only tools, or "/mode default" to re-enable command execution.',
+  );
+}
+
+function renderAgentModeChanged(
+  ui: TerminalUI | null,
+  mode: AgentMode,
+): void {
+  renderInfo(ui, `Tool mode changed to ${getAgentModeSummary(mode)}.`);
 }
 
 function renderInfo(ui: TerminalUI | null, message: string): void {

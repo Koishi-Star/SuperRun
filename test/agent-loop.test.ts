@@ -161,7 +161,10 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
     await writeFile(path.join(tempDir, "beta.txt"), "beta\n", "utf8");
     process.chdir(tempDir);
 
-    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
     const reply = await runAgentTurn(session, "What files are here?");
 
     assert.equal(reply, "The workspace includes alpha.ts and beta.txt.");
@@ -235,7 +238,10 @@ test("runAgentTurn preserves provider reasoning_content across tool calls", asyn
     await writeFile(path.join(tempDir, "alpha.ts"), "export const alpha = 1;\n", "utf8");
     process.chdir(tempDir);
 
-    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
     const reply = await runAgentTurn(session, "What files are here?");
 
     assert.equal(reply, "There is one file here.");
@@ -245,6 +251,59 @@ test("runAgentTurn preserves provider reasoning_content across tool calls", asyn
         ? (server.requests[1].messages[2] as Record<string, unknown>).reasoning_content
         : undefined,
       "Need to inspect the workspace before answering.",
+    );
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn resolves a run_command tool call in default mode", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "run_command",
+          arguments: JSON.stringify({
+            command: "node -p \"process.cwd()\"",
+          }),
+        },
+      ],
+    },
+    "The command printed the workspace path.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-command-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    process.chdir(tempDir);
+
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const reply = await runAgentTurn(session, "Where am I?");
+
+    assert.equal(reply, "The command printed the workspace path.");
+    assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "run_command");
+
+    const toolMessage = server.requests[1]?.messages[3];
+    assert.equal(toolMessage?.role, "tool");
+    assert.equal(
+      typeof toolMessage?.content === "string" &&
+        toolMessage.content.includes(`\"stdout\":\"${tempDir.replace(/\\/g, "\\\\")}`),
+      true,
     );
   } finally {
     process.chdir(previousCwd);

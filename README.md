@@ -11,18 +11,22 @@ What works today:
 - interactive multi-turn chat
 - streaming assistant output
 - OpenAI-compatible chat completion provider
+- process-level agent modes with `default` and opt-in `strict`
+- guarded command execution in default mode
 - persistent system prompt profiles managed from the interactive UI
 - multi-session storage with switching and deletion commands
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
-- the first read-only local tool for listing workspace files
+- strict-mode specialized tool support, with `list_files` as the first read-only tool
 - focused tests for env parsing, agent history, and CLI interaction
 
 What does not exist yet:
 
-- file-reading, writing, or shell tools beyond the initial `list_files` slice
+- structured file-writing/editing support
+- a second strict-mode file-reading tool
 - multiple providers
+- advanced approval/policy controls for command execution
 - advanced TUI
 
 ## Conversation Model
@@ -36,7 +40,9 @@ The current request shape is:
 2. prior `user` and `assistant` turns from the current session, truncated to the most recent 10 turns
 3. the current `user` prompt
 
-That is the correct structure for the current stage, with a narrow tool-calling loop now available when the model requests `list_files`.
+That is the correct structure for the current stage, with a mode-aware tool-calling loop now available.
+In `default` mode the model can use `run_command`.
+In opt-in `strict` mode the model sees only the narrow specialized tools such as `list_files`.
 The default base system prompt currently lives in [`src/prompts/system.ts`](./src/prompts/system.ts):
 
 ```ts
@@ -97,6 +103,12 @@ Interactive multi-turn mode:
 npm run dev --
 ```
 
+Interactive multi-turn mode in strict mode:
+
+```bash
+npm run dev -- --mode strict
+```
+
 Run compiled output directly:
 
 ```bash
@@ -109,6 +121,7 @@ node dist/index.js
 In interactive mode, these local commands are supported:
 
 - `/help`
+- `/mode [default|strict]`
 - `/settings`
 - `/session`
 - `/sessions`
@@ -119,6 +132,11 @@ In interactive mode, these local commands are supported:
 - `/system reset`
 - `/clear`
 - `/exit`
+
+Mode behavior:
+
+- `default`: enables guarded `run_command` for inspection, build, lint, and test flows
+- `strict`: hides command execution and exposes only the specialized strict-mode tools
 
 The current conversation now works with multiple saved sessions:
 

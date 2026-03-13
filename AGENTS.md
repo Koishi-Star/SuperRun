@@ -11,8 +11,8 @@
 - Runtime: Node.js + TypeScript + ESM.
 - CLI entry: `src/index.ts` calls Commander setup from `src/cli.ts`.
 - Current command shape: `superrun [prompt]`.
-- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings, history browsing, filtered session browsing, and session management.
-- `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, per-turn model calls, and a narrow tool-calling loop.
+- `src/cli.ts` loads `.env`, supports single-turn prompt mode and interactive multi-turn chat mode, exposes `--mode <default|strict>`, provides a lightweight terminal UI in TTY sessions, and wires local slash commands for settings, history browsing, filtered session browsing, session management, and runtime mode switching.
+- `src/agent/loop.ts` manages session state, message history, system prompt assembly, lightweight history truncation, per-turn model calls, and a mode-aware tool-calling loop.
 - `src/prompts/system.ts` centralizes the base system prompt used for each session.
 - `src/config/settings.ts` persists the default system prompt profile used across runs.
 - `src/config/paths.ts` centralizes where local config and session files are stored.
@@ -21,15 +21,19 @@
 - `src/llm/openai_compatible.ts` implements a working OpenAI-compatible chat completion adapter, including basic streaming, proxy support, and function-call parsing.
 - `src/utils/env.ts` validates `OPENAI_API_KEY` and reads base URL, model, and timeout settings from the environment.
 - `src/session/store.ts` persists multiple saved sessions, tracks the active session, derives session titles and previews, and restores sessions across CLI runs.
-- `src/tools/list_files.ts` implements the first local read-only tool for repository structure inspection under the workspace root.
+- `src/tools/run_command.ts` implements the default-mode command tool with workspace scoping, timeout/output bounds, and a conservative blocklist for obviously state-changing commands.
+- `src/tools/list_files.ts` implements the first strict-mode local read-only tool for repository structure inspection under the workspace root.
+- `src/tools/workspace.ts` centralizes workspace-relative path validation shared by local tools.
 - `src/ui/tui.ts` contains the lightweight terminal UI helpers used in TTY interactive sessions, including command help, the `/sessions` picker, and history workflows.
-- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, session picker interaction, tool orchestration, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
+- `src/ui/session-picker.ts` models the paged `/sessions` picker state, navigation, and view data for TTY mode.
+- `src/ui/session-picker-controller.ts` handles keyboard-driven `/sessions` picker interaction, including raw-mode lifecycle and cancel/confirm behavior.
+- `test/` contains focused tests for env parsing, system prompt settings, session store behavior, session picker rendering and interaction, tool orchestration, provider reasoning-content passthrough, history handling, and interactive CLI behavior using a local mock OpenAI-compatible server.
 
 ## Project progress
 
-- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a narrow TTY `/sessions` picker, the first `list_files` function call, lightweight TTY UI, and focused tests for the current slice including picker interaction coverage and tool orchestration.
-- Not done yet: richer TTY session actions beyond switching, prompt/version handling for evolving system prompts, additional local tools such as file reading, multi-provider routing, and write/command execution boundaries.
-- Current maturity: the chat loop is solid for local experiments and saved-session workflows, but the agent still behaves like a chat-first CLI rather than a full coding agent with tools.
+- Done: single-turn prompts, interactive multi-turn chat, streaming responses, centralized system prompt assembly, persistent system prompt settings, lightweight history truncation, multi-session persistence across runs, active session restore, session rename, session switching by id/index/title, richer `/sessions` previews, saved history viewing, `/sessions [query]` filtering, a paged keyboard-driven TTY `/sessions` picker, process-level agent modes (`default` and opt-in `strict`), guarded `run_command` in default mode, strict-mode-only specialized tools, provider `reasoning_content` passthrough across tool rounds, lightweight TTY UI, and focused tests for the current slice including mode coverage and tool orchestration.
+- Not done yet: structured file writing/editing, stronger command approval/policy controls, the second strict-mode read-only tool for file content inspection, prompt/version handling for evolving system prompts, richer TTY session actions beyond switching, and multi-provider routing.
+- Current maturity: the chat loop is now viable as an early coding agent because default mode can inspect and verify work through commands, but write-path design and command policy hardening are still intentionally incomplete.
 
 ## Working rules
 
@@ -51,17 +55,17 @@
 
 ## Priorities for upcoming work
 
-1. Expand the lightweight TUI carefully beyond the current `/sessions` picker with clearer saved-session actions, transient status states, and better error surfacing.
-2. Add the second read-only local tool, likely line-bounded file reading, on top of the new `list_files` slice.
-3. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
-4. Add router-level coverage once a second provider or selection rule exists.
-5. Only after read-only tool behavior is stable, introduce stricter write/command execution boundaries.
+1. Design the write path explicitly instead of letting it leak through ad hoc shell usage. Keep command execution and file editing as separate capabilities.
+2. Harden default-mode command policy with clearer allow/deny behavior, better surfaced failures, and room for future approval hooks.
+3. Add the second strict-mode read-only tool, likely line-bounded file reading, so strict mode remains useful without command access.
+4. Refine prompt handling so the centralized system prompt can evolve without confusing older saved sessions.
+5. Add router-level coverage once a second provider or selection rule exists.
 
 ## Implementation preferences
 
 - Favor a thin vertical slice that can actually run over partially building every layer.
 - Keep prompts and model-facing message construction centralized rather than scattered across files.
-- If tool use is added later, start with a narrow tool interface and strict execution boundaries.
+- Keep the default coding-agent path centered on command execution plus explicit policy, while preserving narrow specialized tools for strict mode.
 - Avoid fake abstractions for future multi-provider support until at least one provider is working.
 
 ## Verification

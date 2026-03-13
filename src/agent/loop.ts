@@ -1,6 +1,7 @@
 import { chatOnce } from "../llm/router.js";
 import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
+import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 
 export type AgentTurnOptions = ChatOptions;
@@ -8,12 +9,14 @@ export const DEFAULT_MAX_HISTORY_TURNS = 10;
 const MAX_TOOL_CALL_ROUNDS = 3;
 
 export type AgentSession = {
+  mode: AgentMode;
   systemPrompt: string;
   history: ConversationMessage[];
   maxHistoryTurns: number;
 };
 
 export type CreateAgentSessionOptions = {
+  mode?: AgentMode;
   systemPrompt?: string;
   history?: ConversationMessage[];
   maxHistoryTurns?: number;
@@ -31,6 +34,7 @@ export function createAgentSession(
   options?: CreateAgentSessionOptions,
 ): AgentSession {
   return {
+    mode: parseAgentMode(options?.mode),
     systemPrompt: options?.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT,
     history: [...(options?.history ?? [])],
     maxHistoryTurns: normalizeMaxHistoryTurns(options?.maxHistoryTurns),
@@ -68,6 +72,7 @@ export async function runAgentTurn(
   trimSessionHistory(session);
   const reply = await resolveAgentReply(
     buildTurnMessages(session, trimmedPrompt),
+    session.mode,
     options,
   );
 
@@ -113,10 +118,11 @@ function trimSessionHistory(session: AgentSession): void {
 
 async function resolveAgentReply(
   baseMessages: ChatMessage[],
+  mode: AgentMode,
   options?: AgentTurnOptions,
 ): Promise<string> {
   const messages = [...baseMessages];
-  const tools = getAgentToolDefinitions();
+  const tools = getAgentToolDefinitions(mode);
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
     const response = await chatOnce(messages, {
@@ -155,7 +161,7 @@ async function resolveAgentReply(
     });
 
     for (const toolCall of response.toolCalls) {
-      const toolResult = await executeAgentTool(toolCall);
+      const toolResult = await executeAgentTool(toolCall, mode);
       messages.push({
         role: "tool",
         toolCallId: toolCall.id,

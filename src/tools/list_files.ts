@@ -2,6 +2,10 @@ import path from "node:path";
 import { lstat, readdir } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import {
+  normalizeRelativeWorkspacePath,
+  resolveWorkspacePath,
+} from "./workspace.js";
 
 const MAX_DEPTH = 5;
 const MAX_ENTRIES = 200;
@@ -69,8 +73,12 @@ export async function listWorkspaceFiles(args?: ListFilesArgs): Promise<{
   truncated: boolean;
 }> {
   const workspaceRoot = process.cwd();
-  const relativePath = normalizeRelativePath(args?.path);
-  const absolutePath = resolveWorkspacePath(workspaceRoot, relativePath);
+  const relativePath = normalizeRelativeWorkspacePath("list_files", args?.path);
+  const absolutePath = resolveWorkspacePath(
+    "list_files",
+    workspaceRoot,
+    relativePath,
+  );
   const stat = await lstat(absolutePath);
   const depth = args?.depth ?? 2;
 
@@ -163,28 +171,4 @@ function parseListFilesArgs(rawArguments: string): ListFilesArgs {
     ? JSON.parse(rawArguments)
     : {};
   return listFilesArgsSchema.parse(parsed);
-}
-
-function normalizeRelativePath(value: string | undefined): string {
-  const normalized = value?.trim() || ".";
-  if (path.isAbsolute(normalized)) {
-    throw new Error("list_files path must be relative to the workspace root.");
-  }
-
-  return normalized.replace(/\\/g, "/");
-}
-
-function resolveWorkspacePath(workspaceRoot: string, relativePath: string): string {
-  const resolvedPath = path.resolve(workspaceRoot, relativePath);
-  const relativeToRoot = path.relative(workspaceRoot, resolvedPath);
-
-  if (
-    relativeToRoot === ".." ||
-    relativeToRoot.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relativeToRoot)
-  ) {
-    throw new Error("list_files path must stay inside the workspace root.");
-  }
-
-  return resolvedPath;
 }
