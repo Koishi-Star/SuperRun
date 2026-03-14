@@ -121,6 +121,12 @@ Interactive multi-turn mode with fully automatic command approvals:
 npm run dev -- --approvals allow-all
 ```
 
+Interactive multi-turn mode with all command guardrails disabled:
+
+```bash
+npm run dev -- --approvals crazy_auto
+```
+
 Run compiled output directly:
 
 ```bash
@@ -134,7 +140,7 @@ In interactive mode, these local commands are supported:
 
 - `/help`
 - `/mode [default|strict]`
-- `/approvals [ask|allow-all|reject]`
+- `/approvals [ask|allow-all|crazy_auto|reject]`
 - `/settings`
 - `/session`
 - `/sessions`
@@ -153,8 +159,9 @@ Mode behavior:
 
 Command approval behavior:
 
-- `ask`: auto-runs read-oriented commands and prompts before write, execute, network, or high-risk shell commands
-- `allow-all`: auto-approves shell execution for the current process
+- `ask`: auto-runs read-oriented commands and prompts before file edits or shell commands
+- `allow-all`: auto-approves file edits and ordinary shell commands, but still gates elevated-risk network, environment, and VCS mutations
+- `crazy_auto`: auto-approves file edits and all shell commands, including elevated-risk or destructive paths
 - `reject`: blocks `run_command`
 
 Command hooks:

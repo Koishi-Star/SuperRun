@@ -1,11 +1,20 @@
-export type CommandApprovalMode = "ask" | "allow-all" | "reject";
+export type CommandApprovalMode =
+  | "ask"
+  | "allow-all"
+  | "crazy_auto"
+  | "reject";
+
+export type CommandAuthorizationAction = "allow" | "ask" | "deny";
 
 export type CommandCategory =
   | "read"
-  | "write"
   | "execute"
+  | "workspace-write"
+  | "env-mutate"
   | "network"
-  | "high-risk";
+  | "vcs-write"
+  | "download-exec"
+  | "destructive";
 
 export type CommandAssessment = {
   command: string;
@@ -13,7 +22,11 @@ export type CommandAssessment = {
   category: CommandCategory;
   summary: string;
   reasons: string[];
-  approvalRequired: boolean;
+  modeActions: {
+    ask: CommandAuthorizationAction;
+    allowAll: CommandAuthorizationAction;
+    crazyAuto: CommandAuthorizationAction;
+  };
 };
 
 export type CommandApprovalDecision = "once" | "always" | "reject";

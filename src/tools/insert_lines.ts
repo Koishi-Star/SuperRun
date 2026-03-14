@@ -120,7 +120,10 @@ export async function insertWorkspaceLines(
     path: relativePath,
     summary: assessment.summary,
     approvalMode: authorization.approvalModeAfter,
-    autoApproved: !authorization.prompted && authorization.approvalModeBefore === "allow-all",
+    autoApproved:
+      !authorization.prompted &&
+      (authorization.approvalModeBefore === "allow-all" ||
+        authorization.approvalModeBefore === "crazy_auto"),
     diffPreview,
   });
 

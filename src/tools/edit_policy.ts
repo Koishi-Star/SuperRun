@@ -24,7 +24,11 @@ export async function authorizeWorkspaceEdit(
     );
   }
 
-  if (!assessment.approvalRequired || approvalMode === "allow-all") {
+  if (
+    !assessment.approvalRequired ||
+    approvalMode === "allow-all" ||
+    approvalMode === "crazy_auto"
+  ) {
     return {
       approvalModeBefore: approvalMode,
       approvalModeAfter: approvalMode,
@@ -36,7 +40,7 @@ export async function authorizeWorkspaceEdit(
   const requestApproval = policy?.requestApproval;
   if (!requestApproval) {
     throw new Error(
-      `${assessment.tool} requires approval. Re-run in the Ink TTY shell or switch approvals to allow-all.`,
+      `${assessment.tool} requires approval. Re-run in the Ink TTY shell or switch approvals to allow-all or crazy_auto.`,
     );
   }
 

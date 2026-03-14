@@ -127,7 +127,7 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
-      /requires approval for write commands\. Re-run in a TTY or switch approvals to allow-all\./,
+      /requires approval for env-mutate commands\. Re-run in a TTY to approve it, or switch approvals to crazy_auto\./,
     );
   } finally {
     await server.close();
@@ -174,7 +174,7 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
-      /write_file requires approval\. Re-run in the Ink TTY shell or switch approvals to allow-all\./,
+      /write_file requires approval\. Re-run in the Ink TTY shell or switch approvals to allow-all or crazy_auto\./,
     );
   } finally {
     await server.close();

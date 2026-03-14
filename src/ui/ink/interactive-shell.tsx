@@ -1,5 +1,6 @@
 import React from "react";
 import { Box, Text, useInput, type Key } from "ink";
+import { AssistantRichText, RichText } from "../assistant-rich-text.js";
 import type { ComposerState } from "../composer-state.js";
 import type {
   RendererLine,
@@ -139,12 +140,10 @@ function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
       paddingX={1}
       paddingY={0}
     >
-      <Text bold color="cyan">
-        {overlay.title}
-      </Text>
-      {overlay.subtitle ? <Text dimColor>{overlay.subtitle}</Text> : null}
+      <RichText text={overlay.title} />
+      {overlay.subtitle ? <RichText text={overlay.subtitle} tone="info" /> : null}
       {overlay.options.length === 0 && overlay.emptyMessage ? (
-        <Text dimColor>{overlay.emptyMessage}</Text>
+        <RichText text={overlay.emptyMessage} tone="info" />
       ) : null}
       {overlay.options.map((option, index) => (
         <Box
@@ -158,7 +157,9 @@ function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
           >
             {`${index === overlay.selectedIndex ? ">" : " "} ${option.label}`}
           </Text>
-          <Text dimColor>{`  ${option.description}`}</Text>
+          <Box marginLeft={2}>
+            <RichText text={option.description} tone="info" />
+          </Box>
         </Box>
       ))}
     </Box>
@@ -186,18 +187,19 @@ function DiffApprovalOverlay(props: {
       paddingX={1}
       paddingY={0}
     >
-      <Text bold color="yellowBright">
-        {props.overlay.title}
-      </Text>
-      {props.overlay.subtitle ? <Text dimColor>{props.overlay.subtitle}</Text> : null}
-      <Text>{props.overlay.summary}</Text>
+      <RichText text={props.overlay.title} />
+      {props.overlay.subtitle ? <RichText text={props.overlay.subtitle} tone="info" /> : null}
+      <RichText text={props.overlay.summary} />
       <Text color="yellowBright">
         {`Changed ${props.overlay.changeSummary.changedLines}  Added ${props.overlay.changeSummary.addedLines}  Removed ${props.overlay.changeSummary.removedLines}`}
       </Text>
       {props.overlay.truncated ? (
-        <Text color="yellowBright">Preview truncated to the first diff lines.</Text>
+        <RichText text="Preview truncated to the first diff lines." tone="warning" />
       ) : null}
-      <Text dimColor>{`Showing lines ${props.overlay.scrollOffset + 1}-${scrollEnd} of ${props.overlay.lines.length}`}</Text>
+      <RichText
+        text={`Showing lines ${props.overlay.scrollOffset + 1}-${scrollEnd} of ${props.overlay.lines.length}`}
+        tone="info"
+      />
       <Box flexDirection="column" marginTop={1}>
         {visibleLines.map((line, index) => (
           <DiffLine
@@ -230,29 +232,31 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
           <Text bold color="redBright">
             error:
           </Text>
-          {text ? <Text>{` ${text}`}</Text> : null}
+          {text ? (
+            <Box marginLeft={1}>
+              <RichText text={text} tone="error" />
+            </Box>
+          ) : null}
         </Box>
       );
     case "warning":
-      return (
-        <Text bold color="yellowBright">
-          {text}
-        </Text>
-      );
+      return <RichText text={text} tone="warning" />;
     case "assistant":
       return (
         <Box flexDirection="row">
-          <Text bold color="green">
-            superrun &gt;{" "}
-          </Text>
-          <Text>{text}</Text>
+          <Box marginRight={1}>
+            <Text bold color="green">
+              superrun &gt;
+            </Text>
+          </Box>
+          <AssistantRichText text={text} />
         </Box>
       );
     case "body":
-      return <Text>{text}</Text>;
+      return <RichText text={text} />;
     case "info":
     default:
-      return <Text dimColor>{text}</Text>;
+      return <RichText text={text} tone="info" />;
   }
 }
 

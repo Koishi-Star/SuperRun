@@ -83,9 +83,9 @@ program
   .addOption(
     new Option(
       "--approvals <mode>",
-      'approval mode: "ask" prompts before file edits and non-read-only commands, "allow-all" auto-approves, "reject" disables local mutations and command execution',
+      'approval mode: "ask" prompts before file edits and shell commands, "allow-all" auto-approves ordinary commands but still gates elevated-risk shell actions, "crazy_auto" removes those guardrails, "reject" disables local mutations and command execution',
     )
-      .choices(["ask", "allow-all", "reject"])
+      .choices(["ask", "allow-all", "crazy_auto", "reject"])
       .default("ask"),
   )
   .argument("[prompt]", "prompt to send to the model")
@@ -303,7 +303,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -1176,7 +1176,7 @@ async function renderTurnEvents(
     if (event.autoApproved) {
       renderInfo(
         ui,
-        `Auto-approved under allow-all: ${event.summary}.`,
+        `Auto-approved under ${event.approvalMode}: ${event.summary}.`,
       );
       if (ui) {
         await ui.viewDiff({
@@ -1909,7 +1909,7 @@ async function promptCommandApproval(
       {
         value: "always",
         label: "Allow all this session",
-        description: "Switch approvals to allow-all for later commands in this process.",
+        description: "Switch approvals to allow-all for later ordinary commands in this process.",
         tone: "default",
       },
       {
@@ -1955,7 +1955,7 @@ async function promptWorkspaceEditApproval(
       {
         value: "always",
         label: "Allow all this session",
-        description: "Switch approvals to allow-all for later file edits and commands in this process.",
+        description: "Switch approvals to allow-all for later file edits and ordinary commands in this process.",
         tone: "default",
       },
       {
@@ -1977,14 +1977,20 @@ function buildApprovalPickerOptions(
     {
       value: "ask",
       label: currentMode === "ask" ? "ask (current)" : "ask",
-      description: "Auto-run read-only tools and prompt before file edits or other shell execution.",
+      description: "Auto-run read-only commands and prompt before file edits or other shell execution.",
       tone: currentMode === "ask" ? "accent" : "default",
     },
     {
       value: "allow-all",
       label: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
-      description: "Auto-approve file edits and command execution for the current process.",
+      description: "Auto-approve file edits and ordinary shell commands, but still gate elevated-risk shell actions.",
       tone: currentMode === "allow-all" ? "accent" : "default",
+    },
+    {
+      value: "crazy_auto",
+      label: currentMode === "crazy_auto" ? "crazy_auto (current)" : "crazy_auto",
+      description: "Auto-approve file edits and all shell commands, including elevated-risk actions.",
+      tone: currentMode === "crazy_auto" ? "danger" : "danger",
     },
     {
       value: "reject",

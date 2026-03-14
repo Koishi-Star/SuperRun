@@ -41,7 +41,7 @@ export const runCommandTool = {
   definition: {
     name: COMMAND_NAME,
     description:
-      "Run a workspace command for inspection, search, build, or test tasks. Commands that obviously modify files, package state, or git state are blocked in default mode.",
+      "Run a workspace command for inspection, search, build, test, or explicitly approved environment tasks. Elevated-risk shell mutation and download-exec flows stay gated unless the session approval mode is relaxed.",
     parameters: {
       type: "object",
       properties: {

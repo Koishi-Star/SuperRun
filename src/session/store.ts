@@ -2,6 +2,7 @@ import path from "node:path";
 import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import type { ConversationMessage } from "../llm/types.js";
 import { getConfigFilePath } from "../config/paths.js";
+import { isCommandApprovalMode } from "../tools/command_policy.js";
 import type { SessionEvent } from "./events.js";
 import type { CommandCategory, WorkspaceEditAssessment } from "../tools/types.js";
 
@@ -508,8 +509,10 @@ function parseSessionEvent(
         typeof candidate.summary === "string" &&
         typeof candidate.subject === "string" &&
         (candidate.decision === "once" || candidate.decision === "always" || candidate.decision === "reject") &&
-        (candidate.modeBefore === "ask" || candidate.modeBefore === "allow-all" || candidate.modeBefore === "reject") &&
-        (candidate.modeAfter === "ask" || candidate.modeAfter === "allow-all" || candidate.modeAfter === "reject")
+        typeof candidate.modeBefore === "string" &&
+        isCommandApprovalMode(candidate.modeBefore) &&
+        typeof candidate.modeAfter === "string" &&
+        isCommandApprovalMode(candidate.modeAfter)
       ) {
         return {
           timestamp,
@@ -528,8 +531,10 @@ function parseSessionEvent(
       break;
     case "approval_mode_changed":
       if (
-        (candidate.from === "ask" || candidate.from === "allow-all" || candidate.from === "reject") &&
-        (candidate.to === "ask" || candidate.to === "allow-all" || candidate.to === "reject") &&
+        typeof candidate.from === "string" &&
+        isCommandApprovalMode(candidate.from) &&
+        typeof candidate.to === "string" &&
+        isCommandApprovalMode(candidate.to) &&
         (candidate.source === "slash_command" || candidate.source === "approval_decision")
       ) {
         return {
@@ -546,7 +551,8 @@ function parseSessionEvent(
         typeof candidate.tool === "string" &&
         typeof candidate.path === "string" &&
         typeof candidate.summary === "string" &&
-        (candidate.approvalMode === "ask" || candidate.approvalMode === "allow-all" || candidate.approvalMode === "reject") &&
+        typeof candidate.approvalMode === "string" &&
+        isCommandApprovalMode(candidate.approvalMode) &&
         typeof candidate.autoApproved === "boolean" &&
         candidate.changeSummary &&
         typeof candidate.changeSummary === "object" &&
