@@ -242,6 +242,68 @@ export async function deleteSession(
   });
 }
 
+export async function renameSession(
+  sessionId: string,
+  title: string,
+): Promise<{ session: StoredSession; store: SessionStoreState }> {
+  const normalizedId = normalizeSessionId(sessionId);
+  const normalizedTitle = normalizeOptionalText(title);
+  if (!normalizedTitle) {
+    throw new Error("Session title must not be empty.");
+  }
+
+  const currentStore = await loadSessionStore();
+  const storedSession = await loadSession(normalizedId);
+  const updatedAt = new Date().toISOString();
+  const filePath = getSessionFilePath(normalizedId);
+  const summary: SessionSummary = {
+    id: normalizedId,
+    title: normalizedTitle,
+    preview: storedSession.preview,
+    updatedAt,
+    turnCount: countTurns(storedSession.history),
+    charCount: countChars(storedSession.history),
+  };
+
+  // Rename updates only the saved metadata and keeps the current active session unchanged.
+  await writeFile(
+    filePath,
+    `${JSON.stringify(
+      {
+        title: normalizedTitle,
+        systemPrompt: storedSession.systemPrompt,
+        history: storedSession.history,
+        events: storedSession.events,
+        maxHistoryTurns: storedSession.maxHistoryTurns,
+        updatedAt,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const nextSessions = [
+    summary,
+    ...currentStore.sessions.filter((session) => session.id !== normalizedId),
+  ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const store = await writeSessionIndex({
+    sessions: nextSessions,
+    activeSessionId: currentStore.activeSessionId,
+    indexFilePath: currentStore.indexFilePath,
+    sessionsDirectoryPath: currentStore.sessionsDirectoryPath,
+  });
+
+  return {
+    session: {
+      ...storedSession,
+      title: normalizedTitle,
+      updatedAt,
+    },
+    store,
+  };
+}
+
 export async function deleteAllSessions(): Promise<SessionStoreState> {
   const currentStore = await loadSessionStore();
   const indexFileName = path.basename(currentStore.indexFilePath);

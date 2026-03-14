@@ -24,6 +24,7 @@ import {
   deleteSession,
   loadSession,
   loadSessionStore,
+  renameSession,
   saveSession,
   setActiveSession,
   type SessionSummary,
@@ -70,7 +71,7 @@ import {
   type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
 import { buildModePickerChoices } from "./ui/mode-picker.js";
-import { buildSessionPickerChoices } from "./ui/session-picker.js";
+import { runSessionBrowser } from "./ui/session-browser.js";
 
 export const program = new Command();
 
@@ -461,29 +462,118 @@ async function handleInteractivePrompt(
     );
 
     if (ui) {
-      const selectedSession = await runSessionPicker(state, ui, {
+      const browserResult = await runSessionBrowser(ui, {
         sessions: filteredSessions,
+        currentSessionId: state.currentSessionId,
         filterQuery,
       });
 
       try {
-        if (selectedSession) {
-          const storedSession = await loadSession(selectedSession.id);
-          restoreStoredSession(session, storedSession);
-          state.currentSessionId = storedSession.id;
-          state.currentSessionTitle = storedSession.title;
-          state.sessionEvents = [...storedSession.events];
-          state.sessionStore = await setActiveSession(storedSession.id);
+        if (browserResult.kind === "cancel") {
           renderInteractiveShell(ui, session, state);
-          renderSessionSwitched(ui, storedSession, session.mode);
           return true;
         }
 
+        if (browserResult.kind === "exit") {
+          renderInteractiveShell(ui, session, state);
+          return false;
+        }
+
+        if (browserResult.kind === "new") {
+          resetCurrentSession(session, state.settings.systemPrompt);
+          state.currentSessionTitle = null;
+          state.sessionEvents = [];
+          const result = await createSession({
+            ...(browserResult.title ? { title: browserResult.title } : {}),
+            systemPrompt: session.systemPrompt,
+            history: session.history,
+            events: state.sessionEvents,
+            maxHistoryTurns: session.maxHistoryTurns,
+          });
+          state.sessionStore = result.store;
+          state.currentSessionId = result.session.id;
+          state.currentSessionTitle = result.session.title;
+          state.sessionEvents = [...result.session.events];
+          renderInteractiveShell(ui, session, state);
+          renderNewSessionCreated(ui, result.session);
+          return true;
+        }
+
+        if (browserResult.kind === "history") {
+          const storedSession = await loadSession(browserResult.sessionId);
+          renderInteractiveShell(ui, session, state);
+          await renderHistory(ui, {
+            label: formatSessionLabel(storedSession.title, storedSession.id),
+            history: storedSession.history,
+            events: storedSession.events,
+            current: storedSession.id === state.currentSessionId,
+          });
+          return true;
+        }
+
+        if (browserResult.kind === "rename") {
+          if (browserResult.sessionId === state.currentSessionId) {
+            await persistCurrentSession(session, state, {
+              allowEmpty: true,
+              title: browserResult.title,
+            });
+          } else {
+            const result = await renameSession(browserResult.sessionId, browserResult.title);
+            state.sessionStore = result.store;
+          }
+
+          renderInteractiveShell(ui, session, state);
+          renderSessionRenamed(ui, state, browserResult.title, browserResult.sessionId);
+          return true;
+        }
+
+        if (browserResult.kind === "delete") {
+          const deletedCurrent = state.currentSessionId === browserResult.sessionId;
+          state.sessionStore = await deleteSession(browserResult.sessionId);
+
+          if (deletedCurrent) {
+            if (state.sessionStore.activeSessionId) {
+              const activeSession = await loadSession(state.sessionStore.activeSessionId);
+              restoreStoredSession(session, activeSession);
+              state.currentSessionId = activeSession.id;
+              state.currentSessionTitle = activeSession.title;
+              state.sessionEvents = [...activeSession.events];
+              renderInteractiveShell(ui, session, state);
+              renderSessionDeletedAndSwitched(
+                ui,
+                browserResult.sessionId,
+                activeSession,
+                session.mode,
+              );
+              return true;
+            }
+
+            resetCurrentSession(session, state.settings.systemPrompt);
+            state.currentSessionId = null;
+            state.currentSessionTitle = null;
+            state.sessionEvents = [];
+            renderInteractiveShell(ui, session, state);
+            renderSessionDeleted(ui, browserResult.sessionId);
+            return true;
+          }
+
+          renderInteractiveShell(ui, session, state);
+          renderSessionDeleted(ui, browserResult.sessionId);
+          return true;
+        }
+
+        const storedSession = await loadSession(browserResult.sessionId);
+        restoreStoredSession(session, storedSession);
+        state.currentSessionId = storedSession.id;
+        state.currentSessionTitle = storedSession.title;
+        state.sessionEvents = [...storedSession.events];
+        state.sessionStore = await setActiveSession(storedSession.id);
         renderInteractiveShell(ui, session, state);
+        renderSessionSwitched(ui, storedSession, session.mode);
         return true;
       } catch (error) {
         renderInteractiveShell(ui, session, state);
-        renderError(ui, error instanceof Error ? error.message : "Failed to switch session.");
+        renderError(ui, error instanceof Error ? error.message : "Failed to handle session action.");
         return true;
       }
     }
@@ -1722,12 +1812,14 @@ function renderSessionDeletedAndSwitched(
 function renderSessionRenamed(
   ui: InteractiveRenderer | null,
   state: InteractiveState,
+  title?: string,
+  sessionId?: string | null,
 ): void {
   renderInfo(
     ui,
     `Renamed session: ${formatSessionLabel(
-      state.currentSessionTitle,
-      state.currentSessionId,
+      title ?? state.currentSessionTitle,
+      sessionId ?? state.currentSessionId,
     )}`,
   );
 }
@@ -1998,30 +2090,6 @@ function resolveSessionSelector(
   return sessionSummary;
 }
 
-async function runSessionPicker(
-  state: InteractiveState,
-  ui: InteractiveRenderer,
-  options?: {
-    sessions?: SessionSummary[];
-    filterQuery?: string | undefined;
-  },
-): Promise<SessionSummary | null> {
-  const sessions = options?.sessions ?? state.sessionStore.sessions;
-  const selectedSessionId = await ui.selectOption({
-    title: "Saved Sessions",
-    subtitle: buildSessionPickerSubtitle(sessions.length, options?.filterQuery),
-    helpText: "Up/Down move  Enter switch  Esc cancel",
-    options: buildSessionPickerChoices(sessions, state.currentSessionId).map((choice) => ({
-      value: choice.value,
-      label: choice.name,
-      description: choice.description,
-      tone: choice.value === state.currentSessionId ? "accent" : "default",
-    })),
-  });
-
-  return sessions.find((session) => session.id === selectedSessionId) ?? null;
-}
-
 async function runModePicker(
   currentMode: AgentMode,
   ui: InteractiveRenderer,
@@ -2263,18 +2331,6 @@ function buildApprovalPickerOptions(
       tone: "default",
     },
   ];
-}
-
-function buildSessionPickerSubtitle(
-  sessionCount: number,
-  filterQuery?: string,
-): string {
-  const trimmedFilter = filterQuery?.trim();
-  if (!trimmedFilter) {
-    return `${sessionCount} saved session${sessionCount === 1 ? "" : "s"} available.`;
-  }
-
-  return `Filter: "${trimmedFilter}" (${sessionCount} match${sessionCount === 1 ? "" : "es"}).`;
 }
 
 async function runWithSuspendedRenderer<T>(

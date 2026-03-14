@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionSummary } from "../src/session/store.js";
 import {
+  buildSessionActionChoices,
   SESSION_PICKER_EXIT_LABEL,
+  SESSION_PICKER_NEW_LABEL,
+  SESSION_PICKER_NEW_VALUE,
   buildSessionPickerChoices,
 } from "../src/ui/session-picker.js";
 
@@ -54,4 +57,27 @@ test("session picker still offers an exit choice when there are no saved session
       description: "Return to chat without switching sessions.",
     },
   ]);
+});
+
+test("session picker can prepend a new-session action", () => {
+  const choices = buildSessionPickerChoices(
+    [createSessionSummary(1)],
+    null,
+    { includeNewSessionAction: true },
+  );
+
+  assert.deepEqual(choices[0], {
+    value: SESSION_PICKER_NEW_VALUE,
+    name: SESSION_PICKER_NEW_LABEL,
+    description: "Create and switch to a fresh saved session.",
+  });
+});
+
+test("session action choices omit switch for the current session", () => {
+  const choices = buildSessionActionChoices(createSessionSummary(2), "s_2");
+
+  assert.deepEqual(
+    choices.map((choice) => choice.value),
+    ["history", "rename", "delete", null],
+  );
 });

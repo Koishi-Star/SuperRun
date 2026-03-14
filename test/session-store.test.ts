@@ -10,6 +10,7 @@ import {
   deleteSession,
   loadSession,
   loadSessionStore,
+  renameSession,
   saveSession,
   setActiveSession,
 } from "../src/session/store.js";
@@ -160,6 +161,39 @@ test("deleteAllSessions clears saved files and resets the active session", async
     const sessionsDir = path.join(tempDir, "sessions");
     const entries = await readdir(sessionsDir);
     assert.deepEqual(entries.sort(), ["index.json"]);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("renameSession keeps the active session unchanged", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-session-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    const first = await createSession({
+      systemPrompt: "You are a reviewer.",
+      history: [{ role: "user", content: "First" }],
+      maxHistoryTurns: 10,
+    });
+    const second = await createSession({
+      systemPrompt: "You are a reviewer.",
+      history: [{ role: "user", content: "Second" }],
+      maxHistoryTurns: 10,
+    });
+
+    const renamed = await renameSession(first.session.id, "Renamed First");
+    assert.equal(renamed.session.title, "Renamed First");
+    assert.equal(renamed.store.activeSessionId, second.session.id);
+
+    const store = await loadSessionStore();
+    assert.equal(store.activeSessionId, second.session.id);
+    assert.equal(
+      store.sessions.find((session) => session.id === first.session.id)?.title,
+      "Renamed First",
+    );
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });
