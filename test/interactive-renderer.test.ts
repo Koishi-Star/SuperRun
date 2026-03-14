@@ -30,6 +30,8 @@ function createKey(overrides: Partial<Key> = {}): Key {
     rightArrow: false,
     pageDown: false,
     pageUp: false,
+    home: false,
+    end: false,
     return: false,
     escape: false,
     ctrl: false,
@@ -215,6 +217,45 @@ test("interactive renderer applies file suggestions with Tab and clears submit e
 
     renderer.dispatchInput("c", createKey({ ctrl: true }));
     assert.equal(await errorPrompt, "/exit");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer supports scrollable diff approval overlays", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const reviewPromise = renderer.reviewDiff({
+      title: "Approve replace_lines?",
+      subtitle: "src/example.ts",
+      summary: "Replace lines 10-12 in src/example.ts",
+      lines: Array.from({ length: 30 }, (_, index) => ({
+        kind: index % 3 === 0 ? "remove" : index % 3 === 1 ? "add" : "context",
+        oldLineNumber: index % 3 === 1 ? null : index + 1,
+        newLineNumber: index % 3 === 0 ? null : index + 1,
+        text: `line ${index + 1}`,
+      })),
+    });
+
+    renderer.dispatchInput("", createKey({ downArrow: true }));
+    renderer.dispatchInput("", createKey({ pageDown: true }));
+
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.overlay?.kind, "diff");
+    assert.equal(snapshot.overlay?.scrollOffset, 11);
+
+    renderer.dispatchInput("", createKey({ home: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.overlay?.kind, "diff");
+    assert.equal(snapshot.overlay?.scrollOffset, 0);
+
+    renderer.dispatchInput("a", createKey());
+    assert.equal(await reviewPromise, "always");
   } finally {
     renderer.dispose();
   }

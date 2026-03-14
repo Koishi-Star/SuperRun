@@ -1,6 +1,7 @@
 import type { Writable } from "node:stream";
 import { render, type Instance } from "ink";
 import React from "react";
+import type { CommandApprovalDecision, WorkspaceEditDiffPreviewLine } from "../tools/types.js";
 import {
   applySelectedComposerSuggestion,
   backspaceComposerText,
@@ -53,13 +54,37 @@ export type RendererOverlayOption = {
   tone: "default" | "accent" | "danger";
 };
 
-export type RendererOverlay = {
+export type RendererPickerOverlay = {
+  kind: "picker";
   title: string;
   subtitle: string | null;
   helpText: string | null;
   emptyMessage: string | null;
   options: RendererOverlayOption[];
   selectedIndex: number;
+};
+
+export type RendererDiffOverlay = {
+  kind: "diff";
+  title: string;
+  subtitle: string | null;
+  helpText: string | null;
+  summary: string;
+  truncated: boolean;
+  lines: WorkspaceEditDiffPreviewLine[];
+  scrollOffset: number;
+  viewportHeight: number;
+};
+
+export type RendererOverlay = RendererPickerOverlay | RendererDiffOverlay;
+
+export type RendererDiffApprovalOptions = {
+  title: string;
+  subtitle?: string;
+  helpText?: string;
+  summary: string;
+  truncated?: boolean;
+  lines: WorkspaceEditDiffPreviewLine[];
 };
 
 export type InteractiveRenderer = {
@@ -80,6 +105,9 @@ export type InteractiveRenderer = {
     workspaceFiles: string[];
   }) => Promise<string>;
   selectOption: (options: RendererSelectOptions) => Promise<string | null>;
+  reviewDiff: (
+    options: RendererDiffApprovalOptions,
+  ) => Promise<CommandApprovalDecision>;
   getSnapshot: () => InteractiveRendererSnapshot;
   dispatchInput: (
     inputValue: string,
@@ -122,6 +150,7 @@ export function createInteractiveRenderer(options: {
   let promptWorkspaceFiles: string[] = [];
   let promptResolver: ((value: string) => void) | null = null;
   let overlayResolver: ((value: string | null) => void) | null = null;
+  let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let instance: Instance | null = null;
   let state: RendererState = {
     headerLines: [],
@@ -218,6 +247,18 @@ export function createInteractiveRenderer(options: {
     resolver?.(value);
   };
 
+  const resolveDiff = (value: CommandApprovalDecision) => {
+    const resolver = diffResolver;
+    diffResolver = null;
+    state = {
+      ...state,
+      inputMode: "inactive",
+      overlay: null,
+    };
+    rerender();
+    resolver?.(value);
+  };
+
   const renderer: InteractiveRenderer = {
     promptLabel,
     editorPromptLabel,
@@ -244,6 +285,7 @@ export function createInteractiveRenderer(options: {
       appendLines("body", "/switch   Switch to a saved session by id, title, or list index");
       appendLines("body", "/rename   Rename the current saved session");
       appendLines("body", "/delete   Delete the current session, one session by id/title/index, or all sessions");
+      appendLines("body", "/trash    Manage the local delete area without going through the model");
       appendLines("body", "/system  Edit and persist the system prompt directly in the terminal");
       appendLines("body", "/editor  Open the current system prompt in your external editor");
       appendLines("body", "/system reset Restore the built-in system prompt");
@@ -318,7 +360,7 @@ export function createInteractiveRenderer(options: {
       rerender();
     },
     readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
-      if (promptResolver || overlayResolver) {
+      if (promptResolver || overlayResolver || diffResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -346,7 +388,7 @@ export function createInteractiveRenderer(options: {
       });
     },
     selectOption: async (selection) => {
-      if (promptResolver || overlayResolver) {
+      if (promptResolver || overlayResolver || diffResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -360,6 +402,7 @@ export function createInteractiveRenderer(options: {
         ...state,
         inputMode: "overlay",
         overlay: {
+          kind: "picker",
           title: selection.title,
           subtitle: selection.subtitle ?? null,
           helpText: selection.helpText ?? null,
@@ -374,6 +417,32 @@ export function createInteractiveRenderer(options: {
         overlayResolver = resolve;
       });
     },
+    reviewDiff: async (review) => {
+      if (promptResolver || overlayResolver || diffResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      state = {
+        ...state,
+        inputMode: "overlay",
+        overlay: {
+          kind: "diff",
+          title: review.title,
+          subtitle: review.subtitle ?? null,
+          helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter approve once  a allow-all  Esc reject",
+          summary: review.summary,
+          truncated: review.truncated ?? false,
+          lines: review.lines,
+          scrollOffset: 0,
+          viewportHeight: getDiffViewportHeight(options.output),
+        },
+      };
+      rerender();
+
+      return new Promise<CommandApprovalDecision>((resolve) => {
+        diffResolver = resolve;
+      });
+    },
     getSnapshot: () => ({
       headerLines: [...state.headerLines],
       logLines: [...state.logLines],
@@ -384,10 +453,15 @@ export function createInteractiveRenderer(options: {
       inputMode: state.inputMode,
       inputActive: state.inputMode !== "inactive",
       overlay: state.overlay
-        ? {
-            ...state.overlay,
-            options: [...state.overlay.options],
-          }
+        ? state.overlay.kind === "picker"
+          ? {
+              ...state.overlay,
+              options: [...state.overlay.options],
+            }
+          : {
+              ...state.overlay,
+              lines: [...state.overlay.lines],
+            }
         : null,
       statusText: buildStatusText(state),
     }),
@@ -440,7 +514,16 @@ export function createInteractiveRenderer(options: {
   };
 
   const handleOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
-    if (!event || !state.overlay || !overlayResolver) {
+    if (!event || !state.overlay) {
+      return;
+    }
+
+    if (state.overlay.kind === "diff") {
+      handleDiffOverlayInput(event);
+      return;
+    }
+
+    if (!overlayResolver) {
       return;
     }
 
@@ -494,6 +577,88 @@ export function createInteractiveRenderer(options: {
         },
       };
       rerender();
+    }
+  };
+
+  const handleDiffOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
+    if (!event || !state.overlay || state.overlay.kind !== "diff" || !diffResolver) {
+      return;
+    }
+
+    if (event.type === "interrupt" || event.type === "cancel") {
+      resolveDiff("reject");
+      return;
+    }
+
+    if (event.type === "submit") {
+      resolveDiff("once");
+      return;
+    }
+
+    if (event.type === "insert_text") {
+      const normalizedText = event.text.trim().toLowerCase();
+      if (normalizedText === "a") {
+        resolveDiff("always");
+        return;
+      }
+
+      if (normalizedText === "r") {
+        resolveDiff("reject");
+      }
+      return;
+    }
+
+    switch (event.type) {
+      case "move_up":
+        state = {
+          ...state,
+          overlay: moveDiffScroll(state.overlay, -1),
+        };
+        rerender();
+        return;
+      case "move_down":
+        state = {
+          ...state,
+          overlay: moveDiffScroll(state.overlay, 1),
+        };
+        rerender();
+        return;
+      case "move_page_up":
+        state = {
+          ...state,
+          overlay: moveDiffScroll(state.overlay, -state.overlay.viewportHeight),
+        };
+        rerender();
+        return;
+      case "move_page_down":
+        state = {
+          ...state,
+          overlay: moveDiffScroll(state.overlay, state.overlay.viewportHeight),
+        };
+        rerender();
+        return;
+      case "move_home":
+        state = {
+          ...state,
+          overlay: {
+            ...state.overlay,
+            scrollOffset: 0,
+          },
+        };
+        rerender();
+        return;
+      case "move_end":
+        state = {
+          ...state,
+          overlay: {
+            ...state.overlay,
+            scrollOffset: Math.max(0, state.overlay.lines.length - state.overlay.viewportHeight),
+          },
+        };
+        rerender();
+        return;
+      default:
+        return;
     }
   };
 
@@ -600,9 +765,9 @@ export function createInteractiveRenderer(options: {
 }
 
 function moveOverlaySelection(
-  overlay: RendererOverlay,
+  overlay: RendererPickerOverlay,
   delta: number,
-): RendererOverlay {
+): RendererPickerOverlay {
   if (overlay.options.length === 0) {
     return overlay;
   }
@@ -616,8 +781,23 @@ function moveOverlaySelection(
   };
 }
 
+function moveDiffScroll(
+  overlay: RendererDiffOverlay,
+  delta: number,
+): RendererDiffOverlay {
+  const maxOffset = Math.max(0, overlay.lines.length - overlay.viewportHeight);
+  return {
+    ...overlay,
+    scrollOffset: Math.min(Math.max(overlay.scrollOffset + delta, 0), maxOffset),
+  };
+}
+
 function buildStatusText(state: RendererState): string {
   if (state.inputMode === "overlay") {
+    if (state.overlay?.kind === "diff") {
+      return state.overlay.helpText ?? "Up/Down scroll  Enter approve once  Esc reject";
+    }
+
     return state.overlay?.helpText ?? "Up/Down move  Enter select  Esc cancel";
   }
 
@@ -635,4 +815,13 @@ function buildDivider(output: Writable): string {
       : 80;
   const width = Math.min(Math.max(columns, 40), 120);
   return "-".repeat(width);
+}
+
+function getDiffViewportHeight(output: Writable): number {
+  const rows =
+    "rows" in output && typeof output.rows === "number"
+      ? output.rows
+      : 24;
+
+  return Math.min(Math.max(rows - 14, 6), 18);
 }

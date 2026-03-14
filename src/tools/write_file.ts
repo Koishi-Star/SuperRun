@@ -1,8 +1,10 @@
 import path from "node:path";
-import { lstat, mkdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import { buildWorkspaceEditDiffPreview } from "./diff_preview.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
+import { parseWorkspaceText } from "./text_file.js";
 import type { ToolExecutionContext, WorkspaceEditAssessment } from "./types.js";
 import {
   normalizeRelativeWorkspacePath,
@@ -84,6 +86,7 @@ export async function writeWorkspaceFile(
   const overwrite = args.overwrite ?? false;
 
   let existingStat: Awaited<ReturnType<typeof lstat>> | null = null;
+  let existingContent = "";
   try {
     existingStat = await lstat(absolutePath);
   } catch (error) {
@@ -95,6 +98,13 @@ export async function writeWorkspaceFile(
   if (existingStat?.isDirectory()) {
     throw new Error("write_file path must point to a file, not a directory.");
   }
+
+  if (existingStat) {
+    existingContent = await readFile(absolutePath, "utf8");
+  }
+
+  const previousText = parseWorkspaceText(existingContent);
+  const nextText = parseWorkspaceText(args.content);
 
   if (!existingStat && !createIfMissing) {
     throw new Error(`write_file target does not exist: ${relativePath}`);
@@ -118,6 +128,14 @@ export async function writeWorkspaceFile(
         : "creating files changes the workspace state.",
     ],
     approvalRequired: true,
+    diffPreview: buildWorkspaceEditDiffPreview({
+      title: relativePath,
+      summary: existingStat
+        ? `Overwrite ${relativePath} (${previousText.lines.length} -> ${nextText.lines.length} lines)`
+        : `Create ${relativePath} (${nextText.lines.length} lines)`,
+      oldLines: previousText.lines,
+      newLines: nextText.lines,
+    }),
   };
   await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 

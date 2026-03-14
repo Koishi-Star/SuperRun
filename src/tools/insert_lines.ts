@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import { buildWorkspaceEditDiffPreview } from "./diff_preview.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
 import { normalizeReplacementLines, readWorkspaceTextFile, writeWorkspaceTextFile } from "./text_file.js";
 import type { ToolExecutionContext, WorkspaceEditAssessment } from "./types.js";
@@ -81,6 +82,14 @@ export async function insertWorkspaceLines(
     );
   }
 
+  const insertedLines = normalizeReplacementLines(args.content);
+  const insertionIndex = args.before_line - 1;
+  const nextLines = [
+    ...file.lines.slice(0, insertionIndex),
+    ...insertedLines,
+    ...file.lines.slice(insertionIndex),
+  ];
+
   const assessment: WorkspaceEditAssessment = {
     tool: "insert_lines",
     path: relativePath,
@@ -89,16 +98,14 @@ export async function insertWorkspaceLines(
       "targeted line insertion edits existing workspace content.",
     ],
     approvalRequired: true,
+    diffPreview: buildWorkspaceEditDiffPreview({
+      title: relativePath,
+      summary: `Insert ${insertedLines.length} line${insertedLines.length === 1 ? "" : "s"} before line ${args.before_line} in ${relativePath}`,
+      oldLines: file.lines,
+      newLines: nextLines,
+    }),
   };
   await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
-
-  const insertedLines = normalizeReplacementLines(args.content);
-  const insertionIndex = args.before_line - 1;
-  const nextLines = [
-    ...file.lines.slice(0, insertionIndex),
-    ...insertedLines,
-    ...file.lines.slice(insertionIndex),
-  ];
 
   await writeWorkspaceTextFile(absolutePath, {
     ...file,

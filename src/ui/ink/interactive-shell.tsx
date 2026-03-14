@@ -4,6 +4,7 @@ import type { ComposerState } from "../composer-state.js";
 import type {
   RendererLine,
   RendererOverlay,
+  RendererPickerOverlay,
   RendererPrompt,
 } from "../interactive-renderer.js";
 
@@ -123,6 +124,12 @@ function PromptLine(props: {
 }
 
 function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
+  if (props.overlay.kind === "diff") {
+    return <DiffApprovalOverlay overlay={props.overlay} />;
+  }
+
+  const overlay = props.overlay;
+
   return (
     <Box
       flexDirection="column"
@@ -133,13 +140,13 @@ function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
       paddingY={0}
     >
       <Text bold color="cyan">
-        {props.overlay.title}
+        {overlay.title}
       </Text>
-      {props.overlay.subtitle ? <Text dimColor>{props.overlay.subtitle}</Text> : null}
-      {props.overlay.options.length === 0 && props.overlay.emptyMessage ? (
-        <Text dimColor>{props.overlay.emptyMessage}</Text>
+      {overlay.subtitle ? <Text dimColor>{overlay.subtitle}</Text> : null}
+      {overlay.options.length === 0 && overlay.emptyMessage ? (
+        <Text dimColor>{overlay.emptyMessage}</Text>
       ) : null}
-      {props.overlay.options.map((option, index) => (
+      {overlay.options.map((option, index) => (
         <Box
           key={`overlay-${option.value ?? "cancel"}-${option.label}-${index}`}
           flexDirection="column"
@@ -147,13 +154,58 @@ function OverlayPicker(props: { overlay: RendererOverlay }): React.JSX.Element {
         >
           <Text
             color={getOverlayToneColor(option.tone)}
-            inverse={index === props.overlay.selectedIndex}
+            inverse={index === overlay.selectedIndex}
           >
-            {`${index === props.overlay.selectedIndex ? ">" : " "} ${option.label}`}
+            {`${index === overlay.selectedIndex ? ">" : " "} ${option.label}`}
           </Text>
           <Text dimColor>{`  ${option.description}`}</Text>
         </Box>
       ))}
+    </Box>
+  );
+}
+
+function DiffApprovalOverlay(props: {
+  overlay: Extract<RendererOverlay, { kind: "diff" }>;
+}): React.JSX.Element {
+  const visibleLines = props.overlay.lines.slice(
+    props.overlay.scrollOffset,
+    props.overlay.scrollOffset + props.overlay.viewportHeight,
+  );
+  const scrollEnd = Math.min(
+    props.overlay.lines.length,
+    props.overlay.scrollOffset + props.overlay.viewportHeight,
+  );
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="yellowBright"
+      marginTop={1}
+      paddingX={1}
+      paddingY={0}
+    >
+      <Text bold color="yellowBright">
+        {props.overlay.title}
+      </Text>
+      {props.overlay.subtitle ? <Text dimColor>{props.overlay.subtitle}</Text> : null}
+      <Text>{props.overlay.summary}</Text>
+      {props.overlay.truncated ? (
+        <Text color="yellowBright">Preview truncated to the first diff lines.</Text>
+      ) : null}
+      <Text dimColor>{`Showing lines ${props.overlay.scrollOffset + 1}-${scrollEnd} of ${props.overlay.lines.length}`}</Text>
+      <Box flexDirection="column" marginTop={1}>
+        {visibleLines.map((line, index) => (
+          <DiffLine
+            key={`diff-${props.overlay.scrollOffset + index}-${line.kind}-${line.oldLineNumber ?? "n"}-${line.newLineNumber ?? "n"}`}
+            line={line}
+          />
+        ))}
+      </Box>
+      <Text dimColor>
+        Enter approve once  a allow-all  Esc reject
+      </Text>
     </Box>
   );
 }
@@ -199,6 +251,29 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
   }
 }
 
+function DiffLine(props: {
+  line: Extract<RendererOverlay, { kind: "diff" }>["lines"][number];
+}): React.JSX.Element {
+  const marker = props.line.kind === "add"
+    ? "+"
+    : props.line.kind === "remove"
+      ? "-"
+      : " ";
+  const oldNumber = formatDiffLineNumber(props.line.oldLineNumber);
+  const newNumber = formatDiffLineNumber(props.line.newLineNumber);
+  const color = props.line.kind === "add"
+    ? "green"
+    : props.line.kind === "remove"
+      ? "redBright"
+      : "white";
+
+  return (
+    <Text color={color} dimColor={props.line.kind === "context"}>
+      {`${marker} ${oldNumber} ${newNumber} ${props.line.text}`}
+    </Text>
+  );
+}
+
 function renderSuggestionLines(state: ComposerState): Array<{
   text: string;
   selected: boolean;
@@ -224,7 +299,7 @@ function renderSuggestionLines(state: ComposerState): Array<{
 }
 
 function getOverlayToneColor(
-  tone: RendererOverlay["options"][number]["tone"],
+  tone: RendererPickerOverlay["options"][number]["tone"],
 ): "white" | "cyan" | "redBright" {
   switch (tone) {
     case "accent":
@@ -235,4 +310,12 @@ function getOverlayToneColor(
     default:
       return "white";
   }
+}
+
+function formatDiffLineNumber(lineNumber: number | null): string {
+  if (lineNumber === null) {
+    return "   .";
+  }
+
+  return `${lineNumber}`.padStart(4, " ");
 }

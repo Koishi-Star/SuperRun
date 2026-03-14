@@ -1,12 +1,19 @@
+import { lstat } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
 import { moveWorkspaceFileToTrash } from "./trash.js";
 import type { ToolExecutionContext, WorkspaceEditAssessment } from "./types.js";
+import {
+  normalizeRelativeWorkspacePath,
+  resolveWorkspacePath,
+} from "./workspace.js";
 
 const deleteFileArgsSchema = z.object({
   path: z.string().trim().min(1),
 });
+
+const MAX_DELETE_AREA_FILE_BYTES = 1_024 * 1_024;
 
 type DeleteFileArgs = z.infer<typeof deleteFileArgsSchema>;
 
@@ -61,9 +68,23 @@ export async function deleteWorkspaceFile(
     totalBytes: number;
   };
 }> {
+  const relativePath = normalizeRelativeWorkspacePath("delete_file", args.path);
+  const absolutePath = resolveWorkspacePath("delete_file", process.cwd(), relativePath);
+  const stat = await lstat(absolutePath);
+
+  if (stat.size > MAX_DELETE_AREA_FILE_BYTES) {
+    context?.notices?.addNotice({
+      level: "warning",
+      message: `Skipped delete area move for ${relativePath}: files larger than 1 MB must be deleted manually.`,
+    });
+    throw new Error(
+      `delete_file refuses to store files larger than 1 MB in the delete area: ${relativePath}`,
+    );
+  }
+
   const assessment: WorkspaceEditAssessment = {
     tool: "delete_file",
-    path: args.path,
+    path: relativePath,
     summary: "Move a workspace file into the delete area",
     reasons: [
       "deleting files changes the workspace and may remove important code or assets.",
@@ -72,7 +93,7 @@ export async function deleteWorkspaceFile(
   };
   await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 
-  const result = await moveWorkspaceFileToTrash("delete_file", args.path);
+  const result = await moveWorkspaceFileToTrash("delete_file", relativePath);
   return {
     path: result.entry.originalPath,
     deletedFileId: result.entry.id,

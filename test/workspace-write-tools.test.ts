@@ -445,6 +445,52 @@ test("list_deleted_files, purge_deleted_file, and empty_delete_area manage the d
   }
 });
 
+test("delete_file rejects files larger than 1 MB and records a warning notice without deleting them", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-large-delete-"));
+  const previousCwd = process.cwd();
+  const notices: Array<{ level: string; message: string }> = [];
+
+  try {
+    await writeFile(
+      path.join(tempDir, "large.bin"),
+      Buffer.alloc(1_024 * 1_024 + 1, 1),
+    );
+    process.chdir(tempDir);
+
+    const result = JSON.parse(
+      await executeAgentTool(
+        {
+          id: "call_15",
+          name: "delete_file",
+          arguments: JSON.stringify({ path: "large.bin" }),
+        },
+        "default",
+        {
+          workspaceEditPolicy: createWorkspaceEditPolicyContext("allow-all"),
+          notices: {
+            addNotice: (notice) => notices.push(notice),
+          },
+        },
+      ),
+    ) as {
+      ok: boolean;
+      error?: string;
+    };
+
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /larger than 1 MB/);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0]?.message ?? "", /Skipped delete area move for large\.bin/);
+    assert.equal(
+      (await readFile(path.join(tempDir, "large.bin"))).length,
+      1_024 * 1_024 + 1,
+    );
+  } finally {
+    process.chdir(previousCwd);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("strict mode does not expose write_file", async () => {
   const result = JSON.parse(
     await executeAgentTool(

@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import { readWorkspaceTextFile } from "./text_file.js";
 import type { ToolExecutionContext } from "./types.js";
 import {
   normalizeRelativeWorkspacePath,
@@ -77,17 +77,22 @@ export async function readWorkspaceFile(args: ReadFileArgs): Promise<{
 }> {
   const relativePath = normalizeRelativeWorkspacePath("read_file", args.path);
   const absolutePath = resolveWorkspacePath("read_file", process.cwd(), relativePath);
-  const fileContent = await readFile(absolutePath, "utf8");
+  const file = await readWorkspaceTextFile(absolutePath, "read_file");
+  const lines = file.lines;
+  const totalLines = lines.length;
 
-  if (fileContent.includes("\u0000")) {
-    throw new Error("read_file only supports UTF-8 text files.");
+  if (totalLines === 0) {
+    return {
+      path: relativePath,
+      startLine: 1,
+      endLine: 0,
+      totalLines: 0,
+      truncated: false,
+      content: "",
+    };
   }
 
-  const normalizedContent = fileContent.replace(/\r\n/g, "\n");
-  const lines = normalizedContent.split("\n");
-  const totalLines = lines.length;
   const startLine = args.start_line ?? 1;
-
   if (startLine > totalLines) {
     throw new Error(`read_file start_line is out of range for ${relativePath}.`);
   }

@@ -189,6 +189,6 @@ test("delete area banner text appears only when the delete area is non-empty", (
   );
   assert.match(
     getDeleteAreaBannerText({ fileCount: 2, totalBytes: 4096 }) ?? "",
-    /Delete area now has 2 files \(about 4 KB\)\. Ask SuperRun to use list_deleted_files, restore_deleted_file, purge_deleted_file, or empty_delete_area\./,
+    /Delete area now has 2 files \(about 4 KB\)\. Use \/trash to inspect, restore, purge, or empty it\./,
   );
 });

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import { buildWorkspaceEditDiffPreview } from "./diff_preview.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
 import { normalizeReplacementLines, readWorkspaceTextFile, writeWorkspaceTextFile } from "./text_file.js";
 import type { ToolExecutionContext, WorkspaceEditAssessment } from "./types.js";
@@ -93,6 +94,13 @@ export async function replaceWorkspaceLines(
     throw new Error(`replace_lines range is out of bounds for ${relativePath}.`);
   }
 
+  const replacementLines = normalizeReplacementLines(args.content);
+  const nextLines = [
+    ...file.lines.slice(0, args.start_line - 1),
+    ...replacementLines,
+    ...file.lines.slice(args.end_line),
+  ];
+
   const assessment: WorkspaceEditAssessment = {
     tool: "replace_lines",
     path: relativePath,
@@ -101,15 +109,15 @@ export async function replaceWorkspaceLines(
       "targeted line replacement edits existing workspace content.",
     ],
     approvalRequired: true,
+    diffPreview: buildWorkspaceEditDiffPreview({
+      title: relativePath,
+      summary: `Replace lines ${args.start_line}-${args.end_line} in ${relativePath}`,
+      oldLines: file.lines,
+      newLines: nextLines,
+    }),
   };
   await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 
-  const replacementLines = normalizeReplacementLines(args.content);
-  const nextLines = [
-    ...file.lines.slice(0, args.start_line - 1),
-    ...replacementLines,
-    ...file.lines.slice(args.end_line),
-  ];
   await writeWorkspaceTextFile(absolutePath, {
     ...file,
     lines: nextLines,

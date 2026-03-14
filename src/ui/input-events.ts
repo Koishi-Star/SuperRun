@@ -9,6 +9,8 @@ export type SemanticInputEvent =
   | { type: "move_right" }
   | { type: "move_up" }
   | { type: "move_down" }
+  | { type: "move_page_up" }
+  | { type: "move_page_down" }
   | { type: "move_home" }
   | { type: "move_end" }
   | { type: "cancel" }
@@ -70,6 +72,14 @@ export function normalizeInkInput(
 
   if (key.downArrow) {
     return { type: "move_down" };
+  }
+
+  if (key.pageUp) {
+    return { type: "move_page_up" };
+  }
+
+  if (key.pageDown) {
+    return { type: "move_page_down" };
   }
 
   if (key.home || (key.ctrl && inputValue === "a")) {

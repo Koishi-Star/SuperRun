@@ -35,11 +35,18 @@ import {
   parseCommandApprovalMode,
 } from "./tools/command_policy.js";
 import { createEnvCommandHookRunner } from "./tools/command_hooks.js";
-import { getWorkspaceDeleteAreaStatus } from "./tools/trash.js";
+import {
+  emptyWorkspaceTrash,
+  getWorkspaceDeleteAreaStatus,
+  listWorkspaceTrashEntries,
+  purgeWorkspaceFileFromTrash,
+  restoreWorkspaceFileFromTrash,
+} from "./tools/trash.js";
 import type {
   CommandApprovalDecision,
   CommandApprovalMode,
   CommandApprovalRequest,
+  ToolNotice,
   ToolExecutionContext,
   WorkspaceEditApprovalRequest,
 } from "./tools/types.js";
@@ -198,11 +205,12 @@ async function runSingleTurn(
   prompt: string,
   state: InteractiveState,
 ): Promise<void> {
+  const turnNotices: ToolNotice[] = [];
   console.log("user:", prompt);
   process.stdout.write("assistant: ");
 
   const reply = await runAgentTurn(session, prompt, {
-    toolContext: createToolExecutionContext(state, null),
+    toolContext: createToolExecutionContext(state, null, turnNotices),
     onChunk: (chunk) => {
       process.stdout.write(chunk);
     },
@@ -213,6 +221,7 @@ async function runSingleTurn(
   }
 
   process.stdout.write("\n");
+  renderTurnNotices(null, turnNotices);
 }
 
 async function runInteractiveSession(
@@ -284,7 +293,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -555,6 +564,11 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  if (matchesCommand(prompt, "/trash")) {
+    await handleTrashCommand(prompt, session, state, ui);
+    return true;
+  }
+
   if (prompt.startsWith("/")) {
     renderError(ui, `Unknown command: ${prompt}. Type /help.`);
     return true;
@@ -566,8 +580,10 @@ async function handleInteractivePrompt(
     process.stdout.write("assistant: ");
   }
 
+  const turnNotices: ToolNotice[] = [];
+
   const reply = await runAgentTurn(session, prompt, {
-    toolContext: createToolExecutionContext(state, ui),
+    toolContext: createToolExecutionContext(state, ui, turnNotices),
     onChunk: (chunk) => {
       if (ui) {
         ui.appendAssistantChunk(chunk);
@@ -592,6 +608,7 @@ async function handleInteractivePrompt(
   if (!ui) {
     process.stdout.write("\n");
   }
+  renderTurnNotices(ui, turnNotices);
   return true;
 }
 
@@ -763,7 +780,7 @@ function buildInteractiveShellFrame(
     { kind: "info", text: "Local coding agent interactive mode" },
     {
       kind: "info",
-      text: "Commands: /help /mode /approvals /history /sessions /new /switch /rename /delete /system /editor /clear /exit",
+      text: "Commands: /help /mode /approvals /history /sessions /new /switch /rename /delete /trash /system /editor /clear /exit",
     },
     { kind: "body", text: "" },
     {
@@ -860,7 +877,7 @@ export function getDeleteAreaBannerText(status: {
     return null;
   }
 
-  return `Delete area now has ${status.fileCount} file${status.fileCount === 1 ? "" : "s"} (about ${formatDeleteAreaKilobytes(status.totalBytes)} KB). Ask SuperRun to use list_deleted_files, restore_deleted_file, purge_deleted_file, or empty_delete_area.`;
+  return `Delete area now has ${status.fileCount} file${status.fileCount === 1 ? "" : "s"} (about ${formatDeleteAreaKilobytes(status.totalBytes)} KB). Use /trash to inspect, restore, purge, or empty it.`;
 }
 
 function renderInteractiveShell(
@@ -930,6 +947,118 @@ function renderSessionStoreHint(
   renderInfo(ui, 'Use "/sessions" to browse them or "/switch <index>" to load one.');
 }
 
+async function handleTrashCommand(
+  prompt: string,
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<void> {
+  const argument = parseCommandArgument(prompt, "/trash");
+  const [subcommand = "list", ...restParts] = argument.split(/\s+/).filter(Boolean);
+  const value = restParts.join(" ").trim();
+
+  if (subcommand === "help") {
+    renderTrashHelp(ui);
+    return;
+  }
+
+  if (subcommand === "list") {
+    renderTrashList(ui, await listWorkspaceTrashEntries());
+    return;
+  }
+
+  if (subcommand === "restore") {
+    if (!value) {
+      renderError(ui, 'Usage: /trash restore <id>');
+      return;
+    }
+
+    try {
+      const result = await restoreWorkspaceFileFromTrash(value);
+      await refreshDeleteAreaBanner(session, state, ui);
+      renderInfo(ui, `Restored deleted file: ${result.entry.originalPath} -> ${result.restoredPath}`);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to restore deleted file.");
+    }
+    return;
+  }
+
+  if (subcommand === "purge") {
+    if (!value) {
+      renderError(ui, 'Usage: /trash purge <id>');
+      return;
+    }
+
+    try {
+      const result = await purgeWorkspaceFileFromTrash(value);
+      await refreshDeleteAreaBanner(session, state, ui);
+      renderInfo(ui, `Purged deleted file: ${result.entry.originalPath} [${result.entry.id}]`);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to purge deleted file.");
+    }
+    return;
+  }
+
+  if (subcommand === "empty") {
+    if (value !== "YES") {
+      renderError(ui, 'Usage: /trash empty YES');
+      return;
+    }
+
+    try {
+      const result = await emptyWorkspaceTrash();
+      await refreshDeleteAreaBanner(session, state, ui);
+      renderInfo(ui, `Emptied delete area: ${result.purgedCount} file${result.purgedCount === 1 ? "" : "s"} permanently removed.`);
+    } catch (error) {
+      renderError(ui, error instanceof Error ? error.message : "Failed to empty the delete area.");
+    }
+    return;
+  }
+
+  renderError(ui, `Unknown /trash command: ${subcommand}. Use /trash help.`);
+}
+
+function renderTrashHelp(ui: InteractiveRenderer | null): void {
+  if (ui) {
+    ui.renderSectionTitle("Delete Area");
+  } else {
+    console.log("Delete Area");
+  }
+
+  renderInfo(ui, "/trash list");
+  renderInfo(ui, "/trash restore <id>");
+  renderInfo(ui, "/trash purge <id>");
+  renderInfo(ui, "/trash empty YES");
+}
+
+function renderTrashList(
+  ui: InteractiveRenderer | null,
+  trash: Awaited<ReturnType<typeof listWorkspaceTrashEntries>>,
+): void {
+  if (ui) {
+    ui.renderSectionTitle("Delete Area");
+  } else {
+    console.log("Delete Area");
+  }
+
+  renderInfo(
+    ui,
+    `Delete area: ${trash.status.fileCount} file${trash.status.fileCount === 1 ? "" : "s"}, about ${formatDeleteAreaKilobytes(trash.status.totalBytes)} KB.`,
+  );
+
+  if (trash.entries.length === 0) {
+    renderInfo(ui, "Delete area is empty.");
+    return;
+  }
+
+  for (const entry of trash.entries) {
+    renderInfo(
+      ui,
+      `${entry.id}  ${entry.originalPath}  ${formatDeleteAreaKilobytes(entry.sizeBytes)} KB  ${formatTimestamp(entry.deletedAt)}`,
+    );
+  }
+}
+
 function renderSettingsSummary(
   ui: InteractiveRenderer | null,
   session: AgentSession,
@@ -978,6 +1107,29 @@ function renderRiskNotice(ui: InteractiveRenderer | null = null): void {
   write(
     "Recommendation: initialize git in the workspace so you have a recovery path for your files.",
   );
+}
+
+function renderTurnNotices(
+  ui: InteractiveRenderer | null,
+  notices: ToolNotice[],
+): void {
+  for (const notice of notices) {
+    if (notice.level === "error") {
+      renderError(ui, notice.message);
+      continue;
+    }
+
+    if (notice.level === "warning") {
+      if (ui) {
+        ui.renderWarning(notice.message);
+      } else {
+        console.log(`warning: ${notice.message}`);
+      }
+      continue;
+    }
+
+    renderInfo(ui, notice.message);
+  }
 }
 
 function renderApprovalSummary(
@@ -1487,6 +1639,7 @@ async function runApprovalPicker(
 function createToolExecutionContext(
   state: InteractiveState,
   ui: InteractiveRenderer | null,
+  turnNotices: ToolNotice[] = [],
 ): ToolExecutionContext {
   return {
     commandPolicy: {
@@ -1508,6 +1661,11 @@ function createToolExecutionContext(
               promptWorkspaceEditApproval(request, ui),
           }
         : {}),
+    },
+    notices: {
+      addNotice: (notice) => {
+        turnNotices.push(notice);
+      },
     },
   };
 }
@@ -1552,6 +1710,16 @@ async function promptWorkspaceEditApproval(
   ui: InteractiveRenderer,
 ): Promise<CommandApprovalDecision> {
   const { assessment } = request;
+  if (assessment.diffPreview) {
+    return ui.reviewDiff({
+      title: `Approve ${assessment.tool}?`,
+      subtitle: assessment.path,
+      summary: assessment.diffPreview.summary,
+      truncated: assessment.diffPreview.truncated,
+      lines: assessment.diffPreview.lines,
+    });
+  }
+
   const reasonSummary = assessment.reasons.join(" ");
   const selectedDecision = await ui.selectOption({
     title: `Approve ${assessment.tool}?`,

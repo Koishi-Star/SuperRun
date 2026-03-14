@@ -11,6 +11,8 @@ function createKey(overrides: Partial<Key> = {}): Key {
     rightArrow: false,
     pageDown: false,
     pageUp: false,
+    home: false,
+    end: false,
     return: false,
     escape: false,
     ctrl: false,
@@ -76,6 +78,14 @@ test("normalizeInkInput maps navigation and submit keys to semantic events", () 
   assert.deepEqual(
     normalizeInkInput("", createKey({ downArrow: true })),
     { type: "move_down" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ pageUp: true })),
+    { type: "move_page_up" },
+  );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ pageDown: true })),
+    { type: "move_page_down" },
   );
   assert.deepEqual(
     normalizeInkInput("", createKey({ return: true })),

@@ -36,6 +36,21 @@ export type WorkspaceEditAssessment = {
   summary: string;
   reasons: string[];
   approvalRequired: boolean;
+  diffPreview?: WorkspaceEditDiffPreview;
+};
+
+export type WorkspaceEditDiffPreviewLine = {
+  kind: "context" | "add" | "remove";
+  oldLineNumber: number | null;
+  newLineNumber: number | null;
+  text: string;
+};
+
+export type WorkspaceEditDiffPreview = {
+  title: string;
+  summary: string;
+  truncated: boolean;
+  lines: WorkspaceEditDiffPreviewLine[];
 };
 
 export type WorkspaceEditApprovalRequest = {
@@ -82,7 +97,17 @@ export type WorkspaceEditPolicyContext = {
   ) => Promise<CommandApprovalDecision>;
 };
 
+export type ToolNotice = {
+  level: "info" | "warning" | "error";
+  message: string;
+};
+
+export type ToolNoticeContext = {
+  addNotice: (notice: ToolNotice) => void;
+};
+
 export type ToolExecutionContext = {
   commandPolicy?: CommandPolicyContext;
   workspaceEditPolicy?: WorkspaceEditPolicyContext;
+  notices?: ToolNoticeContext;
 };
