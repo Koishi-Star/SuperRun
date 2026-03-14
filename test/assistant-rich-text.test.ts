@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createAnsiRichTextStreamWriter,
+  formatRichTextToAnsi,
   highlightAssistantCode,
   parseAssistantRichText,
   parseInlineSegments,
@@ -70,4 +72,30 @@ test("highlightAssistantCode preserves code content even when terminal coloring 
 
   assert.match(highlighted, /const/);
   assert.match(highlighted, /answer/);
+});
+
+test("formatRichTextToAnsi removes markdown markers while preserving content", () => {
+  const rendered = formatRichTextToAnsi("Use **bold** and `code`.");
+
+  assert.match(rendered, /Use /);
+  assert.match(rendered, /bold/);
+  assert.match(rendered, /code/);
+  assert.doesNotMatch(rendered, /\*\*/);
+});
+
+test("createAnsiRichTextStreamWriter formats fenced blocks across streamed chunks", () => {
+  let output = "";
+  const writer = createAnsiRichTextStreamWriter((chunk) => {
+    output += chunk;
+  });
+
+  writer.writeChunk("Before\n```ts\nconst ");
+  writer.writeChunk("answer = 42;\n```\nAfter");
+  writer.end();
+
+  assert.match(output, /Before/);
+  assert.match(output, /const/);
+  assert.match(output, /answer/);
+  assert.match(output, /After/);
+  assert.doesNotMatch(output, /```ts\nconst answer = 42;\n```/);
 });

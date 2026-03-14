@@ -56,6 +56,10 @@ import type {
   ToolExecutionContext,
   WorkspaceEditApprovalRequest,
 } from "./tools/types.js";
+import {
+  createAnsiRichTextStreamWriter,
+  formatRichTextToAnsi,
+} from "./ui/assistant-rich-text.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
@@ -216,20 +220,24 @@ async function runSingleTurn(
   state: InteractiveState,
 ): Promise<void> {
   const turnEvents: ToolTurnEvent[] = [];
+  const assistantWriter = createAnsiRichTextStreamWriter((chunk) => {
+    process.stdout.write(chunk);
+  }, "assistant");
   console.log("user:", prompt);
   process.stdout.write("assistant: ");
 
   const reply = await runAgentTurn(session, prompt, {
     toolContext: createToolExecutionContext(session, state, null, turnEvents),
     onChunk: (chunk) => {
-      process.stdout.write(chunk);
+      assistantWriter.writeChunk(chunk);
     },
   });
 
   if (!reply) {
-    process.stdout.write("(empty response)");
+    assistantWriter.writeChunk("(empty response)");
   }
 
+  assistantWriter.end();
   process.stdout.write("\n");
   await renderTurnEvents(null, turnEvents);
 }
@@ -1128,7 +1136,7 @@ function renderSettingsSummary(
 function renderRiskNotice(ui: InteractiveRenderer | null = null): void {
   const write = ui
     ? (message: string) => ui.renderWarning(message)
-    : (message: string) => console.log(message);
+    : (message: string) => console.log(formatRichTextToAnsi(message, "warning"));
 
   write(
     "Risk notice: this agent may read, run, modify, delete, or create files in the workspace. Keep backups.",
@@ -1146,6 +1154,13 @@ async function renderTurnEvents(
   events: ToolTurnEvent[],
 ): Promise<void> {
   for (const event of events) {
+    if (event.kind === "command_execution") {
+      if (!ui) {
+        renderCommandExecutionEvent(null, event);
+      }
+      continue;
+    }
+
     if (event.kind === "notice") {
       if (event.level === "error") {
         renderError(ui, event.message);
@@ -1156,7 +1171,7 @@ async function renderTurnEvents(
         if (ui) {
           ui.renderWarning(event.message);
         } else {
-          console.log(`warning: ${event.message}`);
+          console.log(formatRichTextToAnsi(`warning: ${event.message}`, "warning"));
         }
         continue;
       }
@@ -1240,6 +1255,10 @@ function applyTurnEventsToSession(
         level: event.level,
         message: event.message,
       });
+      continue;
+    }
+
+    if (event.kind === "command_execution") {
       continue;
     }
 
@@ -1572,7 +1591,7 @@ function renderInfo(ui: InteractiveRenderer | null, message: string): void {
     return;
   }
 
-  console.log(message);
+  console.log(formatRichTextToAnsi(message, "info"));
 }
 
 function renderError(ui: InteractiveRenderer | null, message: string): void {
@@ -1581,7 +1600,7 @@ function renderError(ui: InteractiveRenderer | null, message: string): void {
     return;
   }
 
-  console.error(`error: ${message}`);
+  console.error(`error: ${formatRichTextToAnsi(message, "error")}`);
 }
 
 function writeBodyLine(ui: InteractiveRenderer | null, message: string): void {
@@ -1590,7 +1609,69 @@ function writeBodyLine(ui: InteractiveRenderer | null, message: string): void {
     return;
   }
 
-  console.log(message);
+  console.log(formatRichTextToAnsi(message));
+}
+
+function renderCommandExecutionEvent(
+  ui: InteractiveRenderer | null,
+  event: Extract<ToolTurnEvent, { kind: "command_execution" }>,
+): void {
+  for (const line of buildCommandExecutionBox(event)) {
+    writeBodyLine(ui, line);
+  }
+}
+
+function buildCommandExecutionBox(
+  event: Extract<ToolTurnEvent, { kind: "command_execution" }>,
+): string[] {
+  if (event.phase === "started") {
+    return [
+      "┌ Command",
+      `│ \`${event.command}\``,
+      `│ cwd: \`${event.cwd}\``,
+      `│ category: \`${event.category}\``,
+      `└ status: **running** (${event.summary})`,
+    ];
+  }
+
+  const lines = [
+    "┌ Command Result",
+    `│ \`${event.command}\``,
+    `│ cwd: \`${event.cwd}\``,
+    `│ category: \`${event.category}\``,
+    `│ exit: \`${event.exitCode ?? "null"}\``,
+  ];
+
+  lines.push(
+    event.timedOut
+      ? "│ status: **timed out**"
+      : `│ status: **completed** (${event.summary})`,
+  );
+
+  if (event.stdout) {
+    lines.push("│ stdout:");
+    for (const line of event.stdout.split(/\r?\n/)) {
+      lines.push(`│   ${line}`);
+    }
+  }
+
+  if (event.stderr) {
+    lines.push("│ stderr:");
+    for (const line of event.stderr.split(/\r?\n/)) {
+      lines.push(`│   ${line}`);
+    }
+  }
+
+  if (!event.stdout && !event.stderr) {
+    lines.push("│ output: *(empty)*");
+  }
+
+  if (event.truncated) {
+    lines.push("│ note: output was **truncated** to fit the preview limit");
+  }
+
+  lines.push("└ done");
+  return lines;
 }
 
 function summarizePrompt(prompt: string): string {
@@ -1884,6 +1965,9 @@ function createToolExecutionContext(
     turnEvents: {
       addEvent: (event) => {
         turnEvents.push(event);
+        if (ui && event.kind === "command_execution") {
+          renderCommandExecutionEvent(ui, event);
+        }
       },
     },
   };

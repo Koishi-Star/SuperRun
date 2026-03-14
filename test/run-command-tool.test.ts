@@ -4,7 +4,7 @@ import path from "node:path";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import test from "node:test";
 import { executeAgentTool } from "../src/tools/index.js";
-import type { CommandApprovalMode } from "../src/tools/types.js";
+import type { CommandApprovalMode, ToolTurnEvent } from "../src/tools/types.js";
 
 function createCommandPolicyContext(mode: CommandApprovalMode) {
   return {
@@ -212,6 +212,46 @@ test("run_command crazy_auto allows shell redirection writes", async () => {
       ? rawFile.toString("utf16le").replace(/^\uFEFF/, "").trim()
       : rawFile.toString("utf8").trim();
     assert.equal(normalizedFile, "hello");
+  } finally {
+    process.chdir(previousCwd);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("run_command emits started and completed command execution events", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-command-tool-"));
+  const previousCwd = process.cwd();
+  const turnEvents: ToolTurnEvent[] = [];
+
+  try {
+    process.chdir(tempDir);
+
+    const result = JSON.parse(
+      await executeAgentTool(
+        {
+          id: "call_5c",
+          name: "run_command",
+          arguments: JSON.stringify({
+            command: "node -p \"'ok'\"",
+          }),
+        },
+        "default",
+        {
+          commandPolicy: createCommandPolicyContext("allow-all"),
+          turnEvents: {
+            addEvent: (event) => turnEvents.push(event),
+          },
+        },
+      ),
+    ) as {
+      ok: boolean;
+    };
+
+    assert.equal(result.ok, true);
+    assert.equal(turnEvents[0]?.kind, "command_execution");
+    assert.equal(turnEvents[0]?.phase, "started");
+    assert.equal(turnEvents[1]?.kind, "command_execution");
+    assert.equal(turnEvents[1]?.phase, "completed");
   } finally {
     process.chdir(previousCwd);
     await rm(tempDir, { recursive: true, force: true });

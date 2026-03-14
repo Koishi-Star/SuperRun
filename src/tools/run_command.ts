@@ -137,6 +137,15 @@ function executeShellCommand(
   const shell = getPlatformShellCommand(command);
 
   return new Promise((resolve, reject) => {
+    context?.turnEvents?.addEvent({
+      kind: "command_execution",
+      phase: "started",
+      command,
+      cwd: relativeCwd,
+      category: assessment.category,
+      summary: assessment.summary,
+    });
+
     const child = spawn(shell.file, shell.args, {
       cwd: absoluteCwd,
       env: process.env,
@@ -185,6 +194,19 @@ function executeShellCommand(
         timedOut,
         truncated,
       };
+      context?.turnEvents?.addEvent({
+        kind: "command_execution",
+        phase: "completed",
+        command,
+        cwd: relativeCwd,
+        category: assessment.category,
+        summary: assessment.summary,
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        timedOut: result.timedOut,
+        truncated: result.truncated,
+      });
 
       void runAfterCommandHook(context?.commandPolicy, {
         stage: "after",

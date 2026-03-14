@@ -132,12 +132,36 @@ export type WorkspaceEditReviewEvent = {
   diffPreview: WorkspaceEditDiffPreview;
 };
 
+export type CommandExecutionEvent =
+  | {
+      kind: "command_execution";
+      phase: "started";
+      command: string;
+      cwd: string;
+      category: CommandCategory;
+      summary: string;
+    }
+  | {
+      kind: "command_execution";
+      phase: "completed";
+      command: string;
+      cwd: string;
+      category: CommandCategory;
+      summary: string;
+      exitCode: number | null;
+      stdout: string;
+      stderr: string;
+      timedOut: boolean;
+      truncated: boolean;
+    };
+
 export type ToolTurnEvent =
   | {
       kind: "notice";
       level: ToolNotice["level"];
       message: string;
     }
+  | CommandExecutionEvent
   | WorkspaceEditReviewEvent;
 
 export type ToolNoticeContext = {

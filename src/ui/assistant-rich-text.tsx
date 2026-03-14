@@ -1,4 +1,5 @@
 import React from "react";
+import chalk from "chalk";
 import { Box, Text } from "ink";
 import { highlight } from "cli-highlight";
 
@@ -243,6 +244,80 @@ export function highlightAssistantCode(
   }
 }
 
+export function formatRichTextToAnsi(
+  text: string,
+  tone: RichTextTone = "default",
+): string {
+  const blocks = parseAssistantRichText(text);
+  return blocks.map((block) => formatBlockToAnsi(block, tone)).join("\n");
+}
+
+export function createAnsiRichTextStreamWriter(
+  write: (text: string) => void,
+  tone: RichTextTone = "default",
+): {
+  writeChunk: (chunk: string) => void;
+  end: () => void;
+} {
+  let pendingLine = "";
+  let inCodeBlock = false;
+  let codeLanguage: string | null = null;
+
+  const flushLine = (line: string) => {
+    const fenceMatch = line.match(/^```([\w#+.-]+)?\s*$/);
+    if (fenceMatch) {
+      if (inCodeBlock) {
+        inCodeBlock = false;
+        codeLanguage = null;
+        write(`${chalk.magentaBright("```")}\n`);
+        return;
+      }
+
+      inCodeBlock = true;
+      codeLanguage = fenceMatch[1] ?? null;
+      write(`${chalk.magentaBright(`\`\`\`${codeLanguage ?? ""}`)}\n`);
+      return;
+    }
+
+    if (inCodeBlock) {
+      const highlightedLine = highlightAssistantCode(line, codeLanguage);
+      write(`${chalk.magentaBright("│ ")}${applyToneToAnsi(highlightedLine, tone)}\n`);
+      return;
+    }
+
+    write(`${formatRichTextToAnsi(line, tone)}\n`);
+  };
+
+  return {
+    writeChunk: (chunk) => {
+      pendingLine += chunk;
+
+      while (true) {
+        const newlineIndex = pendingLine.indexOf("\n");
+        if (newlineIndex === -1) {
+          break;
+        }
+
+        const nextLine = pendingLine.slice(0, newlineIndex).replace(/\r$/, "");
+        pendingLine = pendingLine.slice(newlineIndex + 1);
+        flushLine(nextLine);
+      }
+    },
+    end: () => {
+      if (pendingLine.length > 0) {
+        flushLine(pendingLine.replace(/\r$/, ""));
+        pendingLine = "";
+      }
+
+      if (inCodeBlock) {
+        write(chalk.magentaBright("```"));
+        inCodeBlock = false;
+        codeLanguage = null;
+      }
+    },
+  };
+}
+
 function renderRichTextBlock(
   block: AssistantRichTextBlock,
   index: number,
@@ -401,4 +476,97 @@ function getHeadingColor(
   }
 
   return level <= 2 ? "cyanBright" : "white";
+}
+
+function formatBlockToAnsi(
+  block: AssistantRichTextBlock,
+  tone: RichTextTone,
+): string {
+  switch (block.kind) {
+    case "blank":
+      return "";
+    case "heading":
+      return applyToneFormatter(
+        formatInlineSegmentsToAnsi(block.segments, tone),
+        tone,
+        true,
+      );
+    case "quote":
+      return `${chalk.magentaBright("> ")}${applyToneFormatter(
+        formatInlineSegmentsToAnsi(block.segments, tone),
+        tone,
+      )}`;
+    case "list_item":
+      return `${chalk.cyan(`${block.marker} `)}${applyToneFormatter(
+        formatInlineSegmentsToAnsi(block.segments, tone),
+        tone,
+      )}`;
+    case "code_block":
+      return [
+        chalk.magentaBright(`\`\`\`${block.language ?? ""}`),
+        ...highlightAssistantCode(block.code, block.language)
+          .split("\n")
+          .map((line) => `${chalk.magentaBright("│ ")}${applyToneToAnsi(line, tone)}`),
+        chalk.magentaBright("```"),
+      ].join("\n");
+    case "paragraph":
+    default:
+      return applyToneFormatter(
+        formatInlineSegmentsToAnsi(block.segments, tone),
+        tone,
+      );
+  }
+}
+
+function formatInlineSegmentsToAnsi(
+  segments: AssistantInlineSegment[],
+  tone: RichTextTone,
+): string {
+  return segments.map((segment) => {
+    switch (segment.kind) {
+      case "bold":
+        return applyToneFormatter(segment.text, tone, true);
+      case "code":
+        return chalk.magentaBright(segment.text);
+      case "text":
+      default:
+        return applyToneFormatter(segment.text, tone);
+    }
+  }).join("");
+}
+
+function applyToneFormatter(
+  text: string,
+  tone: RichTextTone,
+  bold = false,
+): string {
+  let nextText = text;
+
+  if (tone === "info") {
+    nextText = chalk.dim(nextText);
+  } else if (tone === "warning") {
+    nextText = chalk.yellowBright(nextText);
+  } else if (tone === "error") {
+    nextText = chalk.redBright(nextText);
+  }
+
+  return bold ? chalk.bold(nextText) : nextText;
+}
+
+function applyToneToAnsi(
+  text: string,
+  tone: RichTextTone,
+): string {
+  switch (tone) {
+    case "info":
+      return chalk.dim(text);
+    case "warning":
+      return chalk.yellowBright(text);
+    case "error":
+      return chalk.redBright(text);
+    case "assistant":
+    case "default":
+    default:
+      return text;
+  }
 }
