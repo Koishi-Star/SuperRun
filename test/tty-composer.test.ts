@@ -43,3 +43,25 @@ test("composer tab-completes the selected file reference without corrupting surr
   assert.equal(state.buffer, "Open @src/cli.ts ");
   assert.equal(state.errorMessage, null);
 });
+
+test("composer submit accepts a slash-command suggestion before submitting", () => {
+  let state = createComposerState();
+  state = insertComposerText(state, "/his", workspaceFiles);
+
+  const completion = submitComposer(state, workspaceFiles);
+  assert.equal(completion.submittedText, null);
+  assert.equal(completion.state.buffer, "/history");
+  assert.equal(completion.state.errorMessage, null);
+
+  const submission = submitComposer(completion.state, workspaceFiles);
+  assert.equal(submission.submittedText, "/history");
+});
+
+test("composer tab-completes slash commands", () => {
+  let state = createComposerState();
+  state = insertComposerText(state, "/ses", workspaceFiles);
+  state = applySelectedComposerSuggestion(state, workspaceFiles);
+
+  assert.equal(state.buffer, "/session");
+  assert.equal(state.errorMessage, null);
+});

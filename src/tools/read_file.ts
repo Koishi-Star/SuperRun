@@ -47,11 +47,18 @@ export const readFileTool = {
   } satisfies ToolDefinition,
   async execute(
     rawArguments: string,
-    _context?: ToolExecutionContext,
+    context?: ToolExecutionContext,
   ): Promise<string> {
     try {
       const parsedArgs = parseReadFileArgs(rawArguments);
       const result = await readWorkspaceFile(parsedArgs);
+      context?.notices?.addNotice({
+        level: "info",
+        message:
+          result.totalLines === 0
+            ? `read_file read ${result.path}: empty file.`
+            : `read_file read ${result.path} lines ${result.startLine}-${result.endLine} of ${result.totalLines}.`,
+      });
       return JSON.stringify({
         ok: true,
         ...result,

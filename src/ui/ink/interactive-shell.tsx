@@ -1,19 +1,34 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import { AssistantRichText, RichText } from "../assistant-rich-text.js";
 import type { ComposerState } from "../composer-state.js";
+import { getDisplayWidth, truncateForTerminal } from "../terminal_format.js";
 import type {
   RendererAgentTurn,
   RendererDiffBlock,
   RendererLine,
+  RendererOverlay,
   RendererOverlayOption,
   RendererPickerOverlay,
   RendererPrompt,
   RendererToolStep,
   RendererTurnCard,
+  RendererViewerOverlay,
 } from "../interactive-renderer.js";
 
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const WORKING_SPINNER_FRAMES = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+];
 
 export type InteractiveShellProps = {
   headerLines: RendererLine[];
@@ -22,13 +37,15 @@ export type InteractiveShellProps = {
   divider: string;
   inputEnabled?: boolean;
   inputMode: "inactive" | "prompt" | "overlay" | "inline";
-  overlay: RendererPickerOverlay | null;
+  overlay: RendererOverlay | null;
   statusText: string;
   commandViewportHeight: number;
   onInput: (input: string, key: Key) => void;
 };
 
 export function InteractiveShell(props: InteractiveShellProps): React.JSX.Element {
+  const contentWidth = props.divider.length;
+
   useInput(
     (input, key) => {
       props.onInput(input, key);
@@ -39,8 +56,16 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
   return (
     <Box flexDirection="column">
       <HeaderCard lines={props.headerLines} />
-      <TurnList turns={props.turns} commandViewportHeight={props.commandViewportHeight} />
-      {props.overlay ? <OverlayPicker overlay={props.overlay} /> : null}
+      <TurnList
+        turns={props.turns}
+        commandViewportHeight={props.commandViewportHeight}
+        contentWidth={contentWidth}
+      />
+      {props.overlay
+        ? props.overlay.kind === "picker"
+          ? <OverlayPicker overlay={props.overlay} />
+          : <OverlayViewer overlay={props.overlay} />
+        : null}
       {props.inputMode === "prompt"
         ? (
             <Composer
@@ -50,7 +75,7 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
             />
           )
         : null}
-      <StatusBar text={props.statusText} />
+      <StatusBar text={props.statusText} width={props.divider.length} />
     </Box>
   );
 }
@@ -58,6 +83,7 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
 function TurnList(props: {
   turns: RendererTurnCard[];
   commandViewportHeight: number;
+  contentWidth: number;
 }): React.JSX.Element {
   return (
     <Box flexDirection="column">
@@ -70,6 +96,7 @@ function TurnList(props: {
                 turn={turn}
                 isLatest={index === props.turns.length - 1}
                 commandViewportHeight={props.commandViewportHeight}
+                contentWidth={props.contentWidth}
               />
             )
       ))}
@@ -145,11 +172,19 @@ function AgentTurn(props: {
   turn: RendererAgentTurn;
   isLatest: boolean;
   commandViewportHeight: number;
+  contentWidth: number;
 }): React.JSX.Element {
   const activeCommandStep = [...props.turn.steps].reverse().find((step) =>
     step.kind === "command" && step.status === "running"
   ) ?? null;
   const isFocused = props.isLatest || props.turn.status !== "completed";
+  const showLockedPromptStyle =
+    props.turn.status === "running_tools" || props.turn.status === "streaming_answer";
+  const workingSpinnerFrame = useSpinnerFrame({
+    enabled: showLockedPromptStyle,
+    frames: WORKING_SPINNER_FRAMES,
+    intervalMs: 90,
+  });
   const showStepDetails = isFocused;
   const showAnswer = isFocused || props.turn.answerText.length > 0;
 
@@ -162,9 +197,28 @@ function AgentTurn(props: {
       paddingX={1}
       marginLeft={isFocused ? 0 : 2}
     >
-      <Box flexDirection="row" marginBottom={1}>
-        <Text bold color={isFocused ? "cyan" : "white"} dimColor={!isFocused}>{"> "}</Text>
-        <Text dimColor={!isFocused}>{props.turn.promptText}</Text>
+      <Box
+        flexDirection="row"
+        marginBottom={1}
+        paddingX={showLockedPromptStyle ? 1 : 0}
+        backgroundColor={showLockedPromptStyle ? "blackBright" : undefined}
+      >
+        {showLockedPromptStyle ? (
+          <Text color="gray">{`${workingSpinnerFrame} `}</Text>
+        ) : null}
+        <Text
+          bold
+          color={showLockedPromptStyle ? "gray" : isFocused ? "cyan" : "white"}
+          dimColor={!showLockedPromptStyle && !isFocused}
+        >
+          {"> "}
+        </Text>
+        <Text
+          {...(showLockedPromptStyle ? { color: "white" as const } : {})}
+          dimColor={!showLockedPromptStyle && !isFocused}
+        >
+          {fitSingleLine(props.turn.promptText, Math.max(1, props.contentWidth - 6))}
+        </Text>
       </Box>
 
       {props.turn.steps.length > 0 && showStepDetails ? (
@@ -175,19 +229,21 @@ function AgentTurn(props: {
               step={step}
               isActive={activeCommandStep?.id === step.id}
               dimmed={!isFocused}
+              width={props.contentWidth}
             />
           ))}
         </Box>
       ) : null}
 
       {props.turn.steps.length > 0 && !showStepDetails ? (
-        <HistorySummary steps={props.turn.steps} />
+        <HistorySummary steps={props.turn.steps} width={props.contentWidth} />
       ) : null}
 
       {activeCommandStep ? (
         <CommandPanel
           step={activeCommandStep}
           viewportHeight={props.commandViewportHeight}
+          width={props.contentWidth}
         />
       ) : null}
 
@@ -212,10 +268,14 @@ function ToolStepSummary(props: {
   step: RendererToolStep;
   isActive: boolean;
   dimmed: boolean;
+  width: number;
 }): React.JSX.Element {
   const statusColor = getStepColor(props.step);
+  const spinnerFrame = useSpinnerFrame({
+    enabled: props.isActive,
+  });
   const marker = props.isActive
-    ? `${useSpinnerFrame()} `
+    ? `${spinnerFrame} `
     : props.step.kind === "notice"
       ? "! "
       : "- ";
@@ -224,20 +284,23 @@ function ToolStepSummary(props: {
     <Box flexDirection="row">
       <Text color={statusColor} dimColor={props.dimmed}>{marker}</Text>
       <Text color={statusColor} dimColor={props.dimmed}>
-        {`${props.step.title}  ${props.step.summary}`}
+        {fitSingleLine(`${props.step.title}  ${props.step.summary}`, Math.max(1, props.width - 2))}
       </Text>
     </Box>
   );
 }
 
-function HistorySummary(props: { steps: RendererToolStep[] }): React.JSX.Element {
+function HistorySummary(props: { steps: RendererToolStep[]; width?: number }): React.JSX.Element {
   const lastStep = props.steps[props.steps.length - 1] ?? null;
   const completedCount = props.steps.filter((step) => step.status === "completed").length;
   const failedCount = props.steps.filter((step) => step.status === "failed" || step.status === "timed_out").length;
 
   return (
     <Text dimColor>
-      {`${props.steps.length} step${props.steps.length === 1 ? "" : "s"}  completed ${completedCount}  failed ${failedCount}${lastStep ? `  last ${lastStep.title}` : ""}`}
+      {fitSingleLine(
+        `${props.steps.length} step${props.steps.length === 1 ? "" : "s"}  completed ${completedCount}  failed ${failedCount}${lastStep ? `  last ${lastStep.title}` : ""}`,
+        props.width ?? 80,
+      )}
     </Text>
   );
 }
@@ -245,8 +308,11 @@ function HistorySummary(props: { steps: RendererToolStep[] }): React.JSX.Element
 function CommandPanel(props: {
   step: RendererToolStep;
   viewportHeight: number;
+  width: number;
 }): React.JSX.Element {
-  const spinnerFrame = useSpinnerFrame();
+  const spinnerFrame = useSpinnerFrame({
+    enabled: true,
+  });
   const visibleLines = props.step.outputLines.slice(-props.viewportHeight);
 
   return (
@@ -259,9 +325,14 @@ function CommandPanel(props: {
     >
       <Box flexDirection="row">
         <Text color="cyan">{`${spinnerFrame} `}</Text>
-        <Text color="cyan">{props.step.command ?? "command"}</Text>
+        <Text color="cyan">{fitSingleLine(props.step.command ?? "command", Math.max(1, props.width - 4))}</Text>
       </Box>
-      <Text dimColor>{`cwd: ${props.step.cwd ?? "."}  category: ${props.step.category ?? "unknown"}  status: ${formatStepStatus(props.step)}`}</Text>
+      <Text dimColor>
+        {fitSingleLine(
+          `cwd: ${props.step.cwd ?? "."}  category: ${props.step.category ?? "unknown"}  status: ${formatStepStatus(props.step)}`,
+          Math.max(1, props.width - 2),
+        )}
+      </Text>
       <Box flexDirection="column" marginTop={1}>
         {visibleLines.length === 0 ? <Text dimColor>(waiting for output)</Text> : null}
         {visibleLines.map((line, index) => (
@@ -270,7 +341,7 @@ function CommandPanel(props: {
             color={line.startsWith("stderr |") ? "redBright" : "white"}
             dimColor={line.startsWith("stdout |")}
           >
-            {line}
+            {fitSingleLine(line, Math.max(1, props.width - 2))}
           </Text>
         ))}
       </Box>
@@ -364,6 +435,8 @@ function Composer(props: {
   divider: string;
   inputMode: InteractiveShellProps["inputMode"];
 }): React.JSX.Element {
+  const availableWidth = props.divider.length;
+
   return (
     <Box flexDirection="column">
       <Text dimColor>{props.divider}</Text>
@@ -371,9 +444,10 @@ function Composer(props: {
         label={props.prompt.label}
         state={props.prompt.state}
         isActive={props.inputMode === "prompt"}
+        availableWidth={availableWidth}
       />
       {props.prompt.state.errorMessage ? (
-        <Text color="redBright">{`  ${props.prompt.state.errorMessage}`}</Text>
+        <Text color="redBright">{fitSingleLine(`  ${props.prompt.state.errorMessage}`, availableWidth)}</Text>
       ) : null}
       {renderSuggestionLines(props.prompt.state).map((line, index) => (
         <Text
@@ -381,7 +455,7 @@ function Composer(props: {
           dimColor={!line.selected}
           inverse={line.selected}
         >
-          {line.text}
+          {fitSingleLine(line.text, availableWidth)}
         </Text>
       ))}
       <Text dimColor>{props.divider}</Text>
@@ -393,15 +467,11 @@ function PromptLine(props: {
   label: RendererPrompt["label"];
   state: ComposerState;
   isActive: boolean;
+  availableWidth: number;
 }): React.JSX.Element {
-  const beforeCursor = props.state.buffer.slice(0, props.state.cursorIndex);
-  const cursorCharacter = props.state.buffer.slice(
-    props.state.cursorIndex,
-    props.state.cursorIndex + 1,
-  );
-  const afterCursor = cursorCharacter
-    ? props.state.buffer.slice(props.state.cursorIndex + cursorCharacter.length)
-    : "";
+  const labelWidth = getDisplayWidth(props.label.text);
+  const contentWidth = Math.max(1, props.availableWidth - labelWidth);
+  const viewport = buildPromptViewport(props.state.buffer, props.state.cursorIndex, contentWidth);
 
   return (
     <Box flexDirection="row">
@@ -411,12 +481,12 @@ function PromptLine(props: {
       {props.isActive
         ? (
             <Text>
-              {beforeCursor}
+              {viewport.beforeCursor}
             </Text>
           )
-        : <Text dimColor>{props.state.buffer}</Text>}
-      {props.isActive ? <Text inverse>{cursorCharacter || " "}</Text> : null}
-      {props.isActive ? <Text>{afterCursor}</Text> : null}
+        : <Text dimColor>{fitSingleLine(props.state.buffer, contentWidth)}</Text>}
+      {props.isActive ? <Text inverse>{viewport.cursorCharacter}</Text> : null}
+      {props.isActive ? <Text>{viewport.afterCursor}</Text> : null}
     </Box>
   );
 }
@@ -459,8 +529,51 @@ function OverlayPicker(props: { overlay: RendererPickerOverlay }): React.JSX.Ele
   );
 }
 
-function StatusBar(props: { text: string }): React.JSX.Element {
-  return <Text dimColor>{props.text}</Text>;
+function OverlayViewer(props: { overlay: RendererViewerOverlay }): React.JSX.Element {
+  const visibleLines = props.overlay.lines.slice(
+    props.overlay.scrollOffset,
+    props.overlay.scrollOffset + props.overlay.viewportHeight,
+  );
+  const scrollEnd = Math.min(
+    props.overlay.lines.length,
+    props.overlay.scrollOffset + props.overlay.viewportHeight,
+  );
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="cyan"
+      marginTop={1}
+      paddingX={1}
+      paddingY={0}
+    >
+      <RichText text={props.overlay.title} />
+      {props.overlay.subtitle ? <RichText text={props.overlay.subtitle} tone="info" /> : null}
+      {props.overlay.lines.length === 0
+        ? <RichText text={props.overlay.emptyMessage ?? "Nothing to show."} tone="info" />
+        : (
+            <>
+              <RichText
+                text={`Showing lines ${props.overlay.scrollOffset + 1}-${scrollEnd} of ${props.overlay.lines.length}`}
+                tone="info"
+              />
+              <Box flexDirection="column" marginTop={1}>
+                {visibleLines.map((line, index) => (
+                  <ViewerLine
+                    key={`viewer-${props.overlay.scrollOffset + index}-${line.text}`}
+                    line={line}
+                  />
+                ))}
+              </Box>
+            </>
+          )}
+    </Box>
+  );
+}
+
+function StatusBar(props: { text: string; width: number }): React.JSX.Element {
+  return <Text dimColor>{fitSingleLine(props.text, props.width)}</Text>;
 }
 
 function LineBlock(props: { lines: RendererLine[] }): React.JSX.Element {
@@ -522,6 +635,22 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
   }
 }
 
+function ViewerLine(props: {
+  line: RendererViewerOverlay["lines"][number];
+}): React.JSX.Element {
+  switch (props.line.tone) {
+    case "error":
+      return <RichText text={props.line.text} tone="error" />;
+    case "warning":
+      return <RichText text={props.line.text} tone="warning" />;
+    case "info":
+      return <RichText text={props.line.text} tone="info" />;
+    case "default":
+    default:
+      return <RichText text={props.line.text} />;
+  }
+}
+
 function DiffLine(props: {
   line: RendererDiffBlock["lines"][number];
 }): React.JSX.Element {
@@ -549,40 +678,141 @@ function renderSuggestionLines(state: ComposerState): Array<{
   text: string;
   selected: boolean;
 }> {
-  if (state.activeReference === null) {
-    return [];
+  if (state.activeReference !== null) {
+    if (state.suggestions.length === 0) {
+      return [{ text: `  No files match "@${state.activeReference.query}".`, selected: false }];
+    }
+
+    return [
+      {
+        text: "  @ files - Up/Down to choose, Tab to insert",
+        selected: false,
+      },
+      ...state.suggestions.map((match, index) => ({
+        text: `${index === state.selectedSuggestionIndex ? ">" : " "} ${match}`,
+        selected: index === state.selectedSuggestionIndex,
+      })),
+    ];
   }
 
-  if (state.suggestions.length === 0) {
-    return [{ text: `  No files match "@${state.activeReference.query}".`, selected: false }];
+  if (state.activeSlashCommand !== null) {
+    if (state.suggestions.length === 0) {
+      return [{ text: `  No commands match "/${state.activeSlashCommand.query}".`, selected: false }];
+    }
+
+    return [
+      {
+        text: "  / commands - Up/Down to choose, Enter or Tab to insert",
+        selected: false,
+      },
+      ...state.suggestions.map((match, index) => ({
+        text: `${index === state.selectedSuggestionIndex ? ">" : " "} ${match}`,
+        selected: index === state.selectedSuggestionIndex,
+      })),
+    ];
   }
 
-  return [
-    {
-      text: "  @ files - Up/Down to choose, Tab to insert",
-      selected: false,
-    },
-    ...state.suggestions.map((match, index) => ({
-      text: `${index === state.selectedSuggestionIndex ? ">" : " "} ${match}`,
-      selected: index === state.selectedSuggestionIndex,
-    })),
-  ];
+  return [];
 }
 
-function useSpinnerFrame(): string {
+function useSpinnerFrame(options?: {
+  enabled?: boolean;
+  frames?: string[];
+  intervalMs?: number;
+}): string {
+  const enabled = options?.enabled ?? false;
+  const frames = useMemo(
+    () => options?.frames ?? SPINNER_FRAMES,
+    [options?.frames],
+  );
+  const intervalMs = options?.intervalMs ?? 80;
   const [frameIndex, setFrameIndex] = useState(0);
 
   useEffect(() => {
+    if (!enabled || frames.length <= 1) {
+      setFrameIndex(0);
+      return;
+    }
+
     const timer = setInterval(() => {
-      setFrameIndex((current) => (current + 1) % SPINNER_FRAMES.length);
-    }, 80);
+      setFrameIndex((current) => (current + 1) % frames.length);
+    }, intervalMs);
 
     return () => {
       clearInterval(timer);
     };
-  }, []);
+  }, [enabled, frames, intervalMs]);
 
-  return SPINNER_FRAMES[frameIndex] ?? "|";
+  return frames[frameIndex] ?? frames[0] ?? "|";
+}
+
+function fitSingleLine(text: string, width: number): string {
+  return truncateForTerminal(text.replace(/\r?\n/g, " "), Math.max(1, width));
+}
+
+function buildPromptViewport(
+  buffer: string,
+  cursorIndex: number,
+  availableWidth: number,
+): {
+  beforeCursor: string;
+  cursorCharacter: string;
+  afterCursor: string;
+} {
+  const safeCursorIndex = Math.min(Math.max(cursorIndex, 0), buffer.length);
+  const rawCursorCharacter = buffer.slice(safeCursorIndex, safeCursorIndex + 1);
+  const cursorCharacter = rawCursorCharacter || " ";
+  const cursorWidth = Math.max(1, getDisplayWidth(cursorCharacter));
+  const contentWidth = Math.max(cursorWidth, availableWidth);
+
+  let start = 0;
+  let end = buffer.length;
+
+  const buildWindow = () => {
+    const prefix = start > 0 ? "…" : "";
+    const suffix = end < buffer.length ? "…" : "";
+    return {
+      beforeCursor: `${prefix}${buffer.slice(start, safeCursorIndex)}`,
+      cursorCharacter,
+      afterCursor: `${buffer.slice(safeCursorIndex + rawCursorCharacter.length, end)}${suffix}`,
+    };
+  };
+
+  while (true) {
+    const window = buildWindow();
+    const width =
+      getDisplayWidth(window.beforeCursor) +
+      cursorWidth +
+      getDisplayWidth(window.afterCursor);
+
+    if (width <= contentWidth) {
+      return window;
+    }
+
+    const removableLeft = safeCursorIndex - start;
+    const removableRight = end - (safeCursorIndex + rawCursorCharacter.length);
+
+    if (removableRight > removableLeft && removableRight > 0) {
+      end -= 1;
+      continue;
+    }
+
+    if (removableLeft > 0) {
+      start += 1;
+      continue;
+    }
+
+    if (removableRight > 0) {
+      end -= 1;
+      continue;
+    }
+
+    return {
+      beforeCursor: "",
+      cursorCharacter,
+      afterCursor: "",
+    };
+  }
 }
 
 function getTurnBorderColor(

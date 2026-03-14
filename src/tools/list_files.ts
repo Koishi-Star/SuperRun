@@ -50,11 +50,15 @@ export const listFilesTool = {
   } satisfies ToolDefinition,
   async execute(
     rawArguments: string,
-    _context?: ToolExecutionContext,
+    context?: ToolExecutionContext,
   ): Promise<string> {
     try {
       const parsedArgs = parseListFilesArgs(rawArguments);
       const result = await listWorkspaceFiles(parsedArgs);
+      context?.notices?.addNotice({
+        level: "info",
+        message: `list_files found ${result.entries.length} entr${result.entries.length === 1 ? "y" : "ies"} under ${result.path}.`,
+      });
       return JSON.stringify({
         ok: true,
         ...result,

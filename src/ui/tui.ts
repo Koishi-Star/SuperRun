@@ -21,7 +21,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.bold.hex("#ff6b35")("SuperRun")}\n`);
       output.write(`${chalk.dim("Local coding agent interactive mode")}\n`);
       output.write(
-        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/mode")} ${chalk.cyan("/approvals")} ${chalk.cyan("/history")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/editor")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
+        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/mode")} ${chalk.cyan("/approvals")} ${chalk.cyan("/duration")} ${chalk.cyan("/history")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/editor")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
       );
     },
     renderCommands: () => {
@@ -29,6 +29,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.cyan("/help")}  Show command help\n`);
       output.write(`${chalk.cyan("/mode")}     Show or switch the active tool mode (default|strict)\n`);
       output.write(`${chalk.cyan("/approvals")} Show or switch the command approval mode (ask|allow-all|crazy_auto|reject)\n`);
+      output.write(`${chalk.cyan("/duration")} Show or switch the minimum command panel duration in seconds\n`);
       output.write(`${chalk.cyan("/settings")} Show the active system prompt and persistence path\n`);
       output.write(`${chalk.cyan("/session")}  Show current session status\n`);
       output.write(`${chalk.cyan("/history")}  Show the current or selected session transcript\n`);
@@ -56,7 +57,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.bold.red("error:")} ${message}\n`);
     },
     renderWarning: (message: string) => {
-      output.write(`${chalk.bold.hex("#ffb703")(message)}\n`);
+      output.write(`${chalk.bold.hex("#ff8c42")(message)}\n`);
     },
     clearScreen: () => {
       output.write("\x1Bc");

@@ -67,6 +67,7 @@ import {
   type InteractiveRenderer,
   type RendererPickerOption,
   type RendererLine,
+  type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
 import { buildModePickerChoices } from "./ui/mode-picker.js";
 import { buildSessionPickerChoices } from "./ui/session-picker.js";
@@ -127,6 +128,7 @@ program
           workspaceFiles: null,
           sessionEvents: [],
           deleteAreaStatus: await getWorkspaceDeleteAreaStatus(),
+          minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         });
         return;
       }
@@ -160,11 +162,15 @@ type InteractiveState = {
     fileCount: number;
     totalBytes: number;
   };
+  minCommandPanelDurationMs: number;
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
 };
 
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
+const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
+const MIN_ALLOWED_COMMAND_PANEL_DURATION_MS = 100;
+const MAX_ALLOWED_COMMAND_PANEL_DURATION_MS = 10_000;
 
 async function createInteractiveState(
   settings: SuperRunSettings,
@@ -191,6 +197,7 @@ async function createInteractiveState(
         workspaceFiles: null,
         sessionEvents: [...storedSession.events],
         deleteAreaStatus,
+        minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         commandApprovalMode: approvalMode,
         commandHookRunner,
       };
@@ -209,6 +216,7 @@ async function createInteractiveState(
     workspaceFiles: null,
     sessionEvents: [],
     deleteAreaStatus,
+    minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
     commandApprovalMode: approvalMode,
     commandHookRunner,
   };
@@ -246,7 +254,11 @@ async function runInteractiveSession(
   session: AgentSession,
   state: InteractiveState,
 ): Promise<void> {
-  const ui = createInteractiveRenderer({ input, output });
+  const ui = createInteractiveRenderer({
+    input,
+    output,
+    minCommandPanelDurationMs: state.minCommandPanelDurationMs,
+  });
   renderInteractiveShell(ui, session, state);
 
   try {
@@ -311,7 +323,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -379,8 +391,32 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  if (matchesCommand(prompt, "/duration")) {
+    const requestedDuration = parseCommandArgument(prompt, "/duration");
+    if (!requestedDuration) {
+      renderCommandPanelDurationSummary(ui, state.minCommandPanelDurationMs);
+      return true;
+    }
+
+    try {
+      const nextDurationMs = parseCommandPanelDuration(requestedDuration);
+      state.minCommandPanelDurationMs = nextDurationMs;
+      ui?.setMinimumCommandPanelDurationMs(nextDurationMs);
+      if (ui) {
+        ui.setShellFrame(buildInteractiveShellFrame(session, state));
+      }
+      renderCommandPanelDurationApplied(ui, nextDurationMs);
+    } catch (error) {
+      renderError(
+        ui,
+        error instanceof Error ? error.message : "Failed to change command panel duration.",
+      );
+    }
+    return true;
+  }
+
   if (prompt === "/settings") {
-    renderSettingsSummary(ui, session, state.settings);
+    renderSettingsSummary(ui, session, state.settings, state);
     renderApprovalSummary(ui, state.commandApprovalMode);
     return true;
   }
@@ -394,7 +430,7 @@ async function handleInteractivePrompt(
     const sessionSelector = parseCommandArgument(prompt, "/history");
     try {
       if (!sessionSelector) {
-        renderHistory(ui, {
+        await renderHistory(ui, {
           label: formatSessionLabel(state.currentSessionTitle, state.currentSessionId),
           history: session.history,
           events: state.sessionEvents,
@@ -405,7 +441,7 @@ async function handleInteractivePrompt(
 
       const targetSession = resolveSessionSelector(sessionSelector, state);
       const storedSession = await loadSession(targetSession.id);
-      renderHistory(ui, {
+      await renderHistory(ui, {
         label: formatSessionLabel(storedSession.title, storedSession.id),
         history: storedSession.history,
         events: storedSession.events,
@@ -848,7 +884,7 @@ function buildInteractiveShellFrame(
     },
     {
       kind: "info",
-      text: `history ${stats.historyTurnCount}/${stats.maxHistoryTurns}  saved ${state.sessionStore.sessions.length}`,
+      text: `history ${stats.historyTurnCount}/${stats.maxHistoryTurns}  saved ${state.sessionStore.sessions.length}  duration ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s`,
     },
   ];
 
@@ -869,7 +905,7 @@ function buildInteractiveShellFrame(
 
   lines.push({
     kind: "body",
-    text: "commands /help /sessions /new [title] /mode /approvals /system /clear /exit",
+    text: "commands /help /sessions /new [title] /mode /approvals /duration /system /clear /exit",
   });
 
   return lines;
@@ -1085,6 +1121,7 @@ function renderSettingsSummary(
   ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: SuperRunSettings,
+  state: Pick<InteractiveState, "minCommandPanelDurationMs">,
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
@@ -1105,6 +1142,10 @@ function renderSettingsSummary(
   renderInfo(
     ui,
     `Current history: ${stats.historyTurnCount} turns, ${stats.historyMessageCount} messages, ${stats.historyCharCount} chars.`,
+  );
+  renderInfo(
+    ui,
+    `Minimum command panel duration: ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s.`,
   );
   renderInfo(ui, `System prompt size: ${stats.systemPromptCharCount} chars.`);
   renderInfo(ui, "This text defines how the agent should behave on every turn.");
@@ -1289,6 +1330,62 @@ function renderApprovalSummary(
   renderInfo(ui, `Approvals: ${getCommandApprovalSummary(mode)}.`);
 }
 
+function renderCommandPanelDurationSummary(
+  ui: InteractiveRenderer | null,
+  durationMs: number,
+): void {
+  renderInfo(
+    ui,
+    `Minimum command panel duration: ${formatCommandPanelDurationSeconds(durationMs)}s.`,
+  );
+  renderInfo(
+    ui,
+    `Use "/duration <seconds>" to change it. Very short durations can trigger photosensitive epilepsy.`,
+  );
+}
+
+function renderCommandPanelDurationApplied(
+  ui: InteractiveRenderer | null,
+  durationMs: number,
+): void {
+  renderInfo(
+    ui,
+    `Minimum command panel duration set to ${formatCommandPanelDurationSeconds(durationMs)}s.`,
+  );
+
+  if (durationMs < 1_000) {
+    renderWarning(
+      ui,
+      "Warning: very short command panel durations can trigger photosensitive epilepsy.",
+    );
+  }
+}
+
+function parseCommandPanelDuration(value: string): number {
+  const normalized = value.trim().toLowerCase().replace(/s$/, "");
+  const seconds = Number(normalized);
+
+  if (!Number.isFinite(seconds)) {
+    throw new Error('Invalid duration. Use seconds, for example "/duration 1.5".');
+  }
+
+  const durationMs = Math.round(seconds * 1_000);
+  if (
+    durationMs < MIN_ALLOWED_COMMAND_PANEL_DURATION_MS ||
+    durationMs > MAX_ALLOWED_COMMAND_PANEL_DURATION_MS
+  ) {
+    throw new Error(
+      `Duration must stay between ${formatCommandPanelDurationSeconds(MIN_ALLOWED_COMMAND_PANEL_DURATION_MS)}s and ${formatCommandPanelDurationSeconds(MAX_ALLOWED_COMMAND_PANEL_DURATION_MS)}s.`,
+    );
+  }
+
+  return durationMs;
+}
+
+function formatCommandPanelDurationSeconds(durationMs: number): string {
+  return (durationMs / 1_000).toFixed(durationMs % 1_000 === 0 ? 0 : 1);
+}
+
 function renderCurrentSessionSummary(
   ui: InteractiveRenderer | null,
   session: AgentSession,
@@ -1311,6 +1408,10 @@ function renderCurrentSessionSummary(
   );
   renderInfo(ui, `Mode: ${getAgentModeSummary(session.mode)}.`);
   renderInfo(ui, `Approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`);
+  renderInfo(
+    ui,
+    `Minimum command panel duration: ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s.`,
+  );
   renderInfo(
     ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
@@ -1373,7 +1474,7 @@ function renderSessionList(
   }
 }
 
-function renderHistory(
+async function renderHistory(
   ui: InteractiveRenderer | null,
   options: {
     label: string;
@@ -1381,12 +1482,19 @@ function renderHistory(
     events: SessionEvent[];
     current: boolean;
   },
-): void {
+): Promise<void> {
   if (ui) {
-    ui.renderSectionTitle("History");
-  } else {
-    console.log("History");
+    await ui.viewText({
+      title: "History",
+      subtitle: options.label,
+      helpText: "Up/Down scroll  PgUp/PgDn page  q close  Esc close",
+      emptyMessage: "No messages yet.",
+      lines: buildHistoryViewerLines(options),
+    });
+    return;
   }
+
+  console.log("History");
 
   renderInfo(ui, `Session: ${options.label}`);
   renderInfo(ui, `Messages: ${options.history.length}`);
@@ -1425,6 +1533,74 @@ function renderHistory(
       writeBodyLine(ui, `${index + 1}. ${formatSessionEvent(event)}`);
     }
   }
+}
+
+function buildHistoryViewerLines(options: {
+  label: string;
+  history: AgentSession["history"];
+  events: SessionEvent[];
+  current: boolean;
+}): RendererViewerLine[] {
+  const lines: RendererViewerLine[] = [
+    { text: `Session: ${options.label}`, tone: "info" },
+    {
+      text: `Messages: ${options.history.length}  Events: ${options.events.length}${options.current ? "  Viewing current conversation." : ""}`,
+      tone: "info",
+    },
+  ];
+
+  if (options.events.length > 0) {
+    lines.push({ text: "" });
+    lines.push({ text: "Recent Activity", tone: "info" });
+
+    for (const [index, event] of options.events.entries()) {
+      const tone = getEventViewerTone(event);
+      lines.push({
+        text: `${index + 1}. ${formatSessionEvent(event)}`,
+        ...(tone ? { tone } : {}),
+      });
+    }
+  }
+
+  if (options.history.length > 0) {
+    lines.push({ text: "" });
+    lines.push({ text: "Transcript", tone: "info" });
+
+    for (const [index, message] of options.history.entries()) {
+      const speaker = message.role === "user" ? "You" : "Assistant";
+      lines.push({
+        text: `${index + 1}. ${speaker}`,
+        tone: message.role === "user" ? "info" : "default",
+      });
+
+      const contentLines = message.content.split(/\r?\n/);
+      for (const line of contentLines) {
+        lines.push({ text: `   ${line}` });
+      }
+
+      if (index < options.history.length - 1) {
+        lines.push({ text: "" });
+      }
+    }
+  }
+
+  return lines;
+}
+
+function getEventViewerTone(
+  event: SessionEvent,
+): RendererViewerLine["tone"] {
+  if (event.kind === "tool_notice") {
+    if (event.level === "error") {
+      return "error";
+    }
+
+    if (event.level === "warning") {
+      return "warning";
+    }
+  }
+
+  return "info";
 }
 
 function renderSystemPromptTips(
@@ -1590,6 +1766,15 @@ function renderError(ui: InteractiveRenderer | null, message: string): void {
   }
 
   console.error(`error: ${formatRichTextToAnsi(message, "error")}`);
+}
+
+function renderWarning(ui: InteractiveRenderer | null, message: string): void {
+  if (ui) {
+    ui.renderWarning(message);
+    return;
+  }
+
+  console.log(formatRichTextToAnsi(message, "warning"));
 }
 
 function writeBodyLine(ui: InteractiveRenderer | null, message: string): void {

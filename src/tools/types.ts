@@ -22,6 +22,7 @@ export type CommandAssessment = {
   category: CommandCategory;
   summary: string;
   reasons: string[];
+  triggerCommand?: string;
   modeActions: {
     ask: CommandAuthorizationAction;
     allowAll: CommandAuthorizationAction;

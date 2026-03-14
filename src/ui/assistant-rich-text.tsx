@@ -52,6 +52,8 @@ export type RichTextTone =
   | "warning"
   | "error";
 
+const WARNING_COLOR = "#ff8c42";
+
 export function RichText(props: {
   text: string;
   tone?: RichTextTone;
@@ -449,10 +451,10 @@ function CodeBlock(props: {
   );
 }
 
-function getBaseColor(tone: RichTextTone): "white" | "yellowBright" | "redBright" {
+function getBaseColor(tone: RichTextTone): string {
   switch (tone) {
     case "warning":
-      return "yellowBright";
+      return WARNING_COLOR;
     case "error":
       return "redBright";
     case "assistant":
@@ -466,9 +468,9 @@ function getBaseColor(tone: RichTextTone): "white" | "yellowBright" | "redBright
 function getHeadingColor(
   level: number,
   tone: RichTextTone,
-): "cyanBright" | "yellowBright" | "redBright" | "white" {
+): string {
   if (tone === "warning") {
-    return "yellowBright";
+    return WARNING_COLOR;
   }
 
   if (tone === "error") {
@@ -545,7 +547,7 @@ function applyToneFormatter(
   if (tone === "info") {
     nextText = chalk.dim(nextText);
   } else if (tone === "warning") {
-    nextText = chalk.yellowBright(nextText);
+    nextText = chalk.hex(WARNING_COLOR)(nextText);
   } else if (tone === "error") {
     nextText = chalk.redBright(nextText);
   }
@@ -561,7 +563,7 @@ function applyToneToAnsi(
     case "info":
       return chalk.dim(text);
     case "warning":
-      return chalk.yellowBright(text);
+      return chalk.hex(WARNING_COLOR)(text);
     case "error":
       return chalk.redBright(text);
     case "assistant":

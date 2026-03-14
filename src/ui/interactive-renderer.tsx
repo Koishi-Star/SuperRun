@@ -60,6 +60,11 @@ export type RendererOverlayOption = {
   tone: "default" | "accent" | "danger";
 };
 
+export type RendererViewerLine = {
+  text: string;
+  tone?: "default" | "info" | "warning" | "error";
+};
+
 export type RendererPickerOverlay = {
   kind: "picker";
   title: string;
@@ -69,6 +74,19 @@ export type RendererPickerOverlay = {
   options: RendererOverlayOption[];
   selectedIndex: number;
 };
+
+export type RendererViewerOverlay = {
+  kind: "viewer";
+  title: string;
+  subtitle: string | null;
+  helpText: string | null;
+  emptyMessage: string | null;
+  lines: RendererViewerLine[];
+  scrollOffset: number;
+  viewportHeight: number;
+};
+
+export type RendererOverlay = RendererPickerOverlay | RendererViewerOverlay;
 
 export type RendererInlineApprovalOption = {
   value: CommandApprovalDecision;
@@ -119,6 +137,14 @@ export type RendererApprovalOptions = {
   options: RendererInlineApprovalOption[];
 };
 
+export type RendererViewerOptions = {
+  title: string;
+  subtitle?: string;
+  helpText?: string;
+  emptyMessage?: string;
+  lines: RendererViewerLine[];
+};
+
 export type RendererToolStep = {
   id: string;
   kind: "command" | "workspace_edit" | "notice";
@@ -135,6 +161,7 @@ export type RendererToolStep = {
   exitCode: number | null;
   timedOut: boolean;
   stream: "stdout" | "stderr" | null;
+  startedAtMs: number | null;
 };
 
 export type RendererAgentTurn = {
@@ -164,6 +191,7 @@ export type RendererTurnCard = RendererAgentTurn | RendererSystemTurn;
 export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
+  setMinimumCommandPanelDurationMs: (durationMs: number) => void;
   setShellFrame: (lines: Array<Omit<RendererLine, "id">>) => void;
   renderCommands: () => void;
   renderSectionTitle: (title: string) => void;
@@ -182,6 +210,7 @@ export type InteractiveRenderer = {
     workspaceFiles: string[];
   }) => Promise<string>;
   selectOption: (options: RendererSelectOptions) => Promise<string | null>;
+  viewText: (options: RendererViewerOptions) => Promise<void>;
   requestApproval: (options: RendererApprovalOptions) => Promise<CommandApprovalDecision>;
   reviewDiff: (options: RendererDiffApprovalOptions) => Promise<CommandApprovalDecision>;
   viewDiff: (options: RendererDiffApprovalOptions) => Promise<void>;
@@ -202,7 +231,7 @@ type RendererState = {
   turns: RendererTurnCard[];
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
-  overlay: RendererPickerOverlay | null;
+  overlay: RendererOverlay | null;
 };
 
 export type InteractiveRendererSnapshot = {
@@ -211,16 +240,20 @@ export type InteractiveRendererSnapshot = {
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
   inputActive: boolean;
-  overlay: RendererPickerOverlay | null;
+  overlay: RendererOverlay | null;
   statusText: string;
 };
 
 const MAX_COMMAND_OUTPUT_LINES = 200;
+const ASSISTANT_ANIMATION_CHUNK_SIZE = 8;
+const ASSISTANT_ANIMATION_INTERVAL_MS = 16;
+const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
 
 export function createInteractiveRenderer(options: {
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
   enableInput?: boolean;
+  minCommandPanelDurationMs?: number;
 }): InteractiveRenderer {
   const promptLabel = "> ";
   const editorPromptLabel = "system > ";
@@ -232,7 +265,16 @@ export function createInteractiveRenderer(options: {
   let inlineApprovalResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffReviewResolver: (() => void) | null = null;
+  let assistantAnimationTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingAssistantChunks: string[] = [];
+  let pendingTurnStatus: RendererAgentTurn["status"] | null = null;
+  let assistantFlushResolvers: Array<() => void> = [];
+  let minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(
+    options.minCommandPanelDurationMs,
+  );
+  const pendingCommandCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let instance: Instance | null = null;
+  const shouldAnimateAssistantText = options.enableInput ?? true;
   let state: RendererState = {
     headerLines: [],
     turns: [],
@@ -355,6 +397,35 @@ export function createInteractiveRenderer(options: {
     return turn?.kind === "agent" ? turn : null;
   };
 
+  const finalizeCommandStepById = (
+    stepId: string,
+    event: Extract<ToolTurnEvent, { kind: "command_execution"; phase: "completed" }>,
+  ) => {
+    pendingCommandCompletionTimers.delete(stepId);
+    const updated = updateLatestAgentTurn((turn) => {
+      const targetIndex = turn.steps.findIndex((step) => step.id === stepId);
+      if (targetIndex === -1) {
+        return turn;
+      }
+
+      const nextSteps = [...turn.steps];
+      const targetStep = nextSteps[targetIndex];
+      if (!targetStep || targetStep.kind !== "command") {
+        return turn;
+      }
+
+      nextSteps[targetIndex] = finalizeCommandStep(targetStep, event);
+      return {
+        ...turn,
+        steps: nextSteps,
+      };
+    });
+
+    if (updated) {
+      rerender();
+    }
+  };
+
   const setLatestAgentInlineBlock = (
     block: RendererInlineBlock | null,
     status?: RendererAgentTurn["status"],
@@ -367,6 +438,100 @@ export function createInteractiveRenderer(options: {
     if (updated) {
       rerender();
     }
+  };
+
+  const resolveAssistantFlushWaiters = () => {
+    if (pendingAssistantChunks.length > 0 || assistantAnimationTimer) {
+      return;
+    }
+
+    const resolvers = assistantFlushResolvers;
+    assistantFlushResolvers = [];
+    for (const resolver of resolvers) {
+      resolver();
+    }
+  };
+
+  const finishPendingTurnStatusIfReady = () => {
+    if (pendingAssistantChunks.length > 0 || assistantAnimationTimer || !pendingTurnStatus) {
+      resolveAssistantFlushWaiters();
+      return;
+    }
+
+    const status = pendingTurnStatus;
+    pendingTurnStatus = null;
+    const updated = updateLatestAgentTurn((turn) => ({
+      ...turn,
+      status: turn.status === "failed" ? "failed" : status,
+    }));
+    if (updated) {
+      rerender();
+    }
+    resolveAssistantFlushWaiters();
+  };
+
+  const flushNextAssistantChunk = () => {
+    assistantAnimationTimer = null;
+
+    const nextChunk = pendingAssistantChunks.shift() ?? null;
+    if (nextChunk === null) {
+      finishPendingTurnStatusIfReady();
+      return;
+    }
+
+    const updated = updateLatestAgentTurn((turn) => ({
+      ...turn,
+      status: "streaming_answer",
+      answerText: `${turn.answerText}${nextChunk}`,
+    }));
+    if (updated) {
+      rerender();
+    }
+
+    if (pendingAssistantChunks.length > 0) {
+      assistantAnimationTimer = setTimeout(
+        flushNextAssistantChunk,
+        ASSISTANT_ANIMATION_INTERVAL_MS,
+      );
+      return;
+    }
+
+    finishPendingTurnStatusIfReady();
+  };
+
+  const ensureAssistantAnimation = () => {
+    if (assistantAnimationTimer || pendingAssistantChunks.length === 0) {
+      if (pendingAssistantChunks.length === 0) {
+        finishPendingTurnStatusIfReady();
+      }
+      return;
+    }
+
+    assistantAnimationTimer = setTimeout(
+      flushNextAssistantChunk,
+      ASSISTANT_ANIMATION_INTERVAL_MS,
+    );
+  };
+
+  const appendAssistantTextImmediately = (chunk: string) => {
+    const updated = updateLatestAgentTurn((turn) => ({
+      ...turn,
+      status: "streaming_answer",
+      answerText: `${turn.answerText}${chunk}`,
+    }));
+    if (updated) {
+      rerender();
+    }
+  };
+
+  const waitForAssistantFlush = (): Promise<void> | null => {
+    if (!shouldAnimateAssistantText || (pendingAssistantChunks.length === 0 && !assistantAnimationTimer)) {
+      return null;
+    }
+
+    return new Promise<void>((resolve) => {
+      assistantFlushResolvers.push(resolve);
+    });
   };
 
   const resolvePrompt = (value: string) => {
@@ -432,6 +597,9 @@ export function createInteractiveRenderer(options: {
   const renderer: InteractiveRenderer = {
     promptLabel,
     editorPromptLabel,
+    setMinimumCommandPanelDurationMs: (durationMs) => {
+      minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(durationMs);
+    },
     setShellFrame: (lines) => {
       state = {
         ...state,
@@ -447,6 +615,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/help  Show command help");
       renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict)");
       renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
+      renderer.writeBodyLine("/duration Show or switch the minimum command panel duration in seconds");
       renderer.writeBodyLine("/settings Show the active system prompt and persistence path");
       renderer.writeBodyLine("/session  Show current session status");
       renderer.writeBodyLine("/history  Show the current or selected session transcript and events");
@@ -497,16 +666,20 @@ export function createInteractiveRenderer(options: {
       rerender();
     },
     appendAssistantChunk: (chunk) => {
-      const updated = updateLatestAgentTurn((turn) => ({
-        ...turn,
-        status: "streaming_answer",
-        answerText: `${turn.answerText}${chunk}`,
-      }));
-      if (updated) {
-        rerender();
+      if (!shouldAnimateAssistantText) {
+        appendAssistantTextImmediately(chunk);
+        return;
       }
+
+      pendingAssistantChunks.push(...splitAssistantChunkForAnimation(chunk));
+      ensureAssistantAnimation();
     },
     completeActiveTurn: () => {
+      if (shouldAnimateAssistantText && (pendingAssistantChunks.length > 0 || assistantAnimationTimer)) {
+        pendingTurnStatus = "completed";
+        return;
+      }
+
       const updated = updateLatestAgentTurn((turn) => ({
         ...turn,
         status: turn.status === "failed" ? "failed" : "completed",
@@ -529,7 +702,24 @@ export function createInteractiveRenderer(options: {
       renderer.renderError(message);
     },
     applyToolEvent: (event) => {
-      const updated = updateLatestAgentTurn((turn) => applyToolEventToTurn(turn, event));
+      const updated = updateLatestAgentTurn((turn) =>
+        applyToolEventToTurn(turn, event, {
+          minCommandPanelDurationMs,
+          scheduleCommandCompletion: (stepId, completedEvent, remainingMs) => {
+            const existingTimer = pendingCommandCompletionTimers.get(stepId);
+            if (existingTimer) {
+              clearTimeout(existingTimer);
+            }
+
+            pendingCommandCompletionTimers.set(
+              stepId,
+              setTimeout(() => {
+                finalizeCommandStepById(stepId, completedEvent);
+              }, remainingMs),
+            );
+          },
+        }),
+      );
       if (updated) {
         rerender();
       }
@@ -547,6 +737,10 @@ export function createInteractiveRenderer(options: {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
       options.input.resume?.();
       promptWorkspaceFiles = workspaceFiles;
       state = {
@@ -572,6 +766,10 @@ export function createInteractiveRenderer(options: {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
       const overlayOptions = selection.options.map((option) => ({
         ...option,
         tone: option.tone ?? "default",
@@ -597,11 +795,44 @@ export function createInteractiveRenderer(options: {
         overlayResolver = resolve;
       });
     },
+    viewText: async (viewer) => {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
+      state = {
+        ...state,
+        inputMode: "overlay",
+        overlay: {
+          kind: "viewer",
+          title: viewer.title,
+          subtitle: viewer.subtitle ?? null,
+          helpText: viewer.helpText ?? "Up/Down scroll  PgUp/PgDn page  q close  Esc close",
+          emptyMessage: viewer.emptyMessage ?? null,
+          lines: viewer.lines,
+          scrollOffset: 0,
+          viewportHeight: getViewerViewportHeight(options.output),
+        },
+      };
+      rerender();
+
+      return new Promise<void>((resolve) => {
+        overlayResolver = () => resolve();
+      });
+    },
     requestApproval: async (approval) => {
       if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
       const onceIndex = approval.options.findIndex((option) => option.value === "once");
       setLatestAgentInlineBlock({
         kind: "approval",
@@ -626,6 +857,10 @@ export function createInteractiveRenderer(options: {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
       setLatestAgentInlineBlock({
         kind: "diff",
         mode: "approval",
@@ -654,6 +889,10 @@ export function createInteractiveRenderer(options: {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const flushPromise = waitForAssistantFlush();
+      if (flushPromise) {
+        await flushPromise;
+      }
       setLatestAgentInlineBlock({
         kind: "diff",
         mode: "review",
@@ -686,12 +925,7 @@ export function createInteractiveRenderer(options: {
       },
       inputMode: state.inputMode,
       inputActive: state.inputMode !== "inactive",
-      overlay: state.overlay
-        ? {
-            ...state.overlay,
-            options: [...state.overlay.options],
-          }
-        : null,
+      overlay: cloneRendererOverlay(state.overlay),
       statusText: buildStatusText(state),
     }),
     dispatchInput: (inputValue, key) => {
@@ -710,6 +944,14 @@ export function createInteractiveRenderer(options: {
       mount();
     },
     dispose: () => {
+      for (const timer of pendingCommandCompletionTimers.values()) {
+        clearTimeout(timer);
+      }
+      pendingCommandCompletionTimers.clear();
+      if (assistantAnimationTimer) {
+        clearTimeout(assistantAnimationTimer);
+        assistantAnimationTimer = null;
+      }
       if (!instance) {
         return;
       }
@@ -750,6 +992,71 @@ export function createInteractiveRenderer(options: {
   const handleOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
     if (!event || !state.overlay || !overlayResolver) {
       return;
+    }
+
+    if (state.overlay.kind === "viewer") {
+      if (
+        event.type === "interrupt" ||
+        event.type === "cancel" ||
+        event.type === "submit" ||
+        (event.type === "insert_text" && event.text.trim().toLowerCase() === "q")
+      ) {
+        resolveOverlay(null);
+        return;
+      }
+
+      switch (event.type) {
+        case "move_up":
+          state = {
+            ...state,
+            overlay: moveViewerScroll(state.overlay, -1),
+          };
+          rerender();
+          return;
+        case "move_down":
+          state = {
+            ...state,
+            overlay: moveViewerScroll(state.overlay, 1),
+          };
+          rerender();
+          return;
+        case "move_page_up":
+          state = {
+            ...state,
+            overlay: moveViewerScroll(state.overlay, -state.overlay.viewportHeight),
+          };
+          rerender();
+          return;
+        case "move_page_down":
+          state = {
+            ...state,
+            overlay: moveViewerScroll(state.overlay, state.overlay.viewportHeight),
+          };
+          rerender();
+          return;
+        case "move_home":
+          state = {
+            ...state,
+            overlay: {
+              ...state.overlay,
+              scrollOffset: 0,
+            },
+          };
+          rerender();
+          return;
+        case "move_end":
+          state = {
+            ...state,
+            overlay: {
+              ...state.overlay,
+              scrollOffset: Math.max(0, state.overlay.lines.length - state.overlay.viewportHeight),
+            },
+          };
+          rerender();
+          return;
+        default:
+          return;
+      }
     }
 
     if (event.type === "interrupt" || event.type === "cancel") {
@@ -1014,6 +1321,14 @@ export function createInteractiveRenderer(options: {
 function applyToolEventToTurn(
   turn: RendererAgentTurn,
   event: ToolTurnEvent,
+  options?: {
+    minCommandPanelDurationMs: number;
+    scheduleCommandCompletion: (
+      stepId: string,
+      event: Extract<ToolTurnEvent, { kind: "command_execution"; phase: "completed" }>,
+      remainingMs: number,
+    ) => void;
+  },
 ): RendererAgentTurn {
   if (event.kind === "notice") {
     return {
@@ -1036,6 +1351,7 @@ function applyToolEventToTurn(
           exitCode: null,
           timedOut: false,
           stream: null,
+          startedAtMs: null,
         },
       ],
     };
@@ -1062,6 +1378,7 @@ function applyToolEventToTurn(
           exitCode: null,
           timedOut: false,
           stream: null,
+          startedAtMs: null,
         },
       ],
     };
@@ -1089,6 +1406,7 @@ function applyToolEventToTurn(
           exitCode: null,
           timedOut: false,
           stream: null,
+          startedAtMs: Date.now(),
         },
       ],
     };
@@ -1115,6 +1433,17 @@ function applyToolEventToTurn(
       ...turn,
       steps: nextSteps,
     };
+  }
+
+  const elapsedMs =
+    targetStep.startedAtMs === null
+      ? options?.minCommandPanelDurationMs ?? 0
+      : Date.now() - targetStep.startedAtMs;
+  const remainingMs = (options?.minCommandPanelDurationMs ?? 0) - elapsedMs;
+
+  if (remainingMs > 0) {
+    options?.scheduleCommandCompletion(targetStep.id, event, remainingMs);
+    return turn;
   }
 
   nextSteps[activeCommandIndex] = finalizeCommandStep(targetStep, event);
@@ -1180,6 +1509,7 @@ function finalizeCommandStep(
     outputTruncated: step.outputTruncated || event.truncated,
     exitCode: event.exitCode,
     timedOut: event.timedOut,
+    startedAtMs: step.startedAtMs,
   };
 }
 
@@ -1192,6 +1522,48 @@ function truncateOutputLines(lines: string[]): { lines: string[]; truncated: boo
     lines: lines.slice(lines.length - MAX_COMMAND_OUTPUT_LINES),
     truncated: true,
   };
+}
+
+function splitAssistantChunkForAnimation(chunk: string): string[] {
+  if (chunk.length <= ASSISTANT_ANIMATION_CHUNK_SIZE) {
+    return [chunk];
+  }
+
+  const segments: string[] = [];
+  let current = "";
+
+  for (const character of chunk) {
+    if (character === "\n") {
+      if (current) {
+        segments.push(current);
+        current = "";
+      }
+      segments.push(character);
+      continue;
+    }
+
+    current += character;
+    if (current.length >= ASSISTANT_ANIMATION_CHUNK_SIZE) {
+      segments.push(current);
+      current = "";
+    }
+  }
+
+  if (current) {
+    segments.push(current);
+  }
+
+  return segments;
+}
+
+function normalizeMinimumCommandPanelDurationMs(
+  value: number | undefined,
+): number {
+  if (value === undefined || Number.isNaN(value)) {
+    return DEFAULT_MIN_COMMAND_PANEL_DURATION_MS;
+  }
+
+  return Math.max(0, Math.round(value));
 }
 
 function cloneRendererLine(line: RendererLine): RendererLine {
@@ -1226,6 +1598,26 @@ function cloneRendererTurn(turn: RendererTurnCard): RendererTurnCard {
   };
 }
 
+function cloneRendererOverlay(
+  overlay: RendererOverlay | null,
+): RendererOverlay | null {
+  if (!overlay) {
+    return null;
+  }
+
+  if (overlay.kind === "picker") {
+    return {
+      ...overlay,
+      options: [...overlay.options],
+    };
+  }
+
+  return {
+    ...overlay,
+    lines: [...overlay.lines],
+  };
+}
+
 function moveOverlaySelection(
   overlay: RendererPickerOverlay,
   delta: number,
@@ -1237,6 +1629,17 @@ function moveOverlaySelection(
   return {
     ...overlay,
     selectedIndex: (overlay.selectedIndex + delta + overlay.options.length) % overlay.options.length,
+  };
+}
+
+function moveViewerScroll(
+  overlay: RendererViewerOverlay,
+  delta: number,
+): RendererViewerOverlay {
+  const maxOffset = Math.max(0, overlay.lines.length - overlay.viewportHeight);
+  return {
+    ...overlay,
+    scrollOffset: Math.min(Math.max(overlay.scrollOffset + delta, 0), maxOffset),
   };
 }
 
@@ -1276,6 +1679,10 @@ function moveDiffScroll(
 
 function buildStatusText(state: RendererState): string {
   if (state.inputMode === "overlay") {
+    if (state.overlay?.kind === "viewer") {
+      return state.overlay.helpText ?? "Up/Down scroll  PgUp/PgDn page  q close  Esc close";
+    }
+
     return state.overlay?.helpText ?? "Up/Down move  Enter select  Esc cancel";
   }
 
@@ -1298,6 +1705,14 @@ function buildStatusText(state: RendererState): string {
 
   if (state.inputMode === "prompt" && state.prompt.state.activeReference) {
     return "Tab insert file  Up/Down choose  Enter submit  Esc clear";
+  }
+
+  if (
+    state.inputMode === "prompt" &&
+    state.prompt.state.activeSlashCommand &&
+    state.prompt.state.suggestions.length > 0
+  ) {
+    return "Enter accept command  Tab accept  Up/Down choose  Esc clear";
   }
 
   if (state.inputMode === "prompt") {
@@ -1323,6 +1738,15 @@ function getDiffViewportHeight(output: Writable): number {
       : 24;
 
   return Math.min(Math.max(rows - 16, 8), 14);
+}
+
+function getViewerViewportHeight(output: Writable): number {
+  const rows =
+    "rows" in output && typeof output.rows === "number"
+      ? output.rows
+      : 24;
+
+  return Math.min(Math.max(rows - 10, 10), 18);
 }
 
 function getCommandViewportHeight(output: Writable): number {

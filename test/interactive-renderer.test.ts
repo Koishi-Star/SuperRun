@@ -268,6 +268,36 @@ test("interactive renderer applies file suggestions with Tab and clears submit e
   }
 });
 
+test("interactive renderer accepts slash-command suggestions with Enter before submitting", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const promptPromise = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: [],
+    });
+
+    renderer.dispatchInput("/his", createKey());
+
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.buffer, "/his");
+    assert.equal(snapshot.prompt.state.suggestions[0], "/history");
+
+    renderer.dispatchInput("", createKey({ return: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.buffer, "/history");
+
+    renderer.dispatchInput("", createKey({ return: true }));
+    assert.equal(await promptPromise, "/history");
+  } finally {
+    renderer.dispose();
+  }
+});
+
 test("interactive renderer supports inline approval blocks", {
   concurrency: false,
 }, async () => {
@@ -404,6 +434,95 @@ test("interactive renderer supports read only inline diff review blocks", {
     }
     assert.equal(snapshot.turns[0].inlineBlock, null);
     assert.equal(snapshot.turns[0].status, "completed");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer supports read only viewer overlays", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const viewerPromise = renderer.viewText({
+      title: "History",
+      subtitle: "Current session",
+      lines: Array.from({ length: 24 }, (_, index) => ({
+        text: `line ${index + 1}`,
+        tone: index % 5 === 0 ? "info" : "default",
+      })),
+    });
+
+    renderer.dispatchInput("", createKey({ pageDown: true }));
+    let snapshot = renderer.getSnapshot();
+    if (!snapshot.overlay || snapshot.overlay.kind !== "viewer") {
+      throw new Error("Expected viewer overlay.");
+    }
+    assert.equal(snapshot.overlay.scrollOffset, 10);
+
+    renderer.dispatchInput("q", createKey());
+    await viewerPromise;
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.overlay, null);
+    assert.equal(snapshot.inputMode, "inactive");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer keeps fast command panels visible for the configured minimum duration", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({
+    input,
+    output,
+    enableInput: false,
+    minCommandPanelDurationMs: 60,
+  });
+
+  try {
+    renderer.beginAgentTurn("run quick command");
+    renderer.applyToolEvent({
+      kind: "command_execution",
+      phase: "started",
+      command: "node -p 1",
+      cwd: ".",
+      category: "read",
+      summary: "Quick command",
+    });
+    renderer.applyToolEvent({
+      kind: "command_execution",
+      phase: "completed",
+      command: "node -p 1",
+      cwd: ".",
+      category: "read",
+      summary: "Quick command",
+      exitCode: 0,
+      stdout: "1",
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+
+    let snapshot = renderer.getSnapshot();
+    if (snapshot.turns[0]?.kind !== "agent") {
+      throw new Error("Expected agent turn.");
+    }
+    assert.equal(snapshot.turns[0].steps[0]?.status, "running");
+
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    snapshot = renderer.getSnapshot();
+    if (snapshot.turns[0]?.kind !== "agent") {
+      throw new Error("Expected agent turn.");
+    }
+    assert.equal(snapshot.turns[0].steps[0]?.status, "completed");
   } finally {
     renderer.dispose();
   }
