@@ -4,7 +4,7 @@ import path from "node:path";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { executeAgentTool } from "../src/tools/index.js";
-import type { CommandApprovalMode } from "../src/tools/types.js";
+import type { CommandApprovalMode, ToolTurnEvent } from "../src/tools/types.js";
 
 function createWorkspaceEditPolicyContext(mode: CommandApprovalMode) {
   return {
@@ -16,6 +16,7 @@ function createWorkspaceEditPolicyContext(mode: CommandApprovalMode) {
 test("write_file creates a new workspace file when approvals allow it", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-write-file-"));
   const previousCwd = process.cwd();
+  const turnEvents: ToolTurnEvent[] = [];
 
   try {
     process.chdir(tempDir);
@@ -33,6 +34,9 @@ test("write_file creates a new workspace file when approvals allow it", async ()
         "default",
         {
           workspaceEditPolicy: createWorkspaceEditPolicyContext("allow-all"),
+          turnEvents: {
+            addEvent: (event) => turnEvents.push(event),
+          },
         },
       ),
     ) as {
@@ -52,6 +56,9 @@ test("write_file creates a new workspace file when approvals allow it", async ()
       await readFile(path.join(tempDir, "src", "example.ts"), "utf8"),
       "export const value = 1;\n",
     );
+    assert.equal(turnEvents.length, 1);
+    assert.equal(turnEvents[0]?.kind, "workspace_edit_review");
+    assert.equal(turnEvents[0]?.autoApproved, true);
   } finally {
     process.chdir(previousCwd);
     await rm(tempDir, { recursive: true, force: true });

@@ -9,7 +9,9 @@ export type AgentTurnOptions = ChatOptions & {
   toolContext?: ToolExecutionContext;
 };
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
-const MAX_TOOL_CALL_ROUNDS = 3;
+// Coding-oriented models often need several inspect/edit/verify rounds before
+// they can finish naturally, so keep a guardrail without forcing tiny loops.
+const MAX_TOOL_CALL_ROUNDS = 8;
 
 export type AgentSession = {
   mode: AgentMode;
@@ -172,6 +174,7 @@ async function resolveAgentReply(
       messages.push({
         role: "tool",
         toolCallId: toolCall.id,
+        toolName: toolCall.name,
         content: toolResult,
       });
     }

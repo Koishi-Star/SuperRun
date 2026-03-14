@@ -333,6 +333,7 @@ function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
       role: "tool",
       content: message.content,
       tool_call_id: message.toolCallId,
+      name: message.toolName,
     };
   }
 

@@ -1,4 +1,8 @@
-import type { WorkspaceEditDiffPreview, WorkspaceEditDiffPreviewLine } from "./types.js";
+import type {
+  WorkspaceEditChangeSummary,
+  WorkspaceEditDiffPreview,
+  WorkspaceEditDiffPreviewLine,
+} from "./types.js";
 
 const CONTEXT_LINE_COUNT = 2;
 const MAX_PREVIEW_LINES = 240;
@@ -54,8 +58,23 @@ export function buildWorkspaceEditDiffPreview(options: {
   return {
     title: options.title,
     summary: options.summary,
+    changeSummary: summarizeWorkspaceEditChanges(previewLines),
     truncated: previewLines.length > MAX_PREVIEW_LINES,
     lines: previewLines.slice(0, MAX_PREVIEW_LINES),
+  };
+}
+
+export function summarizeWorkspaceEditChanges(
+  lines: WorkspaceEditDiffPreviewLine[],
+): WorkspaceEditChangeSummary {
+  const removedCount = lines.filter((line) => line.kind === "remove").length;
+  const addedCount = lines.filter((line) => line.kind === "add").length;
+  const changedLines = Math.min(removedCount, addedCount);
+
+  return {
+    changedLines,
+    addedLines: Math.max(0, addedCount - changedLines),
+    removedLines: Math.max(0, removedCount - changedLines),
   };
 }
 

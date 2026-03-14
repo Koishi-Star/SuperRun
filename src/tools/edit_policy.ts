@@ -5,10 +5,17 @@ import type {
   WorkspaceEditPolicyContext,
 } from "./types.js";
 
+export type WorkspaceEditAuthorizationResult = {
+  approvalModeBefore: CommandApprovalMode;
+  approvalModeAfter: CommandApprovalMode;
+  prompted: boolean;
+  decision: "auto" | CommandApprovalDecision;
+};
+
 export async function authorizeWorkspaceEdit(
   assessment: WorkspaceEditAssessment,
   policy: WorkspaceEditPolicyContext | undefined,
-): Promise<void> {
+): Promise<WorkspaceEditAuthorizationResult> {
   const approvalMode = policy?.getMode() ?? "allow-all";
 
   if (approvalMode === "reject") {
@@ -18,7 +25,12 @@ export async function authorizeWorkspaceEdit(
   }
 
   if (!assessment.approvalRequired || approvalMode === "allow-all") {
-    return;
+    return {
+      approvalModeBefore: approvalMode,
+      approvalModeAfter: approvalMode,
+      prompted: false,
+      decision: "auto",
+    };
   }
 
   const requestApproval = policy?.requestApproval;
@@ -33,7 +45,7 @@ export async function authorizeWorkspaceEdit(
     approvalMode,
   });
 
-  handleWorkspaceEditDecision(decision, policy, approvalMode, assessment.tool);
+  return handleWorkspaceEditDecision(decision, policy, approvalMode, assessment.tool);
 }
 
 function handleWorkspaceEditDecision(
@@ -41,7 +53,7 @@ function handleWorkspaceEditDecision(
   policy: WorkspaceEditPolicyContext | undefined,
   approvalMode: CommandApprovalMode,
   toolName: WorkspaceEditAssessment["tool"],
-): void {
+): WorkspaceEditAuthorizationResult {
   if (decision === "reject") {
     throw new Error(`${toolName} rejected by user.`);
   }
@@ -49,4 +61,11 @@ function handleWorkspaceEditDecision(
   if (decision === "always" && approvalMode !== "allow-all") {
     policy?.setMode("allow-all");
   }
+
+  return {
+    approvalModeBefore: approvalMode,
+    approvalModeAfter: policy?.getMode() ?? approvalMode,
+    prompted: true,
+    decision,
+  };
 }

@@ -190,6 +190,7 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
       {
         role: "tool",
         tool_call_id: "call_1",
+        name: "list_files",
         content:
           "{\"ok\":true,\"path\":\".\",\"depth\":1,\"entries\":[{\"path\":\"alpha.ts\",\"type\":\"file\"},{\"path\":\"beta.txt\",\"type\":\"file\"}],\"truncated\":false}",
       },
@@ -300,11 +301,86 @@ test("runAgentTurn resolves a run_command tool call in default mode", async () =
 
     const toolMessage = server.requests[1]?.messages[3];
     assert.equal(toolMessage?.role, "tool");
+    assert.equal(toolMessage?.name, "run_command");
     assert.equal(
       typeof toolMessage?.content === "string" &&
         toolMessage.content.includes(`\"stdout\":\"${tempDir.replace(/\\/g, "\\\\")}`),
       true,
     );
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn tolerates multi-step tool loops that exceed three rounds", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_2",
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_3",
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_4",
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    },
+    "Completed after several tool rounds.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-tool-rounds-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    await writeFile(path.join(tempDir, "alpha.ts"), "export const alpha = 1;\n", "utf8");
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
+    const reply = await runAgentTurn(session, "Inspect the workspace carefully.");
+
+    assert.equal(reply, "Completed after several tool rounds.");
+    assert.equal(server.requests.length, 5);
   } finally {
     process.chdir(previousCwd);
     restoreEnv(previousEnv);

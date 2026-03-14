@@ -31,6 +31,12 @@ import {
   type StoredSession,
 } from "./session/store.js";
 import {
+  createSessionEventTimestamp,
+  formatSessionEvent,
+  formatWorkspaceEditChangeSummary,
+  type SessionEvent,
+} from "./session/events.js";
+import {
   getCommandApprovalSummary,
   parseCommandApprovalMode,
 } from "./tools/command_policy.js";
@@ -46,7 +52,7 @@ import type {
   CommandApprovalDecision,
   CommandApprovalMode,
   CommandApprovalRequest,
-  ToolNotice,
+  ToolTurnEvent,
   ToolExecutionContext,
   WorkspaceEditApprovalRequest,
 } from "./tools/types.js";
@@ -115,6 +121,7 @@ program
           pendingDeleteAllConfirmation: false,
           pendingSystemPromptLines: null,
           workspaceFiles: null,
+          sessionEvents: [],
           deleteAreaStatus: await getWorkspaceDeleteAreaStatus(),
         });
         return;
@@ -144,6 +151,7 @@ type InteractiveState = {
   pendingDeleteAllConfirmation: boolean;
   pendingSystemPromptLines: string[] | null;
   workspaceFiles: string[] | null;
+  sessionEvents: SessionEvent[];
   deleteAreaStatus: {
     fileCount: number;
     totalBytes: number;
@@ -177,6 +185,7 @@ async function createInteractiveState(
         pendingDeleteAllConfirmation: false,
         pendingSystemPromptLines: null,
         workspaceFiles: null,
+        sessionEvents: [...storedSession.events],
         deleteAreaStatus,
         commandApprovalMode: approvalMode,
         commandHookRunner,
@@ -194,6 +203,7 @@ async function createInteractiveState(
     pendingDeleteAllConfirmation: false,
     pendingSystemPromptLines: null,
     workspaceFiles: null,
+    sessionEvents: [],
     deleteAreaStatus,
     commandApprovalMode: approvalMode,
     commandHookRunner,
@@ -205,12 +215,12 @@ async function runSingleTurn(
   prompt: string,
   state: InteractiveState,
 ): Promise<void> {
-  const turnNotices: ToolNotice[] = [];
+  const turnEvents: ToolTurnEvent[] = [];
   console.log("user:", prompt);
   process.stdout.write("assistant: ");
 
   const reply = await runAgentTurn(session, prompt, {
-    toolContext: createToolExecutionContext(state, null, turnNotices),
+    toolContext: createToolExecutionContext(session, state, null, turnEvents),
     onChunk: (chunk) => {
       process.stdout.write(chunk);
     },
@@ -221,7 +231,7 @@ async function runSingleTurn(
   }
 
   process.stdout.write("\n");
-  renderTurnNotices(null, turnNotices);
+  await renderTurnEvents(null, turnEvents);
 }
 
 async function runInteractiveSession(
@@ -333,7 +343,8 @@ async function handleInteractivePrompt(
       const selectedMode = await runApprovalPicker(state.commandApprovalMode, ui);
       renderInteractiveShell(ui, session, state);
       if (selectedMode) {
-        state.commandApprovalMode = selectedMode;
+        applyApprovalModeChange(session, state, ui, selectedMode, "slash_command");
+        await persistSessionMetadataIfNeeded(session, state);
         renderApprovalSummary(ui, state.commandApprovalMode);
       }
       return true;
@@ -345,7 +356,14 @@ async function handleInteractivePrompt(
     }
 
     try {
-      state.commandApprovalMode = parseCommandApprovalMode(requestedMode);
+      applyApprovalModeChange(
+        session,
+        state,
+        ui,
+        parseCommandApprovalMode(requestedMode),
+        "slash_command",
+      );
+      await persistSessionMetadataIfNeeded(session, state);
       renderApprovalSummary(ui, state.commandApprovalMode);
     } catch (error) {
       renderError(ui, error instanceof Error ? error.message : "Failed to change approvals.");
@@ -371,6 +389,7 @@ async function handleInteractivePrompt(
         renderHistory(ui, {
           label: formatSessionLabel(state.currentSessionTitle, state.currentSessionId),
           history: session.history,
+          events: state.sessionEvents,
           current: true,
         });
         return true;
@@ -381,6 +400,7 @@ async function handleInteractivePrompt(
       renderHistory(ui, {
         label: formatSessionLabel(storedSession.title, storedSession.id),
         history: storedSession.history,
+        events: storedSession.events,
         current: storedSession.id === state.currentSessionId,
       });
     } catch (error) {
@@ -408,6 +428,7 @@ async function handleInteractivePrompt(
           restoreStoredSession(session, storedSession);
           state.currentSessionId = storedSession.id;
           state.currentSessionTitle = storedSession.title;
+          state.sessionEvents = [...storedSession.events];
           state.sessionStore = await setActiveSession(storedSession.id);
           renderInteractiveShell(ui, session, state);
           renderSessionSwitched(ui, storedSession, session.mode);
@@ -433,14 +454,17 @@ async function handleInteractivePrompt(
   if (prompt === "/new") {
     resetCurrentSession(session, state.settings.systemPrompt);
     state.currentSessionTitle = null;
+    state.sessionEvents = [];
     const result = await createSession({
       systemPrompt: session.systemPrompt,
       history: session.history,
+      events: state.sessionEvents,
       maxHistoryTurns: session.maxHistoryTurns,
     });
     state.sessionStore = result.store;
     state.currentSessionId = result.session.id;
     state.currentSessionTitle = result.session.title;
+    state.sessionEvents = [...result.session.events];
     renderNewSessionCreated(ui, result.session);
     return true;
   }
@@ -458,6 +482,7 @@ async function handleInteractivePrompt(
       restoreStoredSession(session, storedSession);
       state.currentSessionId = storedSession.id;
       state.currentSessionTitle = storedSession.title;
+      state.sessionEvents = [...storedSession.events];
       state.sessionStore = await setActiveSession(storedSession.id);
       renderSessionSwitched(ui, storedSession, session.mode);
     } catch (error) {
@@ -523,6 +548,7 @@ async function handleInteractivePrompt(
         restoreStoredSession(session, activeSession);
         state.currentSessionId = activeSession.id;
         state.currentSessionTitle = activeSession.title;
+        state.sessionEvents = [...activeSession.events];
         renderSessionDeletedAndSwitched(
           ui,
           targetSessionId,
@@ -535,6 +561,7 @@ async function handleInteractivePrompt(
       resetCurrentSession(session, state.settings.systemPrompt);
       state.currentSessionId = null;
       state.currentSessionTitle = null;
+      state.sessionEvents = [];
       renderSessionDeleted(ui, targetSessionId);
       return true;
     }
@@ -552,6 +579,7 @@ async function handleInteractivePrompt(
     const settings = await resetSystemPrompt();
     state.settings = settings;
     resetCurrentSession(session, settings.systemPrompt);
+    state.sessionEvents = [];
     await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
     return true;
@@ -580,10 +608,10 @@ async function handleInteractivePrompt(
     process.stdout.write("assistant: ");
   }
 
-  const turnNotices: ToolNotice[] = [];
+  const turnEvents: ToolTurnEvent[] = [];
 
   const reply = await runAgentTurn(session, prompt, {
-    toolContext: createToolExecutionContext(state, ui, turnNotices),
+    toolContext: createToolExecutionContext(session, state, ui, turnEvents),
     onChunk: (chunk) => {
       if (ui) {
         ui.appendAssistantChunk(chunk);
@@ -594,6 +622,7 @@ async function handleInteractivePrompt(
     },
   });
 
+  applyTurnEventsToSession(state, turnEvents);
   await persistCurrentSession(session, state);
   await refreshDeleteAreaBanner(session, state, ui);
 
@@ -608,7 +637,7 @@ async function handleInteractivePrompt(
   if (!ui) {
     process.stdout.write("\n");
   }
-  renderTurnNotices(ui, turnNotices);
+  await renderTurnEvents(ui, turnEvents);
   return true;
 }
 
@@ -639,6 +668,7 @@ async function handleDeleteAllConfirmationLine(
     resetCurrentSession(session, state.settings.systemPrompt);
     state.currentSessionId = null;
     state.currentSessionTitle = null;
+    state.sessionEvents = [];
   }
 
   renderAllSessionsDeleted(ui, deletedCount, deletedCurrentSession);
@@ -686,6 +716,7 @@ async function handleSystemPromptEditorLine(
     const settings = await saveSystemPrompt(nextPrompt);
     state.settings = settings;
     resetCurrentSession(session, settings.systemPrompt);
+    state.sessionEvents = [];
     state.pendingSystemPromptLines = null;
     await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
@@ -725,6 +756,7 @@ async function runExternalSystemPromptEditor(
     const settings = await saveSystemPrompt(result.value);
     state.settings = settings;
     resetCurrentSession(session, settings.systemPrompt);
+    state.sessionEvents = [];
     await persistCurrentSession(session, state, { allowEmpty: true });
     renderSystemPromptApplied(ui, session, settings, true);
   } catch (error) {
@@ -1109,27 +1141,137 @@ function renderRiskNotice(ui: InteractiveRenderer | null = null): void {
   );
 }
 
-function renderTurnNotices(
+async function renderTurnEvents(
   ui: InteractiveRenderer | null,
-  notices: ToolNotice[],
-): void {
-  for (const notice of notices) {
-    if (notice.level === "error") {
-      renderError(ui, notice.message);
-      continue;
-    }
-
-    if (notice.level === "warning") {
-      if (ui) {
-        ui.renderWarning(notice.message);
-      } else {
-        console.log(`warning: ${notice.message}`);
+  events: ToolTurnEvent[],
+): Promise<void> {
+  for (const event of events) {
+    if (event.kind === "notice") {
+      if (event.level === "error") {
+        renderError(ui, event.message);
+        continue;
       }
+
+      if (event.level === "warning") {
+        if (ui) {
+          ui.renderWarning(event.message);
+        } else {
+          console.log(`warning: ${event.message}`);
+        }
+        continue;
+      }
+
+      renderInfo(ui, event.message);
       continue;
     }
 
-    renderInfo(ui, notice.message);
+    const changeSummaryText = formatWorkspaceEditChangeSummary(
+      event.diffPreview.changeSummary,
+    );
+    renderInfo(
+      ui,
+      `Edited ${event.path}: ${changeSummaryText}.`,
+    );
+
+    if (event.autoApproved) {
+      renderInfo(
+        ui,
+        `Auto-approved under allow-all: ${event.summary}.`,
+      );
+      if (ui) {
+        await ui.viewDiff({
+          title: `Applied ${event.tool}`,
+          subtitle: event.path,
+          summary: `${event.diffPreview.summary}. ${changeSummaryText}.`,
+          changeSummary: event.diffPreview.changeSummary,
+          truncated: event.diffPreview.truncated,
+          lines: event.diffPreview.lines,
+        });
+      } else {
+        for (const line of event.diffPreview.lines) {
+          console.log(
+            `${line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "} ${line.text}`,
+          );
+        }
+      }
+    }
   }
+}
+
+function applyApprovalModeChange(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+  nextMode: CommandApprovalMode,
+  source: "slash_command" | "approval_decision",
+): void {
+  const previousMode = state.commandApprovalMode;
+  if (previousMode === nextMode) {
+    return;
+  }
+
+  state.commandApprovalMode = nextMode;
+  recordSessionEvent(state, {
+    timestamp: createSessionEventTimestamp(),
+    kind: "approval_mode_changed",
+    from: previousMode,
+    to: nextMode,
+    source,
+  });
+  renderInfo(
+    ui,
+    `Approvals changed: ${previousMode} -> ${nextMode} for this session.`,
+  );
+
+  if (source === "slash_command" && session.history.length === 0 && !state.currentSessionId) {
+    return;
+  }
+}
+
+function applyTurnEventsToSession(
+  state: InteractiveState,
+  events: ToolTurnEvent[],
+): void {
+  for (const event of events) {
+    if (event.kind === "notice") {
+      recordSessionEvent(state, {
+        timestamp: createSessionEventTimestamp(),
+        kind: "tool_notice",
+        level: event.level,
+        message: event.message,
+      });
+      continue;
+    }
+
+    recordSessionEvent(state, {
+      timestamp: createSessionEventTimestamp(),
+      kind: "workspace_edit_applied",
+      tool: event.tool,
+      path: event.path,
+      summary: event.summary,
+      approvalMode: event.approvalMode,
+      autoApproved: event.autoApproved,
+      changeSummary: event.diffPreview.changeSummary,
+    });
+  }
+}
+
+function recordSessionEvent(
+  state: InteractiveState,
+  event: SessionEvent,
+): void {
+  state.sessionEvents.push(event);
+}
+
+async function persistSessionMetadataIfNeeded(
+  session: AgentSession,
+  state: InteractiveState,
+): Promise<void> {
+  if (!state.currentSessionId && session.history.length === 0) {
+    return;
+  }
+
+  await persistCurrentSession(session, state, { allowEmpty: true });
 }
 
 function renderApprovalSummary(
@@ -1165,6 +1307,7 @@ function renderCurrentSessionSummary(
     ui,
     `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
   );
+  renderInfo(ui, `Recorded events: ${state.sessionEvents.length}.`);
   renderInfo(ui, `Current behavior: ${summarizePrompt(session.systemPrompt)}`);
   renderInfo(ui, `Session index: ${state.sessionStore.indexFilePath}`);
   renderInfo(ui, `Saved sessions total: ${state.sessionStore.sessions.length}`);
@@ -1227,6 +1370,7 @@ function renderHistory(
   options: {
     label: string;
     history: AgentSession["history"];
+    events: SessionEvent[];
     current: boolean;
   },
 ): void {
@@ -1238,27 +1382,39 @@ function renderHistory(
 
   renderInfo(ui, `Session: ${options.label}`);
   renderInfo(ui, `Messages: ${options.history.length}`);
+  renderInfo(ui, `Events: ${options.events.length}`);
   if (options.current) {
     renderInfo(ui, "Viewing the current conversation.");
   }
 
-  if (options.history.length === 0) {
+  if (options.history.length === 0 && options.events.length === 0) {
     renderInfo(ui, "No messages yet.");
     return;
   }
 
-  writeBodyLine(ui, "");
+  if (options.history.length > 0) {
+    writeBodyLine(ui, "");
 
-  for (const [index, message] of options.history.entries()) {
-    const speaker = message.role === "user" ? "You" : "Assistant";
-    writeBodyLine(ui, `${index + 1}. ${speaker}`);
+    for (const [index, message] of options.history.entries()) {
+      const speaker = message.role === "user" ? "You" : "Assistant";
+      writeBodyLine(ui, `${index + 1}. ${speaker}`);
 
-    for (const line of message.content.split(/\r?\n/)) {
-      writeBodyLine(ui, `   ${line}`);
+      for (const line of message.content.split(/\r?\n/)) {
+        writeBodyLine(ui, `   ${line}`);
+      }
+
+      if (index < options.history.length - 1) {
+        writeBodyLine(ui, "");
+      }
     }
+  }
 
-    if (index < options.history.length - 1) {
-      writeBodyLine(ui, "");
+  if (options.events.length > 0) {
+    writeBodyLine(ui, "");
+    writeBodyLine(ui, "Events");
+
+    for (const [index, event] of options.events.entries()) {
+      writeBodyLine(ui, `${index + 1}. ${formatSessionEvent(event)}`);
     }
   }
 }
@@ -1503,11 +1659,13 @@ async function persistCurrentSession(
       ...(sessionTitle ? { title: sessionTitle } : {}),
       systemPrompt: session.systemPrompt,
       history: session.history,
+      events: state.sessionEvents,
       maxHistoryTurns: session.maxHistoryTurns,
     });
     state.sessionStore = result.store;
     state.currentSessionId = result.session.id;
     state.currentSessionTitle = result.session.title;
+    state.sessionEvents = [...result.session.events];
     return;
   }
 
@@ -1515,11 +1673,13 @@ async function persistCurrentSession(
     ...(sessionTitle ? { title: sessionTitle } : {}),
     systemPrompt: session.systemPrompt,
     history: session.history,
+    events: state.sessionEvents,
     maxHistoryTurns: session.maxHistoryTurns,
   });
   state.sessionStore = result.store;
   state.currentSessionId = result.session.id;
   state.currentSessionTitle = result.session.title;
+  state.sessionEvents = [...result.session.events];
 }
 
 function parseCommandArgument(
@@ -1637,34 +1797,93 @@ async function runApprovalPicker(
 }
 
 function createToolExecutionContext(
+  session: AgentSession,
   state: InteractiveState,
   ui: InteractiveRenderer | null,
-  turnNotices: ToolNotice[] = [],
+  turnEvents: ToolTurnEvent[] = [],
 ): ToolExecutionContext {
   return {
     commandPolicy: {
       getMode: () => state.commandApprovalMode,
       setMode: (mode) => {
-        state.commandApprovalMode = mode;
+        applyApprovalModeChange(session, state, ui, mode, "approval_decision");
       },
-      ...(ui ? { requestApproval: (request: CommandApprovalRequest) => promptCommandApproval(request, ui) } : {}),
+      ...(ui
+        ? {
+            requestApproval: async (request: CommandApprovalRequest) => {
+              recordSessionEvent(state, {
+                timestamp: createSessionEventTimestamp(),
+                kind: "approval_requested",
+                approvalKind: "command",
+                summary: request.assessment.summary,
+                subject: request.assessment.command,
+                category: request.assessment.category,
+              });
+              const decision = await promptCommandApproval(request, ui);
+              recordSessionEvent(state, {
+                timestamp: createSessionEventTimestamp(),
+                kind: "approval_decided",
+                approvalKind: "command",
+                summary: request.assessment.summary,
+                subject: request.assessment.command,
+                decision,
+                modeBefore: request.approvalMode,
+                modeAfter: decision === "always" ? "allow-all" : request.approvalMode,
+                category: request.assessment.category,
+              });
+              return decision;
+            },
+          }
+        : {}),
       ...(state.commandHookRunner ? { runHook: state.commandHookRunner } : {}),
     },
     workspaceEditPolicy: {
       getMode: () => state.commandApprovalMode,
       setMode: (mode) => {
-        state.commandApprovalMode = mode;
+        applyApprovalModeChange(session, state, ui, mode, "approval_decision");
       },
       ...(ui
         ? {
-            requestApproval: (request: WorkspaceEditApprovalRequest) =>
-              promptWorkspaceEditApproval(request, ui),
+            requestApproval: async (request: WorkspaceEditApprovalRequest) => {
+              recordSessionEvent(state, {
+                timestamp: createSessionEventTimestamp(),
+                kind: "approval_requested",
+                approvalKind: "workspace_edit",
+                summary: request.assessment.summary,
+                subject: `${request.assessment.tool} ${request.assessment.path}`,
+                tool: request.assessment.tool,
+                path: request.assessment.path,
+              });
+              const decision = await promptWorkspaceEditApproval(request, ui);
+              recordSessionEvent(state, {
+                timestamp: createSessionEventTimestamp(),
+                kind: "approval_decided",
+                approvalKind: "workspace_edit",
+                summary: request.assessment.summary,
+                subject: `${request.assessment.tool} ${request.assessment.path}`,
+                decision,
+                modeBefore: request.approvalMode,
+                modeAfter: decision === "always" ? "allow-all" : request.approvalMode,
+                tool: request.assessment.tool,
+                path: request.assessment.path,
+              });
+              return decision;
+            },
           }
         : {}),
     },
     notices: {
       addNotice: (notice) => {
-        turnNotices.push(notice);
+        turnEvents.push({
+          kind: "notice",
+          level: notice.level,
+          message: notice.message,
+        });
+      },
+    },
+    turnEvents: {
+      addEvent: (event) => {
+        turnEvents.push(event);
       },
     },
   };
@@ -1715,6 +1934,7 @@ async function promptWorkspaceEditApproval(
       title: `Approve ${assessment.tool}?`,
       subtitle: assessment.path,
       summary: assessment.diffPreview.summary,
+      changeSummary: assessment.diffPreview.changeSummary,
       truncated: assessment.diffPreview.truncated,
       lines: assessment.diffPreview.lines,
     });

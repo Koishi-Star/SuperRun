@@ -2,11 +2,14 @@ import path from "node:path";
 import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import type { ConversationMessage } from "../llm/types.js";
 import { getConfigFilePath } from "../config/paths.js";
+import type { SessionEvent } from "./events.js";
+import type { CommandCategory, WorkspaceEditAssessment } from "../tools/types.js";
 
 type PersistedSessionFile = {
   title?: unknown;
   systemPrompt?: unknown;
   history?: unknown;
+  events?: unknown;
   maxHistoryTurns?: unknown;
   updatedAt?: unknown;
 };
@@ -29,6 +32,7 @@ export type SessionSnapshot = {
   title?: string;
   systemPrompt: string;
   history: ConversationMessage[];
+  events?: SessionEvent[];
   maxHistoryTurns: number;
 };
 
@@ -47,6 +51,7 @@ export type StoredSession = {
   preview: string;
   systemPrompt: string;
   history: ConversationMessage[];
+  events: SessionEvent[];
   maxHistoryTurns: number;
   updatedAt: string;
   filePath: string;
@@ -136,6 +141,7 @@ export async function saveSession(
     role: message.role,
     content: message.content,
   }));
+  const events = [...(snapshot.events ?? [])];
   // Preserve an existing manual title when routine autosaves do not provide one.
   const existingSession = await loadExistingSession(normalizedId);
   const title = deriveSessionTitle(
@@ -166,6 +172,7 @@ export async function saveSession(
         title,
         systemPrompt,
         history,
+        events,
         maxHistoryTurns: snapshot.maxHistoryTurns,
         updatedAt,
       },
@@ -194,6 +201,7 @@ export async function saveSession(
       preview,
       systemPrompt,
       history,
+      events,
       maxHistoryTurns: snapshot.maxHistoryTurns,
       updatedAt,
       filePath,
@@ -370,6 +378,7 @@ function parseStoredSession(
   filePath: string,
 ): StoredSession {
   const history = parseHistory(parsed.history, filePath);
+  const events = parseSessionEvents(parsed.events, filePath);
   const title = deriveSessionTitle(
     typeof parsed.title === "string" ? parsed.title : null,
     null,
@@ -401,6 +410,7 @@ function parseStoredSession(
     preview: buildSessionPreview(history),
     systemPrompt,
     history,
+    events,
     maxHistoryTurns,
     updatedAt,
     filePath,
@@ -440,6 +450,145 @@ function parseHistory(
       content,
     };
   });
+}
+
+function parseSessionEvents(
+  events: unknown,
+  filePath: string,
+): SessionEvent[] {
+  if (events === undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(events)) {
+    throw new Error(`Session file has an invalid events value: ${filePath}`);
+  }
+
+  return events.map((event) => parseSessionEvent(event, filePath));
+}
+
+function parseSessionEvent(
+  event: unknown,
+  filePath: string,
+): SessionEvent {
+  if (!event || typeof event !== "object" || !("kind" in event) || !("timestamp" in event)) {
+    throw new Error(`Session file has an invalid session event: ${filePath}`);
+  }
+
+  const candidate = event as Record<string, unknown>;
+  const kind = typeof candidate.kind === "string" ? candidate.kind : "";
+  const timestamp = typeof candidate.timestamp === "string" ? candidate.timestamp : "";
+
+  if (!timestamp) {
+    throw new Error(`Session file has an invalid session event timestamp: ${filePath}`);
+  }
+
+  switch (kind) {
+    case "approval_requested":
+      if (
+        (candidate.approvalKind === "command" || candidate.approvalKind === "workspace_edit") &&
+        typeof candidate.summary === "string" &&
+        typeof candidate.subject === "string"
+      ) {
+        return {
+          timestamp,
+          kind,
+          approvalKind: candidate.approvalKind,
+          summary: candidate.summary,
+          subject: candidate.subject,
+          ...(typeof candidate.category === "string" ? { category: candidate.category as CommandCategory } : {}),
+          ...(typeof candidate.tool === "string" ? { tool: candidate.tool as WorkspaceEditAssessment["tool"] } : {}),
+          ...(typeof candidate.path === "string" ? { path: candidate.path } : {}),
+        };
+      }
+      break;
+    case "approval_decided":
+      if (
+        (candidate.approvalKind === "command" || candidate.approvalKind === "workspace_edit") &&
+        typeof candidate.summary === "string" &&
+        typeof candidate.subject === "string" &&
+        (candidate.decision === "once" || candidate.decision === "always" || candidate.decision === "reject") &&
+        (candidate.modeBefore === "ask" || candidate.modeBefore === "allow-all" || candidate.modeBefore === "reject") &&
+        (candidate.modeAfter === "ask" || candidate.modeAfter === "allow-all" || candidate.modeAfter === "reject")
+      ) {
+        return {
+          timestamp,
+          kind,
+          approvalKind: candidate.approvalKind,
+          summary: candidate.summary,
+          subject: candidate.subject,
+          decision: candidate.decision,
+          modeBefore: candidate.modeBefore,
+          modeAfter: candidate.modeAfter,
+          ...(typeof candidate.category === "string" ? { category: candidate.category as CommandCategory } : {}),
+          ...(typeof candidate.tool === "string" ? { tool: candidate.tool as WorkspaceEditAssessment["tool"] } : {}),
+          ...(typeof candidate.path === "string" ? { path: candidate.path } : {}),
+        };
+      }
+      break;
+    case "approval_mode_changed":
+      if (
+        (candidate.from === "ask" || candidate.from === "allow-all" || candidate.from === "reject") &&
+        (candidate.to === "ask" || candidate.to === "allow-all" || candidate.to === "reject") &&
+        (candidate.source === "slash_command" || candidate.source === "approval_decision")
+      ) {
+        return {
+          timestamp,
+          kind,
+          from: candidate.from,
+          to: candidate.to,
+          source: candidate.source,
+        };
+      }
+      break;
+    case "workspace_edit_applied":
+      if (
+        typeof candidate.tool === "string" &&
+        typeof candidate.path === "string" &&
+        typeof candidate.summary === "string" &&
+        (candidate.approvalMode === "ask" || candidate.approvalMode === "allow-all" || candidate.approvalMode === "reject") &&
+        typeof candidate.autoApproved === "boolean" &&
+        candidate.changeSummary &&
+        typeof candidate.changeSummary === "object" &&
+        typeof (candidate.changeSummary as Record<string, unknown>).changedLines === "number" &&
+        typeof (candidate.changeSummary as Record<string, unknown>).addedLines === "number" &&
+        typeof (candidate.changeSummary as Record<string, unknown>).removedLines === "number"
+      ) {
+        const changeSummary = candidate.changeSummary as Record<string, number>;
+        return {
+          timestamp,
+          kind,
+          tool: candidate.tool as WorkspaceEditAssessment["tool"],
+          path: candidate.path,
+          summary: candidate.summary,
+          approvalMode: candidate.approvalMode,
+          autoApproved: candidate.autoApproved,
+          changeSummary: {
+            changedLines: Number(changeSummary.changedLines ?? 0),
+            addedLines: Number(changeSummary.addedLines ?? 0),
+            removedLines: Number(changeSummary.removedLines ?? 0),
+          },
+        };
+      }
+      break;
+    case "tool_notice":
+      if (
+        (candidate.level === "info" || candidate.level === "warning" || candidate.level === "error") &&
+        typeof candidate.message === "string"
+      ) {
+        return {
+          timestamp,
+          kind,
+          level: candidate.level,
+          message: candidate.message,
+        };
+      }
+      break;
+    default:
+      break;
+  }
+
+  throw new Error(`Session file has an invalid session event: ${filePath}`);
 }
 
 async function writeSessionIndex(

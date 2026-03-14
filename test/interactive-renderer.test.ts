@@ -234,6 +234,11 @@ test("interactive renderer supports scrollable diff approval overlays", {
       title: "Approve replace_lines?",
       subtitle: "src/example.ts",
       summary: "Replace lines 10-12 in src/example.ts",
+      changeSummary: {
+        changedLines: 10,
+        addedLines: 0,
+        removedLines: 0,
+      },
       lines: Array.from({ length: 30 }, (_, index) => ({
         kind: index % 3 === 0 ? "remove" : index % 3 === 1 ? "add" : "context",
         oldLineNumber: index % 3 === 1 ? null : index + 1,
@@ -256,6 +261,47 @@ test("interactive renderer supports scrollable diff approval overlays", {
 
     renderer.dispatchInput("a", createKey());
     assert.equal(await reviewPromise, "always");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer supports read-only diff review overlays for auto-approved edits", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    const reviewPromise = renderer.viewDiff({
+      title: "Applied replace_lines",
+      subtitle: "src/example.ts",
+      summary: "Replace lines 10-12 in src/example.ts. changed 2, added 1, removed 0.",
+      changeSummary: {
+        changedLines: 2,
+        addedLines: 1,
+        removedLines: 0,
+      },
+      lines: Array.from({ length: 20 }, (_, index) => ({
+        kind: index % 2 === 0 ? "context" : "add",
+        oldLineNumber: index % 2 === 0 ? index + 1 : null,
+        newLineNumber: index + 1,
+        text: `line ${index + 1}`,
+      })),
+    });
+
+    renderer.dispatchInput("", createKey({ pageDown: true }));
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.overlay?.kind, "diff");
+    assert.equal(snapshot.overlay?.mode, "review");
+    assert.equal(snapshot.overlay?.scrollOffset, 10);
+
+    renderer.dispatchInput("", createKey({ escape: true }));
+    await reviewPromise;
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.overlay, null);
   } finally {
     renderer.dispose();
   }

@@ -33,6 +33,7 @@ export type ToolMessage = {
   role: "tool";
   content: string;
   toolCallId: string;
+  toolName: string;
 };
 
 export type ChatMessage =

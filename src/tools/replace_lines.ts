@@ -101,6 +101,12 @@ export async function replaceWorkspaceLines(
     ...file.lines.slice(args.end_line),
   ];
 
+  const diffPreview = buildWorkspaceEditDiffPreview({
+    title: relativePath,
+    summary: `Replace lines ${args.start_line}-${args.end_line} in ${relativePath}`,
+    oldLines: file.lines,
+    newLines: nextLines,
+  });
   const assessment: WorkspaceEditAssessment = {
     tool: "replace_lines",
     path: relativePath,
@@ -109,18 +115,22 @@ export async function replaceWorkspaceLines(
       "targeted line replacement edits existing workspace content.",
     ],
     approvalRequired: true,
-    diffPreview: buildWorkspaceEditDiffPreview({
-      title: relativePath,
-      summary: `Replace lines ${args.start_line}-${args.end_line} in ${relativePath}`,
-      oldLines: file.lines,
-      newLines: nextLines,
-    }),
+    diffPreview,
   };
-  await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
+  const authorization = await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 
   await writeWorkspaceTextFile(absolutePath, {
     ...file,
     lines: nextLines,
+  });
+  context?.turnEvents?.addEvent({
+    kind: "workspace_edit_review",
+    tool: "replace_lines",
+    path: relativePath,
+    summary: assessment.summary,
+    approvalMode: authorization.approvalModeAfter,
+    autoApproved: !authorization.prompted && authorization.approvalModeBefore === "allow-all",
+    diffPreview,
   });
 
   return {

@@ -116,6 +116,14 @@ export async function writeWorkspaceFile(
     );
   }
 
+  const diffPreview = buildWorkspaceEditDiffPreview({
+    title: relativePath,
+    summary: existingStat
+      ? `Overwrite ${relativePath} (${previousText.lines.length} -> ${nextText.lines.length} lines)`
+      : `Create ${relativePath} (${nextText.lines.length} lines)`,
+    oldLines: previousText.lines,
+    newLines: nextText.lines,
+  });
   const assessment: WorkspaceEditAssessment = {
     tool: "write_file",
     path: relativePath,
@@ -128,19 +136,21 @@ export async function writeWorkspaceFile(
         : "creating files changes the workspace state.",
     ],
     approvalRequired: true,
-    diffPreview: buildWorkspaceEditDiffPreview({
-      title: relativePath,
-      summary: existingStat
-        ? `Overwrite ${relativePath} (${previousText.lines.length} -> ${nextText.lines.length} lines)`
-        : `Create ${relativePath} (${nextText.lines.length} lines)`,
-      oldLines: previousText.lines,
-      newLines: nextText.lines,
-    }),
+    diffPreview,
   };
-  await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
+  const authorization = await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 
   await mkdir(path.dirname(absolutePath), { recursive: true });
   await writeFile(absolutePath, args.content, "utf8");
+  context?.turnEvents?.addEvent({
+    kind: "workspace_edit_review",
+    tool: "write_file",
+    path: relativePath,
+    summary: assessment.summary,
+    approvalMode: authorization.approvalModeAfter,
+    autoApproved: !authorization.prompted && authorization.approvalModeBefore === "allow-all",
+    diffPreview,
+  });
 
   return {
     path: relativePath,

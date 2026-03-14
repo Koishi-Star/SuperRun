@@ -46,9 +46,16 @@ export type WorkspaceEditDiffPreviewLine = {
   text: string;
 };
 
+export type WorkspaceEditChangeSummary = {
+  changedLines: number;
+  addedLines: number;
+  removedLines: number;
+};
+
 export type WorkspaceEditDiffPreview = {
   title: string;
   summary: string;
+  changeSummary: WorkspaceEditChangeSummary;
   truncated: boolean;
   lines: WorkspaceEditDiffPreviewLine[];
 };
@@ -102,12 +109,35 @@ export type ToolNotice = {
   message: string;
 };
 
+export type WorkspaceEditReviewEvent = {
+  kind: "workspace_edit_review";
+  tool: WorkspaceEditAssessment["tool"];
+  path: string;
+  summary: string;
+  approvalMode: CommandApprovalMode;
+  autoApproved: boolean;
+  diffPreview: WorkspaceEditDiffPreview;
+};
+
+export type ToolTurnEvent =
+  | {
+      kind: "notice";
+      level: ToolNotice["level"];
+      message: string;
+    }
+  | WorkspaceEditReviewEvent;
+
 export type ToolNoticeContext = {
   addNotice: (notice: ToolNotice) => void;
+};
+
+export type ToolTurnEventContext = {
+  addEvent: (event: ToolTurnEvent) => void;
 };
 
 export type ToolExecutionContext = {
   commandPolicy?: CommandPolicyContext;
   workspaceEditPolicy?: WorkspaceEditPolicyContext;
   notices?: ToolNoticeContext;
+  turnEvents?: ToolTurnEventContext;
 };

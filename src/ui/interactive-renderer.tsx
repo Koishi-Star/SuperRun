@@ -1,7 +1,11 @@
 import type { Writable } from "node:stream";
 import { render, type Instance } from "ink";
 import React from "react";
-import type { CommandApprovalDecision, WorkspaceEditDiffPreviewLine } from "../tools/types.js";
+import type {
+  CommandApprovalDecision,
+  WorkspaceEditChangeSummary,
+  WorkspaceEditDiffPreviewLine,
+} from "../tools/types.js";
 import {
   applySelectedComposerSuggestion,
   backspaceComposerText,
@@ -66,10 +70,12 @@ export type RendererPickerOverlay = {
 
 export type RendererDiffOverlay = {
   kind: "diff";
+  mode: "approval" | "review";
   title: string;
   subtitle: string | null;
   helpText: string | null;
   summary: string;
+  changeSummary: WorkspaceEditChangeSummary;
   truncated: boolean;
   lines: WorkspaceEditDiffPreviewLine[];
   scrollOffset: number;
@@ -83,6 +89,7 @@ export type RendererDiffApprovalOptions = {
   subtitle?: string;
   helpText?: string;
   summary: string;
+  changeSummary: WorkspaceEditChangeSummary;
   truncated?: boolean;
   lines: WorkspaceEditDiffPreviewLine[];
 };
@@ -108,6 +115,7 @@ export type InteractiveRenderer = {
   reviewDiff: (
     options: RendererDiffApprovalOptions,
   ) => Promise<CommandApprovalDecision>;
+  viewDiff: (options: RendererDiffApprovalOptions) => Promise<void>;
   getSnapshot: () => InteractiveRendererSnapshot;
   dispatchInput: (
     inputValue: string,
@@ -151,6 +159,7 @@ export function createInteractiveRenderer(options: {
   let promptResolver: ((value: string) => void) | null = null;
   let overlayResolver: ((value: string | null) => void) | null = null;
   let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
+  let diffReviewResolver: (() => void) | null = null;
   let instance: Instance | null = null;
   let state: RendererState = {
     headerLines: [],
@@ -247,6 +256,18 @@ export function createInteractiveRenderer(options: {
     resolver?.(value);
   };
 
+  const resolveDiffReview = () => {
+    const resolver = diffReviewResolver;
+    diffReviewResolver = null;
+    state = {
+      ...state,
+      inputMode: "inactive",
+      overlay: null,
+    };
+    rerender();
+    resolver?.();
+  };
+
   const resolveDiff = (value: CommandApprovalDecision) => {
     const resolver = diffResolver;
     diffResolver = null;
@@ -279,7 +300,7 @@ export function createInteractiveRenderer(options: {
       appendLines("body", "/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|reject)");
       appendLines("body", "/settings Show the active system prompt and persistence path");
       appendLines("body", "/session  Show current session status");
-      appendLines("body", "/history  Show the current or selected session transcript");
+      appendLines("body", "/history  Show the current or selected session transcript and events");
       appendLines("body", "/sessions Open the saved-session picker, optionally filtered by text");
       appendLines("body", "/new      Create and switch to a fresh session");
       appendLines("body", "/switch   Switch to a saved session by id, title, or list index");
@@ -360,7 +381,7 @@ export function createInteractiveRenderer(options: {
       rerender();
     },
     readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
-      if (promptResolver || overlayResolver || diffResolver) {
+      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -388,7 +409,7 @@ export function createInteractiveRenderer(options: {
       });
     },
     selectOption: async (selection) => {
-      if (promptResolver || overlayResolver || diffResolver) {
+      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -418,7 +439,7 @@ export function createInteractiveRenderer(options: {
       });
     },
     reviewDiff: async (review) => {
-      if (promptResolver || overlayResolver || diffResolver) {
+      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -427,10 +448,12 @@ export function createInteractiveRenderer(options: {
         inputMode: "overlay",
         overlay: {
           kind: "diff",
+          mode: "approval",
           title: review.title,
           subtitle: review.subtitle ?? null,
           helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter approve once  a allow-all  Esc reject",
           summary: review.summary,
+          changeSummary: review.changeSummary,
           truncated: review.truncated ?? false,
           lines: review.lines,
           scrollOffset: 0,
@@ -441,6 +464,34 @@ export function createInteractiveRenderer(options: {
 
       return new Promise<CommandApprovalDecision>((resolve) => {
         diffResolver = resolve;
+      });
+    },
+    viewDiff: async (review) => {
+      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      state = {
+        ...state,
+        inputMode: "overlay",
+        overlay: {
+          kind: "diff",
+          mode: "review",
+          title: review.title,
+          subtitle: review.subtitle ?? null,
+          helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter close  Esc close",
+          summary: review.summary,
+          changeSummary: review.changeSummary,
+          truncated: review.truncated ?? false,
+          lines: review.lines,
+          scrollOffset: 0,
+          viewportHeight: getDiffViewportHeight(options.output),
+        },
+      };
+      rerender();
+
+      return new Promise<void>((resolve) => {
+        diffReviewResolver = resolve;
       });
     },
     getSnapshot: () => ({
@@ -581,21 +632,30 @@ export function createInteractiveRenderer(options: {
   };
 
   const handleDiffOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
-    if (!event || !state.overlay || state.overlay.kind !== "diff" || !diffResolver) {
+    if (!event || !state.overlay || state.overlay.kind !== "diff") {
       return;
     }
 
-    if (event.type === "interrupt" || event.type === "cancel") {
+    if (state.overlay.mode === "review") {
+      if (event.type === "interrupt" || event.type === "cancel" || event.type === "submit") {
+        resolveDiffReview();
+        return;
+      }
+    } else if (!diffResolver) {
+      return;
+    }
+
+    if (state.overlay.mode === "approval" && (event.type === "interrupt" || event.type === "cancel")) {
       resolveDiff("reject");
       return;
     }
 
-    if (event.type === "submit") {
+    if (state.overlay.mode === "approval" && event.type === "submit") {
       resolveDiff("once");
       return;
     }
 
-    if (event.type === "insert_text") {
+    if (state.overlay.mode === "approval" && event.type === "insert_text") {
       const normalizedText = event.text.trim().toLowerCase();
       if (normalizedText === "a") {
         resolveDiff("always");
@@ -795,7 +855,11 @@ function moveDiffScroll(
 function buildStatusText(state: RendererState): string {
   if (state.inputMode === "overlay") {
     if (state.overlay?.kind === "diff") {
-      return state.overlay.helpText ?? "Up/Down scroll  Enter approve once  Esc reject";
+      return state.overlay.helpText ?? (
+        state.overlay.mode === "approval"
+          ? "Up/Down scroll  Enter approve once  Esc reject"
+          : "Up/Down scroll  Enter close  Esc close"
+      );
     }
 
     return state.overlay?.helpText ?? "Up/Down move  Enter select  Esc cancel";

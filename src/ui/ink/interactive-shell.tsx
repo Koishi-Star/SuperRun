@@ -191,6 +191,9 @@ function DiffApprovalOverlay(props: {
       </Text>
       {props.overlay.subtitle ? <Text dimColor>{props.overlay.subtitle}</Text> : null}
       <Text>{props.overlay.summary}</Text>
+      <Text color="yellowBright">
+        {`Changed ${props.overlay.changeSummary.changedLines}  Added ${props.overlay.changeSummary.addedLines}  Removed ${props.overlay.changeSummary.removedLines}`}
+      </Text>
       {props.overlay.truncated ? (
         <Text color="yellowBright">Preview truncated to the first diff lines.</Text>
       ) : null}
@@ -204,7 +207,9 @@ function DiffApprovalOverlay(props: {
         ))}
       </Box>
       <Text dimColor>
-        Enter approve once  a allow-all  Esc reject
+        {props.overlay.mode === "approval"
+          ? "Enter approve once  a allow-all  Esc reject"
+          : "Enter close  Esc close"}
       </Text>
     </Box>
   );

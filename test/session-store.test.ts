@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, readdir, rm, mkdir, writeFile } from "node:fs/promises";
 import test from "node:test";
+import type { SessionEvent } from "../src/session/events.js";
 import {
   createSession,
   deleteAllSessions,
@@ -12,6 +13,30 @@ import {
   saveSession,
   setActiveSession,
 } from "../src/session/store.js";
+
+const sampleEvents: SessionEvent[] = [
+  {
+    timestamp: "2026-03-14T04:10:27.000Z",
+    kind: "approval_mode_changed",
+    from: "ask",
+    to: "allow-all",
+    source: "approval_decision",
+  },
+  {
+    timestamp: "2026-03-14T04:10:28.000Z",
+    kind: "workspace_edit_applied",
+    tool: "replace_lines",
+    path: "test-3.py",
+    summary: "Replace lines 5-12",
+    approvalMode: "allow-all",
+    autoApproved: true,
+    changeSummary: {
+      changedLines: 3,
+      addedLines: 2,
+      removedLines: 1,
+    },
+  },
+];
 
 test("createSession persists a session and marks it active", async () => {
   const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
@@ -25,6 +50,7 @@ test("createSession persists a session and marks it active", async () => {
         { role: "user", content: "Hi" },
         { role: "assistant", content: "Hello" },
       ],
+      events: sampleEvents,
       maxHistoryTurns: 10,
     });
 
@@ -46,6 +72,7 @@ test("createSession persists a session and marks it active", async () => {
       { role: "user", content: "Hi" },
       { role: "assistant", content: "Hello" },
     ]);
+    assert.deepEqual(loaded.events, sampleEvents);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });
@@ -76,6 +103,7 @@ test("saveSession updates an existing session and deleteSession promotes the nex
         { role: "user", content: "First" },
         { role: "assistant", content: "Reply" },
       ],
+      events: sampleEvents,
       maxHistoryTurns: 10,
     });
     assert.equal(updated.store.activeSessionId, first.session.id);
@@ -87,6 +115,7 @@ test("saveSession updates an existing session and deleteSession promotes the nex
         { role: "user", content: "First" },
         { role: "assistant", content: "Reply again" },
       ],
+      events: sampleEvents,
       maxHistoryTurns: 10,
     });
     assert.equal(preservedTitle.session.title, "Ada Session");
@@ -155,6 +184,7 @@ test("loadSessionStore hydrates legacy session summaries from stored files", asy
             { role: "user", content: "My name is Ada." },
             { role: "assistant", content: "Hello Ada." },
           ],
+          events: sampleEvents,
           maxHistoryTurns: 10,
           updatedAt: "2026-03-12T09:36:22.000Z",
         },
@@ -186,6 +216,26 @@ test("loadSessionStore hydrates legacy session summaries from stored files", asy
     assert.equal(store.sessions[0]?.updatedAt, "2026-03-12T09:36:22.000Z");
     assert.equal(store.sessions[0]?.turnCount, 1);
     assert.equal(store.sessions[0]?.charCount, 25);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("loadSession defaults missing legacy events to an empty list", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-session-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    const created = await createSession({
+      systemPrompt: "You are a reviewer.",
+      history: [{ role: "user", content: "Hi" }],
+      maxHistoryTurns: 10,
+    });
+
+    const loaded = await loadSession(created.session.id);
+    assert.deepEqual(loaded.events, []);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

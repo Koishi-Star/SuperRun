@@ -90,6 +90,12 @@ export async function insertWorkspaceLines(
     ...file.lines.slice(insertionIndex),
   ];
 
+  const diffPreview = buildWorkspaceEditDiffPreview({
+    title: relativePath,
+    summary: `Insert ${insertedLines.length} line${insertedLines.length === 1 ? "" : "s"} before line ${args.before_line} in ${relativePath}`,
+    oldLines: file.lines,
+    newLines: nextLines,
+  });
   const assessment: WorkspaceEditAssessment = {
     tool: "insert_lines",
     path: relativePath,
@@ -98,20 +104,24 @@ export async function insertWorkspaceLines(
       "targeted line insertion edits existing workspace content.",
     ],
     approvalRequired: true,
-    diffPreview: buildWorkspaceEditDiffPreview({
-      title: relativePath,
-      summary: `Insert ${insertedLines.length} line${insertedLines.length === 1 ? "" : "s"} before line ${args.before_line} in ${relativePath}`,
-      oldLines: file.lines,
-      newLines: nextLines,
-    }),
+    diffPreview,
   };
-  await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
+  const authorization = await authorizeWorkspaceEdit(assessment, context?.workspaceEditPolicy);
 
   await writeWorkspaceTextFile(absolutePath, {
     ...file,
     lines: nextLines,
     // Appending to an empty file should still produce a valid line-oriented file.
     trailingNewline: file.trailingNewline || nextLines.length > 0,
+  });
+  context?.turnEvents?.addEvent({
+    kind: "workspace_edit_review",
+    tool: "insert_lines",
+    path: relativePath,
+    summary: assessment.summary,
+    approvalMode: authorization.approvalModeAfter,
+    autoApproved: !authorization.prompted && authorization.approvalModeBefore === "allow-all",
+    diffPreview,
   });
 
   return {
