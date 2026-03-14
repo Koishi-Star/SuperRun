@@ -218,7 +218,7 @@ test("run_command crazy_auto allows shell redirection writes", async () => {
   }
 });
 
-test("run_command emits started and completed command execution events", async () => {
+test("run_command emits started output and completed command execution events", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-command-tool-"));
   const previousCwd = process.cwd();
   const turnEvents: ToolTurnEvent[] = [];
@@ -251,7 +251,9 @@ test("run_command emits started and completed command execution events", async (
     assert.equal(turnEvents[0]?.kind, "command_execution");
     assert.equal(turnEvents[0]?.phase, "started");
     assert.equal(turnEvents[1]?.kind, "command_execution");
-    assert.equal(turnEvents[1]?.phase, "completed");
+    assert.equal(turnEvents[1]?.phase, "output");
+    assert.equal(turnEvents[2]?.kind, "command_execution");
+    assert.equal(turnEvents[2]?.phase, "completed");
   } finally {
     process.chdir(previousCwd);
     await rm(tempDir, { recursive: true, force: true });

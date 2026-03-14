@@ -311,7 +311,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /settings /session /history [id|index|title] /sessions [query] /new /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -459,11 +459,13 @@ async function handleInteractivePrompt(
     return true;
   }
 
-  if (prompt === "/new") {
+  if (matchesCommand(prompt, "/new")) {
+    const requestedTitle = parseCommandArgument(prompt, "/new");
     resetCurrentSession(session, state.settings.systemPrompt);
     state.currentSessionTitle = null;
     state.sessionEvents = [];
     const result = await createSession({
+      ...(requestedTitle ? { title: requestedTitle } : {}),
       systemPrompt: session.systemPrompt,
       history: session.history,
       events: state.sessionEvents,
@@ -611,24 +613,32 @@ async function handleInteractivePrompt(
   }
 
   if (ui) {
-    ui.renderAssistantPrefix();
+    ui.beginAgentTurn(prompt);
   } else {
     process.stdout.write("assistant: ");
   }
 
   const turnEvents: ToolTurnEvent[] = [];
 
-  const reply = await runAgentTurn(session, prompt, {
-    toolContext: createToolExecutionContext(session, state, ui, turnEvents),
-    onChunk: (chunk) => {
-      if (ui) {
-        ui.appendAssistantChunk(chunk);
-        return;
-      }
+  let reply = "";
+  try {
+    reply = await runAgentTurn(session, prompt, {
+      toolContext: createToolExecutionContext(session, state, ui, turnEvents),
+      onChunk: (chunk) => {
+        if (ui) {
+          ui.appendAssistantChunk(chunk);
+          return;
+        }
 
-      process.stdout.write(chunk);
-    },
-  });
+        process.stdout.write(chunk);
+      },
+    });
+  } catch (error) {
+    if (ui) {
+      ui.failActiveTurn(error instanceof Error ? error.message : "Unknown error.");
+    }
+    throw error;
+  }
 
   applyTurnEventsToSession(state, turnEvents);
   await persistCurrentSession(session, state);
@@ -640,6 +650,10 @@ async function handleInteractivePrompt(
     } else {
       process.stdout.write("(empty response)");
     }
+  }
+
+  if (ui) {
+    ui.completeActiveTurn();
   }
 
   if (!ui) {
@@ -812,84 +826,52 @@ function buildInteractiveShellFrame(
   state: InteractiveState,
 ): Array<Omit<RendererLine, "id">> {
   const stats = getAgentSessionStats(session);
-  const source = state.settings.hasStoredSystemPrompt
-    ? "saved profile"
-    : "built-in default";
+  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+  const sessionLabel = state.currentSessionId
+    ? formatSessionLabel(state.currentSessionTitle, state.currentSessionId)
+    : state.sessionStore.sessions.length === 0
+      ? "unsaved"
+      : "not loaded";
   const lines: Array<Omit<RendererLine, "id">> = [
     { kind: "section", text: "SuperRun" },
-    { kind: "info", text: "Local coding agent interactive mode" },
     {
       kind: "info",
-      text: "Commands: /help /mode /approvals /history /sessions /new /switch /rename /delete /trash /system /editor /clear /exit",
-    },
-    { kind: "body", text: "" },
-    {
-      kind: "warning",
-      text: "Risk notice: this agent may read, run, modify, delete, or create files in the workspace. Keep backups.",
-    },
-    {
-      kind: "warning",
-      text: "Using SuperRun means you accept that risk. It will try to approve and intercept risky actions, but it cannot guarantee complete safety.",
-    },
-    {
-      kind: "warning",
-      text: "Recommendation: initialize git in the workspace so you have a recovery path for your files.",
-    },
-    ...buildDeleteAreaBannerLines(state),
-    { kind: "body", text: "" },
-    {
-      kind: "info",
-      text: `Approvals: ${getCommandApprovalSummary(state.commandApprovalMode)}.`,
+      text: `${model}  ${process.cwd()}`,
     },
     {
       kind: "info",
-      text: `Tool mode: ${getAgentModeSummary(session.mode)}.`,
+      text: `session ${sessionLabel}`,
     },
     {
       kind: "info",
-      text: `Active behavior (${source}): ${summarizePrompt(session.systemPrompt)}`,
+      text: `mode ${session.mode}  approvals ${state.commandApprovalMode}`,
     },
     {
       kind: "info",
-      text: `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+      text: `history ${stats.historyTurnCount}/${stats.maxHistoryTurns}  saved ${state.sessionStore.sessions.length}`,
     },
-    {
-      kind: "info",
-      text: 'Use "/approvals" to review file-edit and command approval behavior.',
-    },
-    {
-      kind: "info",
-      text: 'Use "/system" to change the default behavior for new work.',
-    },
-    { kind: "body", text: "" },
   ];
 
-  if (state.currentSessionId) {
+  const deleteAreaBanner = getDeleteAreaBannerText(state.deleteAreaStatus);
+  if (deleteAreaBanner) {
     lines.push({
-      kind: "info",
-      text: `Current session: ${formatSessionLabel(state.currentSessionTitle, state.currentSessionId)}. Saved sessions: ${state.sessionStore.sessions.length}.`,
-    });
-    lines.push({
-      kind: "info",
-      text: 'Use "/sessions" to browse saved work, or "/new" to start fresh.',
-    });
-  } else if (state.sessionStore.sessions.length === 0) {
-    lines.push({
-      kind: "info",
-      text: 'No saved sessions yet. Start chatting or use "/new" to create one now.',
-    });
-  } else {
-    lines.push({
-      kind: "info",
-      text: `Saved sessions: ${state.sessionStore.sessions.length}. Active session is not loaded.`,
-    });
-    lines.push({
-      kind: "info",
-      text: 'Use "/sessions" to browse them or "/switch <index>" to load one.',
+      kind: "warning",
+      text: deleteAreaBanner,
     });
   }
 
-  lines.push({ kind: "body", text: "" });
+  if (state.sessionStore.sessions.length === 0) {
+    lines.push({
+      kind: "info",
+      text: "No saved sessions yet.",
+    });
+  }
+
+  lines.push({
+    kind: "body",
+    text: "commands /help /sessions /new [title] /mode /approvals /system /clear /exit",
+  });
+
   return lines;
 }
 
@@ -1155,24 +1137,23 @@ async function renderTurnEvents(
 ): Promise<void> {
   for (const event of events) {
     if (event.kind === "command_execution") {
-      if (!ui) {
+      if (!ui && event.phase !== "output") {
         renderCommandExecutionEvent(null, event);
       }
       continue;
     }
 
     if (event.kind === "notice") {
+      if (ui) {
+        continue;
+      }
       if (event.level === "error") {
         renderError(ui, event.message);
         continue;
       }
 
       if (event.level === "warning") {
-        if (ui) {
-          ui.renderWarning(event.message);
-        } else {
-          console.log(formatRichTextToAnsi(`warning: ${event.message}`, "warning"));
-        }
+        console.log(formatRichTextToAnsi(`warning: ${event.message}`, "warning"));
         continue;
       }
 
@@ -1180,19 +1161,27 @@ async function renderTurnEvents(
       continue;
     }
 
+    if (ui && !event.autoApproved) {
+      continue;
+    }
+
     const changeSummaryText = formatWorkspaceEditChangeSummary(
       event.diffPreview.changeSummary,
     );
-    renderInfo(
-      ui,
-      `Edited ${event.path}: ${changeSummaryText}.`,
-    );
-
-    if (event.autoApproved) {
+    if (!ui) {
       renderInfo(
         ui,
-        `Auto-approved under ${event.approvalMode}: ${event.summary}.`,
+        `Edited ${event.path}: ${changeSummaryText}.`,
       );
+    }
+
+    if (event.autoApproved) {
+      if (!ui) {
+        renderInfo(
+          ui,
+          `Auto-approved under ${event.approvalMode}: ${event.summary}.`,
+        );
+      }
       if (ui) {
         await ui.viewDiff({
           title: `Applied ${event.tool}`,
@@ -1624,6 +1613,10 @@ function renderCommandExecutionEvent(
 function buildCommandExecutionBox(
   event: Extract<ToolTurnEvent, { kind: "command_execution" }>,
 ): string[] {
+  if (event.phase === "output") {
+    return [];
+  }
+
   if (event.phase === "started") {
     return [
       "┌ Command",
@@ -1955,19 +1948,19 @@ function createToolExecutionContext(
     },
     notices: {
       addNotice: (notice) => {
-        turnEvents.push({
+        const event = {
           kind: "notice",
           level: notice.level,
           message: notice.message,
-        });
+        } satisfies ToolTurnEvent;
+        turnEvents.push(event);
+        ui?.applyToolEvent(event);
       },
     },
     turnEvents: {
       addEvent: (event) => {
         turnEvents.push(event);
-        if (ui && event.kind === "command_execution") {
-          renderCommandExecutionEvent(ui, event);
-        }
+        ui?.applyToolEvent(event);
       },
     },
   };
@@ -1979,10 +1972,10 @@ async function promptCommandApproval(
 ): Promise<CommandApprovalDecision> {
   const { assessment } = request;
   const reasonSummary = assessment.reasons.join(" ");
-  const selectedDecision = await ui.selectOption({
+  return ui.requestApproval({
     title: `Approve ${assessment.category} command?`,
     subtitle: assessment.summary,
-    helpText: "Up/Down move  Enter choose  Esc reject",
+    helpText: "Up/Down move  Enter approve once  a allow-all  Esc reject",
     options: [
       {
         value: "once",
@@ -2004,8 +1997,6 @@ async function promptCommandApproval(
       },
     ],
   });
-
-  return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
 }
 
 async function promptWorkspaceEditApproval(
@@ -2025,10 +2016,10 @@ async function promptWorkspaceEditApproval(
   }
 
   const reasonSummary = assessment.reasons.join(" ");
-  const selectedDecision = await ui.selectOption({
+  return ui.requestApproval({
     title: `Approve ${assessment.tool}?`,
     subtitle: `${assessment.summary}: ${assessment.path}`,
-    helpText: "Up/Down move  Enter choose  Esc reject",
+    helpText: "Up/Down move  Enter approve once  a allow-all  Esc reject",
     options: [
       {
         value: "once",
@@ -2050,8 +2041,6 @@ async function promptWorkspaceEditApproval(
       },
     ],
   });
-
-  return (selectedDecision as CommandApprovalDecision | null) ?? "reject";
 }
 
 function buildApprovalPickerOptions(

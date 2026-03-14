@@ -143,6 +143,14 @@ export type CommandExecutionEvent =
     }
   | {
       kind: "command_execution";
+      phase: "output";
+      command: string;
+      cwd: string;
+      stream: "stdout" | "stderr";
+      chunk: string;
+    }
+  | {
+      kind: "command_execution";
       phase: "completed";
       command: string;
       cwd: string;

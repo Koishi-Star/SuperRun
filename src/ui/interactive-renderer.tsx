@@ -3,6 +3,8 @@ import { render, type Instance } from "ink";
 import React from "react";
 import type {
   CommandApprovalDecision,
+  CommandCategory,
+  ToolTurnEvent,
   WorkspaceEditChangeSummary,
   WorkspaceEditDiffPreviewLine,
 } from "../tools/types.js";
@@ -24,7 +26,7 @@ import { normalizeInkInput } from "./input-events.js";
 
 export type RendererLine = {
   id: string;
-  kind: "info" | "error" | "warning" | "section" | "body" | "assistant";
+  kind: "info" | "error" | "warning" | "section" | "body";
   text: string;
 };
 
@@ -68,7 +70,23 @@ export type RendererPickerOverlay = {
   selectedIndex: number;
 };
 
-export type RendererDiffOverlay = {
+export type RendererInlineApprovalOption = {
+  value: CommandApprovalDecision;
+  label: string;
+  description: string;
+  tone: "default" | "accent" | "danger";
+};
+
+export type RendererInlineApprovalBlock = {
+  kind: "approval";
+  title: string;
+  subtitle: string | null;
+  helpText: string | null;
+  options: RendererInlineApprovalOption[];
+  selectedIndex: number;
+};
+
+export type RendererDiffBlock = {
   kind: "diff";
   mode: "approval" | "review";
   title: string;
@@ -82,7 +100,7 @@ export type RendererDiffOverlay = {
   viewportHeight: number;
 };
 
-export type RendererOverlay = RendererPickerOverlay | RendererDiffOverlay;
+export type RendererInlineBlock = RendererInlineApprovalBlock | RendererDiffBlock;
 
 export type RendererDiffApprovalOptions = {
   title: string;
@@ -94,27 +112,78 @@ export type RendererDiffApprovalOptions = {
   lines: WorkspaceEditDiffPreviewLine[];
 };
 
+export type RendererApprovalOptions = {
+  title: string;
+  subtitle?: string;
+  helpText?: string;
+  options: RendererInlineApprovalOption[];
+};
+
+export type RendererToolStep = {
+  id: string;
+  kind: "command" | "workspace_edit" | "notice";
+  title: string;
+  summary: string;
+  status: "running" | "completed" | "failed" | "timed_out";
+  command: string | null;
+  cwd: string | null;
+  category: CommandCategory | null;
+  path: string | null;
+  outputLines: string[];
+  outputRemainder: string;
+  outputTruncated: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  stream: "stdout" | "stderr" | null;
+};
+
+export type RendererAgentTurn = {
+  id: string;
+  kind: "agent";
+  status:
+    | "collecting_input"
+    | "running_tools"
+    | "awaiting_approval"
+    | "streaming_answer"
+    | "completed"
+    | "failed";
+  promptText: string;
+  steps: RendererToolStep[];
+  answerText: string;
+  inlineBlock: RendererInlineBlock | null;
+};
+
+export type RendererSystemTurn = {
+  id: string;
+  kind: "system";
+  lines: RendererLine[];
+};
+
+export type RendererTurnCard = RendererAgentTurn | RendererSystemTurn;
+
 export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
   setShellFrame: (lines: Array<Omit<RendererLine, "id">>) => void;
   renderCommands: () => void;
-  renderAssistantPrefix: () => void;
-  appendAssistantChunk: (chunk: string) => void;
   renderSectionTitle: (title: string) => void;
   renderInfo: (message: string) => void;
   renderError: (message: string) => void;
   renderWarning: (message: string) => void;
   writeBodyLine: (message: string) => void;
+  beginAgentTurn: (promptText: string) => void;
+  appendAssistantChunk: (chunk: string) => void;
+  completeActiveTurn: () => void;
+  failActiveTurn: (message: string) => void;
+  applyToolEvent: (event: ToolTurnEvent) => void;
   clearScreen: () => void;
   readPrompt: (options: {
     promptLabel: string;
     workspaceFiles: string[];
   }) => Promise<string>;
   selectOption: (options: RendererSelectOptions) => Promise<string | null>;
-  reviewDiff: (
-    options: RendererDiffApprovalOptions,
-  ) => Promise<CommandApprovalDecision>;
+  requestApproval: (options: RendererApprovalOptions) => Promise<CommandApprovalDecision>;
+  reviewDiff: (options: RendererDiffApprovalOptions) => Promise<CommandApprovalDecision>;
   viewDiff: (options: RendererDiffApprovalOptions) => Promise<void>;
   getSnapshot: () => InteractiveRendererSnapshot;
   dispatchInput: (
@@ -126,44 +195,47 @@ export type InteractiveRenderer = {
   dispose: () => void;
 };
 
-type RendererInputMode = "inactive" | "prompt" | "overlay";
+type RendererInputMode = "inactive" | "prompt" | "overlay" | "inline";
 
 type RendererState = {
   headerLines: RendererLine[];
-  logLines: RendererLine[];
+  turns: RendererTurnCard[];
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
-  overlay: RendererOverlay | null;
+  overlay: RendererPickerOverlay | null;
 };
 
 export type InteractiveRendererSnapshot = {
   headerLines: RendererLine[];
-  logLines: RendererLine[];
+  turns: RendererTurnCard[];
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
   inputActive: boolean;
-  overlay: RendererOverlay | null;
+  overlay: RendererPickerOverlay | null;
   statusText: string;
 };
+
+const MAX_COMMAND_OUTPUT_LINES = 200;
 
 export function createInteractiveRenderer(options: {
   input: NodeJS.ReadStream;
   output: NodeJS.WriteStream;
   enableInput?: boolean;
 }): InteractiveRenderer {
-  const promptLabel = "you > ";
+  const promptLabel = "> ";
   const editorPromptLabel = "system > ";
   let nextLineId = 0;
-  let activeAssistantLineId: string | null = null;
+  let nextTurnId = 0;
   let promptWorkspaceFiles: string[] = [];
   let promptResolver: ((value: string) => void) | null = null;
   let overlayResolver: ((value: string | null) => void) | null = null;
+  let inlineApprovalResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffReviewResolver: (() => void) | null = null;
   let instance: Instance | null = null;
   let state: RendererState = {
     headerLines: [],
-    logLines: [],
+    turns: [],
     prompt: {
       label: {
         kind: "user",
@@ -203,34 +275,98 @@ export function createInteractiveRenderer(options: {
   const renderApp = () => (
     <InteractiveShell
       headerLines={state.headerLines}
-      logLines={state.logLines}
+      turns={state.turns}
       prompt={state.prompt}
       divider={buildDivider(options.output)}
       inputEnabled={options.enableInput ?? true}
       inputMode={state.inputMode}
       overlay={state.overlay}
       statusText={buildStatusText(state)}
+      commandViewportHeight={getCommandViewportHeight(options.output)}
       onInput={handleInput}
     />
   );
 
-  const appendLines = (
+  const ensureSystemTurn = (): RendererSystemTurn => {
+    const lastTurn = state.turns[state.turns.length - 1];
+    if (lastTurn?.kind === "system") {
+      return lastTurn;
+    }
+
+    const turn: RendererSystemTurn = {
+      id: `turn_${nextTurnId += 1}`,
+      kind: "system",
+      lines: [],
+    };
+    state = {
+      ...state,
+      turns: [...state.turns, turn],
+    };
+    return turn;
+  };
+
+  const appendSystemLines = (
     kind: RendererLine["kind"],
     message: string,
   ) => {
     const lines = message.split(/\r?\n/);
+    const turn = ensureSystemTurn();
+    turn.lines.push(...lines.map((text) => ({
+      id: `line_${nextLineId += 1}`,
+      kind,
+      text,
+    })));
+    rerender();
+  };
+
+  const getLatestAgentTurnIndex = (): number => [...state.turns].findLastIndex(
+    (turn) => turn.kind === "agent",
+  );
+
+  const updateAgentTurn = (
+    index: number,
+    updater: (turn: RendererAgentTurn) => RendererAgentTurn,
+  ): RendererAgentTurn | null => {
+    const target = state.turns[index];
+    if (!target || target.kind !== "agent") {
+      return null;
+    }
+
+    const nextTurn = updater(target);
+    const nextTurns = [...state.turns];
+    nextTurns[index] = nextTurn;
     state = {
       ...state,
-      logLines: [
-        ...state.logLines,
-        ...lines.map((text) => ({
-          id: `line_${nextLineId += 1}`,
-          kind,
-          text,
-        })),
-      ],
+      turns: nextTurns,
     };
-    rerender();
+    return nextTurn;
+  };
+
+  const updateLatestAgentTurn = (
+    updater: (turn: RendererAgentTurn) => RendererAgentTurn,
+  ): RendererAgentTurn | null => {
+    const index = getLatestAgentTurnIndex();
+    return index === -1 ? null : updateAgentTurn(index, updater);
+  };
+
+  const getLatestAgentTurn = (): RendererAgentTurn | null => {
+    const index = getLatestAgentTurnIndex();
+    const turn = index === -1 ? null : state.turns[index];
+    return turn?.kind === "agent" ? turn : null;
+  };
+
+  const setLatestAgentInlineBlock = (
+    block: RendererInlineBlock | null,
+    status?: RendererAgentTurn["status"],
+  ) => {
+    const updated = updateLatestAgentTurn((turn) => ({
+      ...turn,
+      ...(status ? { status } : {}),
+      inlineBlock: block,
+    }));
+    if (updated) {
+      rerender();
+    }
   };
 
   const resolvePrompt = (value: string) => {
@@ -256,28 +392,41 @@ export function createInteractiveRenderer(options: {
     resolver?.(value);
   };
 
-  const resolveDiffReview = () => {
-    const resolver = diffReviewResolver;
-    diffReviewResolver = null;
+  const resolveInlineApproval = (value: CommandApprovalDecision) => {
+    const resolver = inlineApprovalResolver;
+    inlineApprovalResolver = null;
+    setLatestAgentInlineBlock(null, "running_tools");
     state = {
       ...state,
       inputMode: "inactive",
-      overlay: null,
-    };
-    rerender();
-    resolver?.();
-  };
-
-  const resolveDiff = (value: CommandApprovalDecision) => {
-    const resolver = diffResolver;
-    diffResolver = null;
-    state = {
-      ...state,
-      inputMode: "inactive",
-      overlay: null,
     };
     rerender();
     resolver?.(value);
+  };
+
+  const resolveDiffApproval = (value: CommandApprovalDecision) => {
+    const resolver = diffResolver;
+    diffResolver = null;
+    setLatestAgentInlineBlock(null, "running_tools");
+    state = {
+      ...state,
+      inputMode: "inactive",
+    };
+    rerender();
+    resolver?.(value);
+  };
+
+  const resolveDiffReview = () => {
+    const resolver = diffReviewResolver;
+    diffReviewResolver = null;
+    const latestTurn = getLatestAgentTurn();
+    setLatestAgentInlineBlock(null, latestTurn?.status === "failed" ? "failed" : "completed");
+    state = {
+      ...state,
+      inputMode: "inactive",
+    };
+    rerender();
+    resolver?.();
   };
 
   const renderer: InteractiveRenderer = {
@@ -294,102 +443,112 @@ export function createInteractiveRenderer(options: {
       rerender();
     },
     renderCommands: () => {
-      appendLines("section", "Available commands");
-      appendLines("body", "/help  Show command help");
-      appendLines("body", "/mode     Show or switch the active tool mode (default|strict)");
-      appendLines("body", "/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
-      appendLines("body", "/settings Show the active system prompt and persistence path");
-      appendLines("body", "/session  Show current session status");
-      appendLines("body", "/history  Show the current or selected session transcript and events");
-      appendLines("body", "/sessions Open the saved-session picker, optionally filtered by text");
-      appendLines("body", "/new      Create and switch to a fresh session");
-      appendLines("body", "/switch   Switch to a saved session by id, title, or list index");
-      appendLines("body", "/rename   Rename the current saved session");
-      appendLines("body", "/delete   Delete the current session, one session by id/title/index, or all sessions");
-      appendLines("body", "/trash    Manage the local delete area without going through the model");
-      appendLines("body", "/system  Edit and persist the system prompt directly in the terminal");
-      appendLines("body", "/editor  Open the current system prompt in your external editor");
-      appendLines("body", "/system reset Restore the built-in system prompt");
-      appendLines("body", "/clear Clear the screen and redraw the header");
-      appendLines("body", "/exit  Exit the session (also: exit, exit())");
-      appendLines("body", "");
+      renderer.renderSectionTitle("Available commands");
+      renderer.writeBodyLine("/help  Show command help");
+      renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict)");
+      renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
+      renderer.writeBodyLine("/settings Show the active system prompt and persistence path");
+      renderer.writeBodyLine("/session  Show current session status");
+      renderer.writeBodyLine("/history  Show the current or selected session transcript and events");
+      renderer.writeBodyLine("/sessions Open the saved-session picker, optionally filtered by text");
+      renderer.writeBodyLine("/new [title] Create and switch to a fresh session");
+      renderer.writeBodyLine("/switch   Switch to a saved session by id, title, or list index");
+      renderer.writeBodyLine("/rename   Rename the current saved session");
+      renderer.writeBodyLine("/delete   Delete the current session, one session by id/title/index, or all sessions");
+      renderer.writeBodyLine("/trash    Manage the local delete area without going through the model");
+      renderer.writeBodyLine("/system  Edit and persist the system prompt directly in the terminal");
+      renderer.writeBodyLine("/editor  Open the current system prompt in your external editor");
+      renderer.writeBodyLine("/system reset Restore the built-in system prompt");
+      renderer.writeBodyLine("/clear Clear the screen and redraw the header");
+      renderer.writeBodyLine("/exit  Exit the session (also: exit, exit())");
+      renderer.writeBodyLine("");
     },
-    renderAssistantPrefix: () => {
-      if (activeAssistantLineId) {
-        return;
-      }
-
-      const lineId = `assistant_${nextLineId += 1}`;
-      activeAssistantLineId = lineId;
+    renderSectionTitle: (title) => {
+      appendSystemLines("section", title);
+    },
+    renderInfo: (message) => {
+      appendSystemLines("info", message);
+    },
+    renderError: (message) => {
+      appendSystemLines("error", message);
+    },
+    renderWarning: (message) => {
+      appendSystemLines("warning", message);
+    },
+    writeBodyLine: (message) => {
+      appendSystemLines("body", message);
+    },
+    beginAgentTurn: (promptText) => {
       state = {
         ...state,
-        logLines: [
-          ...state.logLines,
+        turns: [
+          ...state.turns,
           {
-            id: lineId,
-            kind: "assistant",
-            text: "",
+            id: `turn_${nextTurnId += 1}`,
+            kind: "agent",
+            status: "running_tools",
+            promptText,
+            steps: [],
+            answerText: "",
+            inlineBlock: null,
           },
         ],
       };
       rerender();
     },
     appendAssistantChunk: (chunk) => {
-      if (!activeAssistantLineId) {
-        renderer.renderAssistantPrefix();
+      const updated = updateLatestAgentTurn((turn) => ({
+        ...turn,
+        status: "streaming_answer",
+        answerText: `${turn.answerText}${chunk}`,
+      }));
+      if (updated) {
+        rerender();
       }
-
-      if (!activeAssistantLineId) {
+    },
+    completeActiveTurn: () => {
+      const updated = updateLatestAgentTurn((turn) => ({
+        ...turn,
+        status: turn.status === "failed" ? "failed" : "completed",
+      }));
+      if (updated) {
+        rerender();
+      }
+    },
+    failActiveTurn: (message) => {
+      const updated = updateLatestAgentTurn((turn) => ({
+        ...turn,
+        status: "failed",
+        answerText: turn.answerText ? `${turn.answerText}\n\n${message}` : message,
+      }));
+      if (updated) {
+        rerender();
         return;
       }
 
-      state = {
-        ...state,
-        logLines: state.logLines.map((line) =>
-          line.id === activeAssistantLineId
-            ? {
-                ...line,
-                text: `${line.text}${chunk}`,
-              }
-            : line,
-        ),
-      };
-      rerender();
+      renderer.renderError(message);
     },
-    renderSectionTitle: (title) => {
-      appendLines("section", title);
-    },
-    renderInfo: (message) => {
-      appendLines("info", message);
-    },
-    renderError: (message) => {
-      appendLines("error", message);
-    },
-    renderWarning: (message) => {
-      appendLines("warning", message);
-    },
-    writeBodyLine: (message) => {
-      appendLines("body", message);
+    applyToolEvent: (event) => {
+      const updated = updateLatestAgentTurn((turn) => applyToolEventToTurn(turn, event));
+      if (updated) {
+        rerender();
+      }
     },
     clearScreen: () => {
       state = {
         ...state,
-        logLines: [],
+        turns: [],
       };
-      activeAssistantLineId = null;
       instance?.clear();
       rerender();
     },
     readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
-      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
-      // External terminal tools can leave stdin paused after they tear down readline.
-      // Resume before each prompt so Ink can receive keypresses again.
       options.input.resume?.();
       promptWorkspaceFiles = workspaceFiles;
-      activeAssistantLineId = null;
       state = {
         ...state,
         inputMode: "prompt",
@@ -409,7 +568,7 @@ export function createInteractiveRenderer(options: {
       });
     },
     selectOption: async (selection) => {
-      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
@@ -438,27 +597,51 @@ export function createInteractiveRenderer(options: {
         overlayResolver = resolve;
       });
     },
-    reviewDiff: async (review) => {
-      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
+    requestApproval: async (approval) => {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      const onceIndex = approval.options.findIndex((option) => option.value === "once");
+      setLatestAgentInlineBlock({
+        kind: "approval",
+        title: approval.title,
+        subtitle: approval.subtitle ?? null,
+        helpText: approval.helpText ?? "Up/Down move  Enter approve once  a allow-all  Esc reject",
+        options: approval.options,
+        selectedIndex: onceIndex >= 0 ? onceIndex : 0,
+      }, "awaiting_approval");
       state = {
         ...state,
-        inputMode: "overlay",
-        overlay: {
-          kind: "diff",
-          mode: "approval",
-          title: review.title,
-          subtitle: review.subtitle ?? null,
-          helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter approve once  a allow-all  Esc reject",
-          summary: review.summary,
-          changeSummary: review.changeSummary,
-          truncated: review.truncated ?? false,
-          lines: review.lines,
-          scrollOffset: 0,
-          viewportHeight: getDiffViewportHeight(options.output),
-        },
+        inputMode: "inline",
+      };
+      rerender();
+
+      return new Promise<CommandApprovalDecision>((resolve) => {
+        inlineApprovalResolver = resolve;
+      });
+    },
+    reviewDiff: async (review) => {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
+        throw new Error("Interactive renderer is already waiting for input.");
+      }
+
+      setLatestAgentInlineBlock({
+        kind: "diff",
+        mode: "approval",
+        title: review.title,
+        subtitle: review.subtitle ?? null,
+        helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter approve once  a allow-all  Esc reject",
+        summary: review.summary,
+        changeSummary: review.changeSummary,
+        truncated: review.truncated ?? false,
+        lines: review.lines,
+        scrollOffset: 0,
+        viewportHeight: getDiffViewportHeight(options.output),
+      }, "awaiting_approval");
+      state = {
+        ...state,
+        inputMode: "inline",
       };
       rerender();
 
@@ -467,26 +650,26 @@ export function createInteractiveRenderer(options: {
       });
     },
     viewDiff: async (review) => {
-      if (promptResolver || overlayResolver || diffResolver || diffReviewResolver) {
+      if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
 
+      setLatestAgentInlineBlock({
+        kind: "diff",
+        mode: "review",
+        title: review.title,
+        subtitle: review.subtitle ?? null,
+        helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter close  Esc close",
+        summary: review.summary,
+        changeSummary: review.changeSummary,
+        truncated: review.truncated ?? false,
+        lines: review.lines,
+        scrollOffset: 0,
+        viewportHeight: getDiffViewportHeight(options.output),
+      }, getLatestAgentTurn()?.status === "failed" ? "failed" : "completed");
       state = {
         ...state,
-        inputMode: "overlay",
-        overlay: {
-          kind: "diff",
-          mode: "review",
-          title: review.title,
-          subtitle: review.subtitle ?? null,
-          helpText: review.helpText ?? "Up/Down scroll  PgUp/PgDn page  Enter close  Esc close",
-          summary: review.summary,
-          changeSummary: review.changeSummary,
-          truncated: review.truncated ?? false,
-          lines: review.lines,
-          scrollOffset: 0,
-          viewportHeight: getDiffViewportHeight(options.output),
-        },
+        inputMode: "inline",
       };
       rerender();
 
@@ -495,8 +678,8 @@ export function createInteractiveRenderer(options: {
       });
     },
     getSnapshot: () => ({
-      headerLines: [...state.headerLines],
-      logLines: [...state.logLines],
+      headerLines: state.headerLines.map(cloneRendererLine),
+      turns: state.turns.map(cloneRendererTurn),
       prompt: {
         label: { ...state.prompt.label },
         state: { ...state.prompt.state },
@@ -504,15 +687,10 @@ export function createInteractiveRenderer(options: {
       inputMode: state.inputMode,
       inputActive: state.inputMode !== "inactive",
       overlay: state.overlay
-        ? state.overlay.kind === "picker"
-          ? {
-              ...state.overlay,
-              options: [...state.overlay.options],
-            }
-          : {
-              ...state.overlay,
-              lines: [...state.overlay.lines],
-            }
+        ? {
+            ...state.overlay,
+            options: [...state.overlay.options],
+          }
         : null,
       statusText: buildStatusText(state),
     }),
@@ -557,6 +735,11 @@ export function createInteractiveRenderer(options: {
       return;
     }
 
+    if (state.inputMode === "inline") {
+      handleInlineInput(event);
+      return;
+    }
+
     if (state.inputMode !== "prompt" || !promptResolver) {
       return;
     }
@@ -565,16 +748,7 @@ export function createInteractiveRenderer(options: {
   };
 
   const handleOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
-    if (!event || !state.overlay) {
-      return;
-    }
-
-    if (state.overlay.kind === "diff") {
-      handleDiffOverlayInput(event);
-      return;
-    }
-
-    if (!overlayResolver) {
+    if (!event || !state.overlay || !overlayResolver) {
       return;
     }
 
@@ -631,12 +805,49 @@ export function createInteractiveRenderer(options: {
     }
   };
 
-  const handleDiffOverlayInput = (event: ReturnType<typeof normalizeInkInput>) => {
-    if (!event || !state.overlay || state.overlay.kind !== "diff") {
+  const handleInlineInput = (event: ReturnType<typeof normalizeInkInput>) => {
+    const latestTurn = getLatestAgentTurn();
+    const inlineBlock = latestTurn?.inlineBlock;
+    if (!event || !latestTurn || !inlineBlock) {
       return;
     }
 
-    if (state.overlay.mode === "review") {
+    if (inlineBlock.kind === "approval") {
+      if (!inlineApprovalResolver) {
+        return;
+      }
+
+      if (event.type === "interrupt" || event.type === "cancel") {
+        resolveInlineApproval("reject");
+        return;
+      }
+
+      if (event.type === "submit") {
+        const selectedOption = inlineBlock.options[inlineBlock.selectedIndex];
+        resolveInlineApproval(selectedOption?.value ?? "reject");
+        return;
+      }
+
+      if (event.type === "insert_text") {
+        const normalizedText = event.text.trim().toLowerCase();
+        if (normalizedText === "a") {
+          resolveInlineApproval("always");
+          return;
+        }
+
+        if (normalizedText === "r") {
+          resolveInlineApproval("reject");
+          return;
+        }
+      }
+
+      if (event.type === "move_up" || event.type === "move_down" || event.type === "move_home" || event.type === "move_end") {
+        setLatestAgentInlineBlock(moveApprovalSelection(inlineBlock, event.type));
+      }
+      return;
+    }
+
+    if (inlineBlock.mode === "review") {
       if (event.type === "interrupt" || event.type === "cancel" || event.type === "submit") {
         resolveDiffReview();
         return;
@@ -645,77 +856,53 @@ export function createInteractiveRenderer(options: {
       return;
     }
 
-    if (state.overlay.mode === "approval" && (event.type === "interrupt" || event.type === "cancel")) {
-      resolveDiff("reject");
+    if (inlineBlock.mode === "approval" && (event.type === "interrupt" || event.type === "cancel")) {
+      resolveDiffApproval("reject");
       return;
     }
 
-    if (state.overlay.mode === "approval" && event.type === "submit") {
-      resolveDiff("once");
+    if (inlineBlock.mode === "approval" && event.type === "submit") {
+      resolveDiffApproval("once");
       return;
     }
 
-    if (state.overlay.mode === "approval" && event.type === "insert_text") {
+    if (inlineBlock.mode === "approval" && event.type === "insert_text") {
       const normalizedText = event.text.trim().toLowerCase();
       if (normalizedText === "a") {
-        resolveDiff("always");
+        resolveDiffApproval("always");
         return;
       }
 
       if (normalizedText === "r") {
-        resolveDiff("reject");
+        resolveDiffApproval("reject");
+        return;
       }
-      return;
     }
 
     switch (event.type) {
       case "move_up":
-        state = {
-          ...state,
-          overlay: moveDiffScroll(state.overlay, -1),
-        };
-        rerender();
+        setLatestAgentInlineBlock(moveDiffScroll(inlineBlock, -1));
         return;
       case "move_down":
-        state = {
-          ...state,
-          overlay: moveDiffScroll(state.overlay, 1),
-        };
-        rerender();
+        setLatestAgentInlineBlock(moveDiffScroll(inlineBlock, 1));
         return;
       case "move_page_up":
-        state = {
-          ...state,
-          overlay: moveDiffScroll(state.overlay, -state.overlay.viewportHeight),
-        };
-        rerender();
+        setLatestAgentInlineBlock(moveDiffScroll(inlineBlock, -inlineBlock.viewportHeight));
         return;
       case "move_page_down":
-        state = {
-          ...state,
-          overlay: moveDiffScroll(state.overlay, state.overlay.viewportHeight),
-        };
-        rerender();
+        setLatestAgentInlineBlock(moveDiffScroll(inlineBlock, inlineBlock.viewportHeight));
         return;
       case "move_home":
-        state = {
-          ...state,
-          overlay: {
-            ...state.overlay,
-            scrollOffset: 0,
-          },
-        };
-        rerender();
+        setLatestAgentInlineBlock({
+          ...inlineBlock,
+          scrollOffset: 0,
+        });
         return;
       case "move_end":
-        state = {
-          ...state,
-          overlay: {
-            ...state.overlay,
-            scrollOffset: Math.max(0, state.overlay.lines.length - state.overlay.viewportHeight),
-          },
-        };
-        rerender();
+        setLatestAgentInlineBlock({
+          ...inlineBlock,
+          scrollOffset: Math.max(0, inlineBlock.lines.length - inlineBlock.viewportHeight),
+        });
         return;
       default:
         return;
@@ -824,6 +1011,221 @@ export function createInteractiveRenderer(options: {
   return renderer;
 }
 
+function applyToolEventToTurn(
+  turn: RendererAgentTurn,
+  event: ToolTurnEvent,
+): RendererAgentTurn {
+  if (event.kind === "notice") {
+    return {
+      ...turn,
+      steps: [
+        ...turn.steps,
+        {
+          id: `notice_${turn.steps.length + 1}`,
+          kind: "notice",
+          title: event.level.toUpperCase(),
+          summary: event.message,
+          status: event.level === "error" ? "failed" : "completed",
+          command: null,
+          cwd: null,
+          category: null,
+          path: null,
+          outputLines: [],
+          outputRemainder: "",
+          outputTruncated: false,
+          exitCode: null,
+          timedOut: false,
+          stream: null,
+        },
+      ],
+    };
+  }
+
+  if (event.kind === "workspace_edit_review") {
+    return {
+      ...turn,
+      steps: [
+        ...turn.steps,
+        {
+          id: `edit_${turn.steps.length + 1}`,
+          kind: "workspace_edit",
+          title: `${event.tool} ${event.path}`,
+          summary: `${event.summary} (${formatChangeSummary(event.diffPreview.changeSummary)})`,
+          status: "completed",
+          command: null,
+          cwd: null,
+          category: null,
+          path: event.path,
+          outputLines: [],
+          outputRemainder: "",
+          outputTruncated: false,
+          exitCode: null,
+          timedOut: false,
+          stream: null,
+        },
+      ],
+    };
+  }
+
+  if (event.phase === "started") {
+    return {
+      ...turn,
+      status: "running_tools",
+      steps: [
+        ...turn.steps,
+        {
+          id: `command_${turn.steps.length + 1}`,
+          kind: "command",
+          title: event.command,
+          summary: event.summary,
+          status: "running",
+          command: event.command,
+          cwd: event.cwd,
+          category: event.category,
+          path: null,
+          outputLines: [],
+          outputRemainder: "",
+          outputTruncated: false,
+          exitCode: null,
+          timedOut: false,
+          stream: null,
+        },
+      ],
+    };
+  }
+
+  const activeCommandIndex = [...turn.steps].findLastIndex((step) =>
+    step.kind === "command" &&
+    step.command === event.command &&
+    step.cwd === event.cwd
+  );
+  if (activeCommandIndex === -1) {
+    return turn;
+  }
+
+  const nextSteps = [...turn.steps];
+  const targetStep = nextSteps[activeCommandIndex];
+  if (!targetStep || targetStep.kind !== "command") {
+    return turn;
+  }
+
+  if (event.phase === "output") {
+    nextSteps[activeCommandIndex] = appendCommandOutput(targetStep, event.chunk, event.stream);
+    return {
+      ...turn,
+      steps: nextSteps,
+    };
+  }
+
+  nextSteps[activeCommandIndex] = finalizeCommandStep(targetStep, event);
+  return {
+    ...turn,
+    steps: nextSteps,
+  };
+}
+
+function appendCommandOutput(
+  step: RendererToolStep,
+  chunk: string,
+  stream: "stdout" | "stderr",
+): RendererToolStep {
+  const combined = `${step.outputRemainder}${chunk}`;
+  const normalized = combined.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  let remainder = lines.pop() ?? "";
+  if (normalized.endsWith("\n")) {
+    remainder = "";
+  }
+  const truncatedOutput = truncateOutputLines([
+    ...step.outputLines,
+    ...lines.map((line) => `${stream === "stderr" ? "stderr" : "stdout"} | ${line}`),
+  ]);
+
+  return {
+    ...step,
+    outputLines: truncatedOutput.lines,
+    outputRemainder: remainder,
+    outputTruncated: step.outputTruncated || truncatedOutput.truncated,
+    stream,
+  };
+}
+
+function finalizeCommandStep(
+  step: RendererToolStep,
+  event: Extract<ToolTurnEvent, { kind: "command_execution"; phase: "completed" }>,
+): RendererToolStep {
+  let outputLines = step.outputLines;
+  if (step.outputRemainder) {
+    const truncatedOutput = truncateOutputLines([
+      ...outputLines,
+      `${step.stream === "stderr" ? "stderr" : "stdout"} | ${step.outputRemainder}`,
+    ]);
+    outputLines = truncatedOutput.lines;
+  }
+
+  return {
+    ...step,
+    summary: event.timedOut
+      ? "Timed out"
+      : event.exitCode === 0
+        ? event.summary
+        : `Exited with code ${event.exitCode ?? "null"}`,
+    status: event.timedOut
+      ? "timed_out"
+      : event.exitCode === 0
+        ? "completed"
+        : "failed",
+    outputLines,
+    outputRemainder: "",
+    outputTruncated: step.outputTruncated || event.truncated,
+    exitCode: event.exitCode,
+    timedOut: event.timedOut,
+  };
+}
+
+function truncateOutputLines(lines: string[]): { lines: string[]; truncated: boolean } {
+  if (lines.length <= MAX_COMMAND_OUTPUT_LINES) {
+    return { lines, truncated: false };
+  }
+
+  return {
+    lines: lines.slice(lines.length - MAX_COMMAND_OUTPUT_LINES),
+    truncated: true,
+  };
+}
+
+function cloneRendererLine(line: RendererLine): RendererLine {
+  return { ...line };
+}
+
+function cloneRendererTurn(turn: RendererTurnCard): RendererTurnCard {
+  if (turn.kind === "system") {
+    return {
+      ...turn,
+      lines: turn.lines.map(cloneRendererLine),
+    };
+  }
+
+  return {
+    ...turn,
+    steps: turn.steps.map((step) => ({
+      ...step,
+      outputLines: [...step.outputLines],
+    })),
+    inlineBlock: turn.inlineBlock
+      ? turn.inlineBlock.kind === "approval"
+        ? {
+            ...turn.inlineBlock,
+            options: [...turn.inlineBlock.options],
+          }
+        : {
+            ...turn.inlineBlock,
+            lines: [...turn.inlineBlock.lines],
+          }
+      : null,
+  };
+}
+
 function moveOverlaySelection(
   overlay: RendererPickerOverlay,
   delta: number,
@@ -832,44 +1234,77 @@ function moveOverlaySelection(
     return overlay;
   }
 
-  const nextIndex =
-    (overlay.selectedIndex + delta + overlay.options.length) % overlay.options.length;
-
   return {
     ...overlay,
-    selectedIndex: nextIndex,
+    selectedIndex: (overlay.selectedIndex + delta + overlay.options.length) % overlay.options.length,
+  };
+}
+
+function moveApprovalSelection(
+  block: RendererInlineApprovalBlock,
+  action: "move_up" | "move_down" | "move_home" | "move_end",
+): RendererInlineApprovalBlock {
+  if (block.options.length === 0) {
+    return block;
+  }
+
+  if (action === "move_home") {
+    return { ...block, selectedIndex: 0 };
+  }
+
+  if (action === "move_end") {
+    return { ...block, selectedIndex: Math.max(0, block.options.length - 1) };
+  }
+
+  const delta = action === "move_up" ? -1 : 1;
+  return {
+    ...block,
+    selectedIndex: (block.selectedIndex + delta + block.options.length) % block.options.length,
   };
 }
 
 function moveDiffScroll(
-  overlay: RendererDiffOverlay,
+  block: RendererDiffBlock,
   delta: number,
-): RendererDiffOverlay {
-  const maxOffset = Math.max(0, overlay.lines.length - overlay.viewportHeight);
+): RendererDiffBlock {
+  const maxOffset = Math.max(0, block.lines.length - block.viewportHeight);
   return {
-    ...overlay,
-    scrollOffset: Math.min(Math.max(overlay.scrollOffset + delta, 0), maxOffset),
+    ...block,
+    scrollOffset: Math.min(Math.max(block.scrollOffset + delta, 0), maxOffset),
   };
 }
 
 function buildStatusText(state: RendererState): string {
   if (state.inputMode === "overlay") {
-    if (state.overlay?.kind === "diff") {
-      return state.overlay.helpText ?? (
-        state.overlay.mode === "approval"
-          ? "Up/Down scroll  Enter approve once  Esc reject"
-          : "Up/Down scroll  Enter close  Esc close"
-      );
-    }
-
     return state.overlay?.helpText ?? "Up/Down move  Enter select  Esc cancel";
   }
 
-  if (state.prompt.state.activeReference) {
+  if (state.inputMode === "inline") {
+    const latestTurn = [...state.turns].reverse().find((turn) => turn.kind === "agent");
+    if (latestTurn?.kind === "agent") {
+      if (latestTurn.inlineBlock?.kind === "approval") {
+        return latestTurn.inlineBlock.helpText ?? "Up/Down move  Enter approve once  a allow-all  Esc reject";
+      }
+
+      if (latestTurn.inlineBlock?.kind === "diff") {
+        return latestTurn.inlineBlock.helpText ?? (
+          latestTurn.inlineBlock.mode === "approval"
+            ? "Up/Down scroll  PgUp/PgDn page  Enter approve once  a allow-all  Esc reject"
+            : "Up/Down scroll  PgUp/PgDn page  Enter close  Esc close"
+        );
+      }
+    }
+  }
+
+  if (state.inputMode === "prompt" && state.prompt.state.activeReference) {
     return "Tab insert file  Up/Down choose  Enter submit  Esc clear";
   }
 
-  return "Enter submit  Ctrl+C exit";
+  if (state.inputMode === "prompt") {
+    return "Enter submit  Ctrl+C exit";
+  }
+
+  return "Agent is working";
 }
 
 function buildDivider(output: Writable): string {
@@ -887,5 +1322,18 @@ function getDiffViewportHeight(output: Writable): number {
       ? output.rows
       : 24;
 
-  return Math.min(Math.max(rows - 14, 6), 18);
+  return Math.min(Math.max(rows - 16, 8), 14);
+}
+
+function getCommandViewportHeight(output: Writable): number {
+  const rows =
+    "rows" in output && typeof output.rows === "number"
+      ? output.rows
+      : 24;
+
+  return Math.min(Math.max(rows - 14, 8), 14);
+}
+
+function formatChangeSummary(summary: WorkspaceEditChangeSummary): string {
+  return `changed ${summary.changedLines}, added ${summary.addedLines}, removed ${summary.removedLines}`;
 }

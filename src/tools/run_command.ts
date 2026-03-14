@@ -161,18 +161,36 @@ function executeShellCommand(
     }, timeoutMs);
 
     child.stdout.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      context?.turnEvents?.addEvent({
+        kind: "command_execution",
+        phase: "output",
+        command,
+        cwd: relativeCwd,
+        stream: "stdout",
+        chunk: text,
+      });
       ({ nextValue: stdout, truncated } = appendOutput(
         stdout,
-        chunk,
+        text,
         stdout.length + stderr.length,
         truncated,
       ));
     });
 
     child.stderr.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      context?.turnEvents?.addEvent({
+        kind: "command_execution",
+        phase: "output",
+        command,
+        cwd: relativeCwd,
+        stream: "stderr",
+        chunk: text,
+      });
       ({ nextValue: stderr, truncated } = appendOutput(
         stderr,
-        chunk,
+        text,
         stdout.length + stderr.length,
         truncated,
       ));
