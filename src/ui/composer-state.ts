@@ -11,6 +11,7 @@ import {
 const MAX_VISIBLE_MATCHES = 6;
 const SLASH_COMMAND_SUGGESTIONS = [
   "/help",
+  "/provider",
   "/mode",
   "/approvals",
   "/duration",

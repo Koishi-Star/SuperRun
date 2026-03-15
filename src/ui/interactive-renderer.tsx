@@ -613,6 +613,7 @@ export function createInteractiveRenderer(options: {
     renderCommands: () => {
       renderer.renderSectionTitle("Available commands");
       renderer.writeBodyLine("/help  Show command help");
+      renderer.writeBodyLine("/provider Show or switch the active provider, model, and runtime API key");
       renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict)");
       renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
       renderer.writeBodyLine("/duration Show or switch the minimum command panel duration in seconds");

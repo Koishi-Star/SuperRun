@@ -314,6 +314,12 @@ function CommandPanel(props: {
     enabled: true,
   });
   const visibleLines = props.step.outputLines.slice(-props.viewportHeight);
+  const renderedLines = visibleLines.length === 0
+    ? ["(waiting for output)"]
+    : visibleLines;
+  // Keep the panel height stable while output streams so the surrounding
+  // layout does not jump up and down on every new line.
+  const paddingLineCount = Math.max(0, props.viewportHeight - renderedLines.length);
 
   return (
     <Box
@@ -334,15 +340,17 @@ function CommandPanel(props: {
         )}
       </Text>
       <Box flexDirection="column" marginTop={1}>
-        {visibleLines.length === 0 ? <Text dimColor>(waiting for output)</Text> : null}
-        {visibleLines.map((line, index) => (
+        {renderedLines.map((line, index) => (
           <Text
             key={`output-${props.step.id}-${index}-${line}`}
             color={line.startsWith("stderr |") ? "redBright" : "white"}
-            dimColor={line.startsWith("stdout |")}
+            dimColor={line === "(waiting for output)" || line.startsWith("stdout |")}
           >
             {fitSingleLine(line, Math.max(1, props.width - 2))}
           </Text>
+        ))}
+        {Array.from({ length: paddingLineCount }, (_, index) => (
+          <Text key={`output-pad-${props.step.id}-${index}`}> </Text>
         ))}
       </Box>
       {props.step.outputTruncated ? (

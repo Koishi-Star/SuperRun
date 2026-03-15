@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   loadSettings,
   resetSystemPrompt,
+  saveActiveProvider,
+  saveProviderModel,
   saveSystemPrompt,
 } from "../src/config/settings.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../src/prompts/system.js";
@@ -19,6 +21,7 @@ test("loadSettings falls back to the built-in prompt when no file exists", async
     const settings = await loadSettings();
     assert.equal(settings.systemPrompt, DEFAULT_SYSTEM_PROMPT);
     assert.equal(settings.hasStoredSystemPrompt, false);
+    assert.equal(settings.providerSettings.activeProvider, "openai_compatible");
     assert.equal(settings.filePath, path.join(tempDir, "settings.json"));
   } finally {
     restoreConfigDir(previousConfigDir);
@@ -50,6 +53,35 @@ test("saveSystemPrompt persists the prompt and resetSystemPrompt removes the ove
     const afterReset = await loadSettings();
     assert.equal(afterReset.systemPrompt, DEFAULT_SYSTEM_PROMPT);
     assert.equal(afterReset.hasStoredSystemPrompt, false);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("provider settings persist independently from the stored system prompt", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-settings-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    await saveActiveProvider("kimi");
+    await saveProviderModel("kimi", "kimi-test-model");
+    await saveSystemPrompt("You are a careful reviewer.");
+
+    const afterSave = await loadSettings();
+    assert.equal(afterSave.providerSettings.activeProvider, "kimi");
+    assert.equal(afterSave.providerSettings.kimi.model, "kimi-test-model");
+    assert.equal(afterSave.systemPrompt, "You are a careful reviewer.");
+
+    const afterReset = await resetSystemPrompt();
+    assert.equal(afterReset.systemPrompt, DEFAULT_SYSTEM_PROMPT);
+    assert.equal(afterReset.providerSettings.activeProvider, "kimi");
+    assert.equal(afterReset.providerSettings.kimi.model, "kimi-test-model");
+
+    const content = await readFile(afterReset.filePath, "utf8");
+    assert.doesNotMatch(content, /careful reviewer/);
+    assert.match(content, /"activeProvider": "kimi"/);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

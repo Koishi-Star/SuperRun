@@ -24,6 +24,11 @@ export type MockChatResponse = {
   content?: string;
   toolCalls?: MockToolCall[];
   reasoningContent?: string;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
 };
 
 type MockResponseFactory = (
@@ -105,6 +110,21 @@ export async function startMockOpenAIServer(responses: MockResponse[]) {
             },
           },
         ],
+        ...(resolvedResponse.usage
+          ? {
+              usage: {
+                ...(resolvedResponse.usage.promptTokens !== undefined
+                  ? { prompt_tokens: resolvedResponse.usage.promptTokens }
+                  : {}),
+                ...(resolvedResponse.usage.completionTokens !== undefined
+                  ? { completion_tokens: resolvedResponse.usage.completionTokens }
+                  : {}),
+                ...(resolvedResponse.usage.totalTokens !== undefined
+                  ? { total_tokens: resolvedResponse.usage.totalTokens }
+                  : {}),
+              },
+            }
+          : {}),
       }),
     );
   });

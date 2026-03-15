@@ -1,3 +1,5 @@
+import type { ProviderRuntimeConfig, ProviderUsage } from "./provider.js";
+
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
 export type ToolCall = {
@@ -48,6 +50,7 @@ export type ChatResponse = {
   content: string;
   toolCalls: ToolCall[];
   reasoningContent?: string;
+  usage?: ProviderUsage;
 };
 
 export type ChatOptions = {
@@ -55,6 +58,7 @@ export type ChatOptions = {
   temperature?: number;
   onChunk?: (chunk: string) => void;
   tools?: ToolDefinition[];
+  providerConfig?: ProviderRuntimeConfig;
 };
 
 export interface LLMClient {

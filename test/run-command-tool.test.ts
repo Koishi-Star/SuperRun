@@ -276,6 +276,53 @@ test("run_command crazy_auto allows shell redirection writes", async () => {
   }
 });
 
+test("run_command redacts provider API keys from subprocess environments", async () => {
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const previousMoonshotKey = process.env.MOONSHOT_API_KEY;
+  process.env.OPENAI_API_KEY = "openai-secret";
+  process.env.MOONSHOT_API_KEY = "kimi-secret";
+
+  try {
+    const result = JSON.parse(
+      await executeAgentTool(
+        {
+          id: "call_provider_env",
+          name: "run_command",
+          arguments: JSON.stringify({
+            command:
+              "node -p \"JSON.stringify({ openai: process.env.OPENAI_API_KEY, kimi: process.env.MOONSHOT_API_KEY })\"",
+          }),
+        },
+        "default",
+        {
+          commandPolicy: createCommandPolicyContext("allow-all"),
+        },
+      ),
+    ) as {
+      ok: boolean;
+      stdout?: string;
+    };
+
+    assert.equal(result.ok, true);
+    assert.match(result.stdout ?? "", /__provider_token__/);
+    assert.match(result.stdout ?? "", /__kimi_token__/);
+    assert.doesNotMatch(result.stdout ?? "", /openai-secret/);
+    assert.doesNotMatch(result.stdout ?? "", /kimi-secret/);
+  } finally {
+    if (previousOpenAIKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousOpenAIKey;
+    }
+
+    if (previousMoonshotKey === undefined) {
+      delete process.env.MOONSHOT_API_KEY;
+    } else {
+      process.env.MOONSHOT_API_KEY = previousMoonshotKey;
+    }
+  }
+});
+
 test("run_command blocks compound download-and-execute chains with trigger details", async () => {
   const result = JSON.parse(
     await executeAgentTool(

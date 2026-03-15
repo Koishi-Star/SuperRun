@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { buildSafeProcessEnv } from "../llm/provider.js";
 import type { CommandHookEvent, CommandHookResult } from "./types.js";
 import { getPlatformShellCommand } from "./shell.js";
 
@@ -22,7 +23,7 @@ export function createEnvCommandHookRunner(): ((
     const rawOutput = await new Promise<string>((resolve, reject) => {
       const child = spawn(shell.file, shell.args, {
         cwd: process.cwd(),
-        env: process.env,
+        env: buildSafeProcessEnv(process.env),
         stdio: ["pipe", "pipe", "pipe"],
       });
       let stdout = "";

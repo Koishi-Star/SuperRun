@@ -12,6 +12,17 @@ export const DEFAULT_MAX_HISTORY_TURNS = 10;
 // Coding-oriented models often need several inspect/edit/verify rounds before
 // they can finish naturally, so keep a guardrail without forcing tiny loops.
 const MAX_TOOL_CALL_ROUNDS = 8;
+const TOOL_LOOP_WARNING_AFTER_ROUND = 4;
+
+export class AgentToolLoopLimitError extends Error {
+  readonly maxRounds: number;
+
+  constructor(maxRounds: number) {
+    super("Model exceeded the maximum tool call rounds.");
+    this.name = "AgentToolLoopLimitError";
+    this.maxRounds = maxRounds;
+  }
+}
 
 export type AgentSession = {
   mode: AgentMode;
@@ -130,13 +141,19 @@ async function resolveAgentReply(
   const tools = getAgentToolDefinitions(mode);
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
-    const response = await chatOnce(messages, {
-      ...(options?.model ? { model: options.model } : {}),
-      ...(options?.temperature !== undefined
-        ? { temperature: options.temperature }
-        : {}),
-      tools,
-    });
+    const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
+    const response = await chatOnce(
+      buildRoundMessages(messages, round, isFinalAnswerAttempt),
+      {
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.temperature !== undefined
+          ? { temperature: options.temperature }
+          : {}),
+        // The last pass disables tools so the model has to summarize or explain
+        // the limit instead of looping forever through more reads or commands.
+        ...(isFinalAnswerAttempt ? {} : { tools }),
+      },
+    );
 
     if (response.toolCalls.length === 0) {
       if (!response.content) {
@@ -152,8 +169,8 @@ async function resolveAgentReply(
       return response.content;
     }
 
-    if (round === MAX_TOOL_CALL_ROUNDS) {
-      throw new Error("Model exceeded the maximum tool call rounds.");
+    if (isFinalAnswerAttempt) {
+      throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
     }
 
     messages.push({
@@ -180,7 +197,39 @@ async function resolveAgentReply(
     }
   }
 
-  throw new Error("Model exceeded the maximum tool call rounds.");
+  throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
+}
+
+function buildRoundMessages(
+  messages: ChatMessage[],
+  round: number,
+  isFinalAnswerAttempt: boolean,
+): ChatMessage[] {
+  const warning = buildToolLoopWarning(round, isFinalAnswerAttempt);
+  return warning
+    ? [
+        ...messages,
+        {
+          role: "system",
+          content: warning,
+        },
+      ]
+    : messages;
+}
+
+function buildToolLoopWarning(
+  round: number,
+  isFinalAnswerAttempt: boolean,
+): string | null {
+  if (isFinalAnswerAttempt) {
+    return `You have already used ${MAX_TOOL_CALL_ROUNDS} tool rounds on this turn. Do not call more tools. Respond with the best answer you can from the information already gathered. If the results were blocked, redacted, repetitive, or insufficient, say that plainly, summarize the relevant findings, and ask the user for a narrower target instead of continuing a broad search.`;
+  }
+
+  if (round < TOOL_LOOP_WARNING_AFTER_ROUND) {
+    return null;
+  }
+
+  return `You have already used ${round} tool rounds on this turn. Avoid repeating broad scans or reading the same kind of files again. Only call another tool if it directly narrows the answer or applies the requested change. If results are blocked, redacted, repetitive, or insufficient, stop and explain the limit instead.`;
 }
 
 function trimConversationHistory(

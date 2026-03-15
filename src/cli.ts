@@ -2,6 +2,7 @@ import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
 import { Command, Option } from "commander";
 import {
+  AgentToolLoopLimitError,
   type AgentSession,
   createAgentSession,
   getAgentSessionStats,
@@ -15,6 +16,10 @@ import {
 import {
   loadSettings,
   resetSystemPrompt,
+  saveActiveProvider,
+  saveProviderBaseURL,
+  saveProviderModel,
+  saveProviderTimeoutMs,
   saveSystemPrompt,
   type SuperRunSettings,
 } from "./config/settings.js";
@@ -61,6 +66,15 @@ import {
   createAnsiRichTextStreamWriter,
   formatRichTextToAnsi,
 } from "./ui/assistant-rich-text.js";
+import {
+  getProviderApiKeyPlaceholder,
+  getProviderDisplayName,
+  parseProviderId,
+  resolveProviderRuntimeConfig,
+  type ProviderId,
+  type ProviderRuntimeConfig,
+  type ProviderRuntimeSecretOverrides,
+} from "./llm/provider.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
@@ -71,7 +85,9 @@ import {
   type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
 import { buildModePickerChoices } from "./ui/mode-picker.js";
+import { buildProviderPickerChoices } from "./ui/provider-picker.js";
 import { runSessionBrowser } from "./ui/session-browser.js";
+import { promptHiddenInput } from "./ui/secret-input.js";
 
 export const program = new Command();
 
@@ -129,6 +145,7 @@ program
           workspaceFiles: null,
           sessionEvents: [],
           deleteAreaStatus: await getWorkspaceDeleteAreaStatus(),
+          providerApiKeyOverrides: {},
           minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         });
         return;
@@ -143,8 +160,7 @@ program
       const state = await createInteractiveState(settings, session, approvalMode);
       await runInteractiveSession(session, state);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unknown error";
+      const message = formatAgentTurnFailureMessage(error);
       console.error("error:", message);
       process.exitCode = 1;
     }
@@ -163,6 +179,7 @@ type InteractiveState = {
     fileCount: number;
     totalBytes: number;
   };
+  providerApiKeyOverrides: ProviderRuntimeSecretOverrides;
   minCommandPanelDurationMs: number;
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
@@ -198,6 +215,7 @@ async function createInteractiveState(
         workspaceFiles: null,
         sessionEvents: [...storedSession.events],
         deleteAreaStatus,
+        providerApiKeyOverrides: {},
         minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         commandApprovalMode: approvalMode,
         commandHookRunner,
@@ -217,6 +235,7 @@ async function createInteractiveState(
     workspaceFiles: null,
     sessionEvents: [],
     deleteAreaStatus,
+    providerApiKeyOverrides: {},
     minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
     commandApprovalMode: approvalMode,
     commandHookRunner,
@@ -236,6 +255,7 @@ async function runSingleTurn(
   process.stdout.write("assistant: ");
 
   const reply = await runAgentTurn(session, prompt, {
+    providerConfig: getActiveProviderConfig(state),
     toolContext: createToolExecutionContext(session, state, null, turnEvents),
     onChunk: (chunk) => {
       assistantWriter.writeChunk(chunk);
@@ -324,7 +344,136 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model <name>|base-url <url>|timeout <ms>] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+    }
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/provider")) {
+    const providerArgument = parseCommandArgument(prompt, "/provider");
+
+    if (!providerArgument) {
+      if (ui) {
+        const selectedProvider = await runProviderPicker(
+          state.settings.providerSettings.activeProvider,
+          ui,
+        );
+        renderInteractiveShell(ui, session, state);
+        if (!selectedProvider) {
+          return true;
+        }
+
+        state.settings = await saveActiveProvider(selectedProvider);
+        await maybePromptForMissingProviderApiKey(selectedProvider, state, ui);
+        renderProviderApplied(ui, getActiveProviderConfig(state));
+        return true;
+      }
+
+      renderProviderSummary(ui, state);
+      return true;
+    }
+
+    const [providerSubcommand, ...providerRest] = providerArgument.split(/\s+/);
+    const providerValue = providerRest.join(" ").trim();
+
+    if (!providerSubcommand) {
+      renderProviderSummary(ui, state);
+      return true;
+    }
+
+    if (providerSubcommand === "key") {
+      if (!ui) {
+        renderError(ui, '"/provider key" requires an interactive terminal.');
+        return true;
+      }
+
+      const currentProviderId = state.settings.providerSettings.activeProvider;
+      await promptForProviderApiKey(currentProviderId, state, ui);
+      renderInteractiveShell(ui, session, state);
+      renderProviderSummary(ui, state);
+      return true;
+    }
+
+    if (providerSubcommand === "clear-key") {
+      const currentProviderId = state.settings.providerSettings.activeProvider;
+      delete state.providerApiKeyOverrides[currentProviderId];
+      if (ui) {
+        renderInteractiveShell(ui, session, state);
+      }
+      renderInfo(ui, `Cleared the in-memory API key for ${getProviderDisplayName(currentProviderId)}.`);
+      return true;
+    }
+
+    if (providerSubcommand === "model") {
+      if (!providerValue) {
+        renderError(ui, 'Usage: /provider model <name>');
+        return true;
+      }
+
+      const currentProviderId = state.settings.providerSettings.activeProvider;
+      state.settings = await saveProviderModel(currentProviderId, providerValue);
+      if (ui) {
+        renderInteractiveShell(ui, session, state);
+      }
+      renderProviderApplied(ui, getActiveProviderConfig(state));
+      return true;
+    }
+
+    if (providerSubcommand === "base-url") {
+      const currentProviderId = state.settings.providerSettings.activeProvider;
+      if (currentProviderId !== "openai_compatible") {
+        renderError(ui, "Only the OpenAI-compatible provider supports a custom base URL.");
+        return true;
+      }
+      if (!providerValue) {
+        renderError(ui, 'Usage: /provider base-url <url>');
+        return true;
+      }
+
+      state.settings = await saveProviderBaseURL(currentProviderId, providerValue);
+      if (ui) {
+        renderInteractiveShell(ui, session, state);
+      }
+      renderProviderApplied(ui, getActiveProviderConfig(state));
+      return true;
+    }
+
+    if (providerSubcommand === "timeout") {
+      if (!providerValue) {
+        renderError(ui, 'Usage: /provider timeout <ms>');
+        return true;
+      }
+
+      const timeoutMs = Number.parseInt(providerValue, 10);
+      if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+        renderError(ui, "Provider timeout must be a positive integer in milliseconds.");
+        return true;
+      }
+
+      const currentProviderId = state.settings.providerSettings.activeProvider;
+      state.settings = await saveProviderTimeoutMs(currentProviderId, timeoutMs);
+      if (ui) {
+        renderInteractiveShell(ui, session, state);
+      }
+      renderProviderApplied(ui, getActiveProviderConfig(state));
+      return true;
+    }
+
+    try {
+      const nextProviderId = parseProviderId(providerSubcommand);
+      state.settings = await saveActiveProvider(nextProviderId);
+      await maybePromptForMissingProviderApiKey(nextProviderId, state, ui);
+      if (ui) {
+        renderInteractiveShell(ui, session, state);
+      }
+      renderProviderApplied(ui, getActiveProviderConfig(state));
+    } catch (error) {
+      renderError(
+        ui,
+        error instanceof Error
+          ? error.message
+          : "Unknown /provider command.",
+      );
     }
     return true;
   }
@@ -749,6 +898,7 @@ async function handleInteractivePrompt(
   let reply = "";
   try {
     reply = await runAgentTurn(session, prompt, {
+      providerConfig: getActiveProviderConfig(state),
       toolContext: createToolExecutionContext(session, state, ui, turnEvents),
       onChunk: (chunk) => {
         if (ui) {
@@ -760,10 +910,13 @@ async function handleInteractivePrompt(
       },
     });
   } catch (error) {
+    const message = formatAgentTurnFailureMessage(error);
     if (ui) {
-      ui.failActiveTurn(error instanceof Error ? error.message : "Unknown error.");
+      ui.failActiveTurn(message);
+      return true;
     }
-    throw error;
+
+    throw new Error(message);
   }
 
   applyTurnEventsToSession(state, turnEvents);
@@ -952,7 +1105,7 @@ function buildInteractiveShellFrame(
   state: InteractiveState,
 ): Array<Omit<RendererLine, "id">> {
   const stats = getAgentSessionStats(session);
-  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+  const provider = getActiveProviderConfig(state);
   const sessionLabel = state.currentSessionId
     ? formatSessionLabel(state.currentSessionTitle, state.currentSessionId)
     : state.sessionStore.sessions.length === 0
@@ -962,7 +1115,7 @@ function buildInteractiveShellFrame(
     { kind: "section", text: "SuperRun" },
     {
       kind: "info",
-      text: `${model}  ${process.cwd()}`,
+      text: `${provider.label}  ${provider.model}  ${process.cwd()}`,
     },
     {
       kind: "info",
@@ -970,7 +1123,7 @@ function buildInteractiveShellFrame(
     },
     {
       kind: "info",
-      text: `mode ${session.mode}  approvals ${state.commandApprovalMode}`,
+      text: `provider ${formatProviderStatus(provider)}  mode ${session.mode}  approvals ${state.commandApprovalMode}`,
     },
     {
       kind: "info",
@@ -995,7 +1148,7 @@ function buildInteractiveShellFrame(
 
   lines.push({
     kind: "body",
-    text: "commands /help /sessions /new [title] /mode /approvals /duration /system /clear /exit",
+    text: "commands /help /provider /sessions /new [title] /mode /approvals /duration /system /clear /exit",
   });
 
   return lines;
@@ -1211,10 +1364,14 @@ function renderSettingsSummary(
   ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: SuperRunSettings,
-  state: Pick<InteractiveState, "minCommandPanelDurationMs">,
+  state: Pick<InteractiveState, "minCommandPanelDurationMs" | "providerApiKeyOverrides">,
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
+  const provider = resolveProviderRuntimeConfig(
+    settings.providerSettings,
+    state.providerApiKeyOverrides,
+  );
 
   if (ui) {
     ui.renderSectionTitle("System Prompt");
@@ -1235,6 +1392,11 @@ function renderSettingsSummary(
   );
   renderInfo(
     ui,
+    `Provider: ${provider.label}  model ${provider.model}  timeout ${provider.timeoutMs}ms  key ${formatProviderApiKeyStatus(provider)}.`,
+  );
+  renderInfo(ui, `Provider base URL: ${provider.baseURL}`);
+  renderInfo(
+    ui,
     `Minimum command panel duration: ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s.`,
   );
   renderInfo(ui, `System prompt size: ${stats.systemPromptCharCount} chars.`);
@@ -1244,6 +1406,38 @@ function renderSettingsSummary(
   for (const line of settings.systemPrompt.split(/\r?\n/)) {
     writeBodyLine(ui, line);
   }
+}
+
+function renderProviderSummary(
+  ui: InteractiveRenderer | null,
+  state: Pick<InteractiveState, "settings" | "providerApiKeyOverrides">,
+): void {
+  const provider = getActiveProviderConfig(state);
+  renderInfo(
+    ui,
+    `Provider: ${provider.label}  model ${provider.model}  timeout ${provider.timeoutMs}ms  key ${formatProviderApiKeyStatus(provider)}.`,
+  );
+  renderInfo(ui, `Base URL: ${provider.baseURL}`);
+  renderInfo(
+    ui,
+    'Use "/provider key" to set a hidden in-memory API key, "/provider clear-key" to remove it, and "/provider model <name>" to change the default model.',
+  );
+  if (provider.id === "openai_compatible") {
+    renderInfo(
+      ui,
+      'Use "/provider base-url <url>" to point the OpenAI-compatible provider at a different endpoint.',
+    );
+  }
+}
+
+function renderProviderApplied(
+  ui: InteractiveRenderer | null,
+  provider: ProviderRuntimeConfig,
+): void {
+  renderInfo(
+    ui,
+    `Active provider: ${provider.label}  model ${provider.model}  key ${formatProviderApiKeyStatus(provider)}.`,
+  );
 }
 
 function renderRiskNotice(ui: InteractiveRenderer | null = null): void {
@@ -1860,6 +2054,14 @@ function renderError(ui: InteractiveRenderer | null, message: string): void {
   console.error(`error: ${formatRichTextToAnsi(message, "error")}`);
 }
 
+function formatAgentTurnFailureMessage(error: unknown): string {
+  if (error instanceof AgentToolLoopLimitError) {
+    return "Stopped this turn after the model exhausted the tool-call limit without producing an answer. The failed tool loop was not added to session history. Ask for a narrower target or a specific file if you want to continue.";
+  }
+
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
 function renderWarning(ui: InteractiveRenderer | null, message: string): void {
   if (ui) {
     ui.renderWarning(message);
@@ -2088,6 +2290,25 @@ function resolveSessionSelector(
   }
 
   return sessionSummary;
+}
+
+async function runProviderPicker(
+  currentProvider: ProviderId,
+  ui: InteractiveRenderer,
+): Promise<ProviderId | null> {
+  const selectedProvider = await ui.selectOption({
+    title: "Provider",
+    subtitle: "Choose which provider profile to use for future model requests.",
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildProviderPickerChoices(currentProvider).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.value === currentProvider ? "accent" : "default",
+    })),
+  });
+
+  return selectedProvider ? parseProviderId(selectedProvider) : null;
 }
 
 async function runModePicker(
@@ -2331,6 +2552,81 @@ function buildApprovalPickerOptions(
       tone: "default",
     },
   ];
+}
+
+function getActiveProviderConfig(
+  state: Pick<InteractiveState, "settings" | "providerApiKeyOverrides">,
+): ProviderRuntimeConfig {
+  return resolveProviderRuntimeConfig(
+    state.settings.providerSettings,
+    state.providerApiKeyOverrides,
+  );
+}
+
+function formatProviderApiKeyStatus(
+  provider: ProviderRuntimeConfig,
+): string {
+  if (provider.apiKeySource === "missing") {
+    return "missing";
+  }
+
+  return `${provider.apiKeySource}:${provider.apiKeyPlaceholder}`;
+}
+
+function formatProviderStatus(
+  provider: ProviderRuntimeConfig,
+): string {
+  return `${provider.id} ${formatProviderApiKeyStatus(provider)}`;
+}
+
+async function maybePromptForMissingProviderApiKey(
+  providerId: ProviderId,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<void> {
+  const provider = getActiveProviderConfig(state);
+  if (provider.id !== providerId || provider.apiKeySource !== "missing") {
+    return;
+  }
+
+  if (!ui) {
+    renderWarning(
+      ui,
+      `No API key is configured for ${provider.label}. Set ${providerId === "kimi" ? "MOONSHOT_API_KEY" : "OPENAI_API_KEY"} or use /provider key in the TTY.`,
+    );
+    return;
+  }
+
+  await promptForProviderApiKey(providerId, state, ui);
+}
+
+async function promptForProviderApiKey(
+  providerId: ProviderId,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): Promise<void> {
+  const providerLabel = getProviderDisplayName(providerId);
+  const secretValue = await runWithSuspendedRenderer(ui, () =>
+    promptHiddenInput({
+      input,
+      output,
+      prompt: `${providerLabel} API key (hidden; empty keeps current): `,
+    }),
+  );
+
+  if (!secretValue) {
+    renderInfo(
+      ui,
+      `Kept the current API key source for ${providerLabel}.`,
+    );
+    return;
+  }
+
+  state.providerApiKeyOverrides[providerId] = secretValue;
+  renderInfo(
+    ui,
+    `Stored an in-memory API key for ${providerLabel} as ${getProviderApiKeyPlaceholder(providerId)}.`,
+  );
 }
 
 async function runWithSuspendedRenderer<T>(

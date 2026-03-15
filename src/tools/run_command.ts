@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
+import { buildSafeProcessEnv } from "../llm/provider.js";
 import {
   authorizeCommand,
   classifyCommand,
@@ -148,7 +149,9 @@ function executeShellCommand(
 
     const child = spawn(shell.file, shell.args, {
       cwd: absoluteCwd,
-      env: process.env,
+      // Keep provider API keys out of the shell subprocess so prompt-injected
+      // commands cannot exfiltrate them through environment inspection.
+      env: buildSafeProcessEnv(process.env),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";

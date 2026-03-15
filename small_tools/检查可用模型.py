@@ -60,6 +60,8 @@ def fetch_models(api_key: str, base_url: str) -> list[dict[str, object]]:
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             payload = json.load(response)
+
+            print(payload)  # Debug: print the raw response payload
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"Model request failed: HTTP {exc.code}\n{body}") from exc

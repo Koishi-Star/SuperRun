@@ -7,7 +7,12 @@ import type {
   ToolCall,
   ToolDefinition,
 } from "./types.js";
-import { getOpenAICompatibleConfig } from "../utils/env.js";
+import {
+  resolveProviderRuntimeConfig,
+  resolveProviderSettings,
+  type ProviderRuntimeConfig,
+  type ProviderUsage,
+} from "./provider.js";
 
 // Respect HTTPS_PROXY / HTTP_PROXY / https_proxy / http_proxy env vars.
 // undici does NOT pick up system proxy automatically, unlike curl.
@@ -34,6 +39,7 @@ type OpenAICompatibleResponse = {
       reasoning_content?: string;
     };
   }>;
+  usage?: OpenAICompatibleUsage;
   error?: {
     message?: string;
   };
@@ -67,21 +73,35 @@ type OpenAICompatibleToolCall = {
   };
 };
 
+type OpenAICompatibleUsage = {
+  prompt_tokens?: unknown;
+  completion_tokens?: unknown;
+  total_tokens?: unknown;
+};
+
 export class OpenAICompatibleClient implements LLMClient {
+  private readonly provider: ProviderRuntimeConfig;
   private readonly apiKey: string;
   private readonly baseURL: string;
   private readonly defaultModel: string;
   private readonly timeoutMs: number;
 
-  constructor() {
-    const config = getOpenAICompatibleConfig();
-    this.apiKey = config.apiKey;
-    this.baseURL = config.baseURL;
-    this.defaultModel = config.model;
-    this.timeoutMs = config.timeoutMs;
+  constructor(config?: ProviderRuntimeConfig) {
+    this.provider =
+      config ?? resolveProviderRuntimeConfig(resolveProviderSettings());
+    this.apiKey = this.provider.apiKey;
+    this.baseURL = this.provider.baseURL;
+    this.defaultModel = this.provider.model;
+    this.timeoutMs = this.provider.timeoutMs;
   }
 
   async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResponse> {
+    if (!this.apiKey) {
+      throw new Error(
+        `Missing API key for ${this.provider.label}. Set ${this.provider.id === "kimi" ? "MOONSHOT_API_KEY" : "OPENAI_API_KEY"} in the environment or add a runtime key through /provider.`,
+      );
+    }
+
     const model = options?.model ?? this.defaultModel;
     const onChunk = options?.onChunk;
     const shouldStream = typeof onChunk === "function";
@@ -131,6 +151,7 @@ export class OpenAICompatibleClient implements LLMClient {
     const reasoningContent = normalizeReasoningContent(
       message?.reasoning_content,
     );
+    const usage = normalizeUsage(data.usage);
 
     if (!content && toolCalls.length === 0) {
       throw new Error("Model returned empty content.");
@@ -140,6 +161,7 @@ export class OpenAICompatibleClient implements LLMClient {
       content,
       toolCalls,
       ...(reasoningContent ? { reasoningContent } : {}),
+      ...(usage ? { usage } : {}),
     };
   }
 
@@ -434,6 +456,27 @@ function normalizeReasoningContent(value: unknown): string | undefined {
   return normalized || undefined;
 }
 
+function normalizeUsage(value: OpenAICompatibleUsage | undefined): ProviderUsage | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const promptTokens = normalizeUsageTokenValue(value.prompt_tokens);
+  const completionTokens = normalizeUsageTokenValue(value.completion_tokens);
+  const totalTokens = normalizeUsageTokenValue(value.total_tokens);
+
+  if (promptTokens === null && completionTokens === null && totalTokens === null) {
+    return undefined;
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    source: "response",
+  };
+}
+
 function parseSseEvent(event: string): string | null {
   const lines = event
     .split(/\r?\n/)
@@ -464,4 +507,8 @@ function getErrorMessage(body: string, statusCode: number): string {
   } catch {
     return `LLM request failed with status ${statusCode}.`;
   }
+}
+
+function normalizeUsageTokenValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : null;
 }

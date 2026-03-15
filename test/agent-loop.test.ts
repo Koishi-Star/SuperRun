@@ -4,6 +4,7 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  AgentToolLoopLimitError,
   createAgentSession,
   getAgentSessionStats,
   runAgentTurn,
@@ -381,6 +382,106 @@ test("runAgentTurn tolerates multi-step tool loops that exceed three rounds", as
 
     assert.equal(reply, "Completed after several tool rounds.");
     assert.equal(server.requests.length, 5);
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn forces a final no-tool answer after repeated tool rounds", async () => {
+  const server = await startMockOpenAIServer([
+    ...Array.from({ length: 8 }, (_, index) => ({
+      toolCalls: [
+        {
+          id: `call_${index + 1}`,
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    })),
+    "Final answer without more tools.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-final-answer-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    await writeFile(path.join(tempDir, "alpha.ts"), "export const alpha = 1;\n", "utf8");
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
+    const reply = await runAgentTurn(session, "Inspect carefully, then stop looping.");
+
+    assert.equal(reply, "Final answer without more tools.");
+    assert.equal(server.requests.length, 9);
+    assert.equal(server.requests[8]?.tools, undefined);
+    assert.match(
+      String(server.requests[8]?.messages.at(-1)?.content ?? ""),
+      /Do not call more tools\./,
+    );
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn leaves history untouched when the model exceeds the tool-round limit", async () => {
+  const server = await startMockOpenAIServer(
+    Array.from({ length: 9 }, (_, index) => ({
+      toolCalls: [
+        {
+          id: `call_${index + 1}`,
+          name: "list_files",
+          arguments: JSON.stringify({ path: ".", depth: 0 }),
+        },
+      ],
+    })),
+  );
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-tool-limit-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    await writeFile(path.join(tempDir, "alpha.ts"), "export const alpha = 1;\n", "utf8");
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
+
+    await assert.rejects(
+      () => runAgentTurn(session, "Keep trying forever."),
+      (error) => error instanceof AgentToolLoopLimitError,
+    );
+    assert.deepEqual(session.history, []);
   } finally {
     process.chdir(previousCwd);
     restoreEnv(previousEnv);
