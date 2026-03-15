@@ -66,15 +66,11 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
           ? <OverlayPicker overlay={props.overlay} />
           : <OverlayViewer overlay={props.overlay} />
         : null}
-      {props.inputMode === "prompt"
-        ? (
-            <Composer
-              prompt={props.prompt}
-              divider={props.divider}
-              inputMode={props.inputMode}
-            />
-          )
-        : null}
+      <Composer
+        prompt={props.prompt}
+        divider={props.divider}
+        inputMode={props.inputMode}
+      />
       <StatusBar text={props.statusText} width={props.divider.length} />
     </Box>
   );
@@ -438,12 +434,33 @@ function DiffBlock(props: { block: RendererDiffBlock }): React.JSX.Element {
   );
 }
 
+// Stable-height suggestion area: cap rendered lines to MAX_SUGGESTION_LINES
+// and pad the remainder so the composer never changes height from suggestions.
+const MAX_SUGGESTION_LINES = 7;
+
 function Composer(props: {
   prompt: RendererPrompt;
   divider: string;
   inputMode: InteractiveShellProps["inputMode"];
 }): React.JSX.Element {
   const availableWidth = props.divider.length;
+  const isActive = props.inputMode === "prompt";
+
+  // When inactive, render the same structural lines but dimmed to avoid
+  // mounting/unmounting jitter while signalling that input is unavailable.
+  if (!isActive) {
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>{props.divider}</Text>
+        <Text dimColor color="gray">{fitSingleLine("  ...", availableWidth)}</Text>
+        <Text dimColor>{props.divider}</Text>
+      </Box>
+    );
+  }
+
+  const suggestionLines = renderSuggestionLines(props.prompt.state);
+  const visibleSuggestions = suggestionLines.slice(0, MAX_SUGGESTION_LINES);
+  const paddingCount = Math.max(0, MAX_SUGGESTION_LINES - visibleSuggestions.length);
 
   return (
     <Box flexDirection="column">
@@ -451,13 +468,13 @@ function Composer(props: {
       <PromptLine
         label={props.prompt.label}
         state={props.prompt.state}
-        isActive={props.inputMode === "prompt"}
+        isActive
         availableWidth={availableWidth}
       />
       {props.prompt.state.errorMessage ? (
         <Text color="redBright">{fitSingleLine(`  ${props.prompt.state.errorMessage}`, availableWidth)}</Text>
       ) : null}
-      {renderSuggestionLines(props.prompt.state).map((line, index) => (
+      {visibleSuggestions.map((line, index) => (
         <Text
           key={`suggestion-${line.text}-${index}`}
           dimColor={!line.selected}
@@ -466,6 +483,11 @@ function Composer(props: {
           {fitSingleLine(line.text, availableWidth)}
         </Text>
       ))}
+      {suggestionLines.length > 0
+        ? Array.from({ length: paddingCount }, (_, index) => (
+            <Text key={`suggestion-pad-${index}`}>{" "}</Text>
+          ))
+        : null}
       <Text dimColor>{props.divider}</Text>
     </Box>
   );

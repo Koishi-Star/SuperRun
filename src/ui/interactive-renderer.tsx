@@ -246,7 +246,9 @@ export type InteractiveRendererSnapshot = {
 
 const MAX_COMMAND_OUTPUT_LINES = 200;
 const ASSISTANT_ANIMATION_CHUNK_SIZE = 8;
-const ASSISTANT_ANIMATION_INTERVAL_MS = 16;
+// Flush interval for animated assistant text. A higher value means fewer
+// re-renders per second which reduces visual jitter during streaming.
+const ASSISTANT_ANIMATION_INTERVAL_MS = 32;
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
 
 export function createInteractiveRenderer(options: {
@@ -473,27 +475,23 @@ export function createInteractiveRenderer(options: {
   const flushNextAssistantChunk = () => {
     assistantAnimationTimer = null;
 
-    const nextChunk = pendingAssistantChunks.shift() ?? null;
-    if (nextChunk === null) {
+    // Drain all pending chunks in one frame to reduce re-render count.
+    // This collapses many tiny updates into a single Ink render pass.
+    if (pendingAssistantChunks.length === 0) {
       finishPendingTurnStatusIfReady();
       return;
     }
 
+    const merged = pendingAssistantChunks.join("");
+    pendingAssistantChunks.length = 0;
+
     const updated = updateLatestAgentTurn((turn) => ({
       ...turn,
       status: "streaming_answer",
-      answerText: `${turn.answerText}${nextChunk}`,
+      answerText: `${turn.answerText}${merged}`,
     }));
     if (updated) {
       rerender();
-    }
-
-    if (pendingAssistantChunks.length > 0) {
-      assistantAnimationTimer = setTimeout(
-        flushNextAssistantChunk,
-        ASSISTANT_ANIMATION_INTERVAL_MS,
-      );
-      return;
     }
 
     finishPendingTurnStatusIfReady();

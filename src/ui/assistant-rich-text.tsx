@@ -427,7 +427,7 @@ function CodeBlock(props: {
   const lines = highlightedCode.split("\n");
 
   return (
-    <Box flexDirection="column" marginTop={1} marginBottom={1}>
+    <Box flexDirection="column">
       <Box flexDirection="row">
         <Text color="magentaBright">```</Text>
         {props.language ? <Text color="magentaBright">{props.language}</Text> : null}
