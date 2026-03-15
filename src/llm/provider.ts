@@ -2,6 +2,7 @@ export const DEFAULT_PROVIDER_ID = "openai_compatible";
 export const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "https://api.openai.com/v1";
 export const DEFAULT_OPENAI_COMPATIBLE_MODEL = "gpt-4o-mini";
 export const DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1";
+export const ALTERNATE_KIMI_BASE_URL = "https://api.moonshot.ai/v1";
 export const DEFAULT_KIMI_MODEL = "kimi-latest";
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 120_000;
 
@@ -43,6 +44,19 @@ export type ProviderUsage = {
   totalTokens: number | null;
   source: "response" | "estimate";
 };
+
+const KIMI_BASE_URL_ALIASES = new Map<string, string>([
+  ["cn", DEFAULT_KIMI_BASE_URL],
+  ["moonshot-cn", DEFAULT_KIMI_BASE_URL],
+  ["moonshot.cn", DEFAULT_KIMI_BASE_URL],
+  ["https://api.moonshot.cn", DEFAULT_KIMI_BASE_URL],
+  [DEFAULT_KIMI_BASE_URL, DEFAULT_KIMI_BASE_URL],
+  ["ai", ALTERNATE_KIMI_BASE_URL],
+  ["moonshot-ai", ALTERNATE_KIMI_BASE_URL],
+  ["moonshot.ai", ALTERNATE_KIMI_BASE_URL],
+  ["https://api.moonshot.ai", ALTERNATE_KIMI_BASE_URL],
+  [ALTERNATE_KIMI_BASE_URL, ALTERNATE_KIMI_BASE_URL],
+]);
 
 export function getProviderDisplayName(providerId: ProviderId): string {
   return providerId === "kimi" ? "Kimi" : "OpenAI-Compatible";
@@ -96,7 +110,8 @@ export function resolveProviderSettings(
       ),
     },
     kimi: {
-      baseURL: normalizeBaseURL(
+      baseURL: normalizeProviderBaseURL(
+        "kimi",
         overrides?.kimi?.baseURL ??
           process.env.MOONSHOT_BASE_URL ??
           process.env.KIMI_BASE_URL ??
@@ -188,6 +203,18 @@ export function getProviderApiKeyEnvNames(
   return providerId === "kimi"
     ? ["MOONSHOT_API_KEY", "KIMI_API_KEY"]
     : ["OPENAI_API_KEY"];
+}
+
+export function normalizeProviderBaseURL(
+  providerId: ProviderId,
+  value: string,
+): string {
+  const normalizedValue = normalizeBaseURL(value);
+  if (providerId !== "kimi") {
+    return normalizedValue;
+  }
+
+  return KIMI_BASE_URL_ALIASES.get(normalizedValue.toLowerCase()) ?? normalizedValue;
 }
 
 function readOptionalProviderFromEnv(

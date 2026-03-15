@@ -3,6 +3,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
 import { getConfigFilePath } from "./paths.js";
 import {
+  normalizeProviderBaseURL,
   parseProviderId,
   resolveProviderSettings,
   type ProviderId,
@@ -170,7 +171,7 @@ export async function saveProviderBaseURL(
   providerId: ProviderId,
   baseURL: string,
 ): Promise<SuperRunSettings> {
-  const trimmedBaseURL = baseURL.trim().replace(/\/+$/, "");
+  const trimmedBaseURL = normalizeProviderBaseURL(providerId, baseURL);
   if (!trimmedBaseURL) {
     throw new Error("Provider base URL must not be empty.");
   }

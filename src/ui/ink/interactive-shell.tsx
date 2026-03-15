@@ -570,6 +570,9 @@ function OverlayViewer(props: { overlay: RendererViewerOverlay }): React.JSX.Ele
     props.overlay.scrollOffset,
     props.overlay.scrollOffset + props.overlay.viewportHeight,
   );
+  // Keep the viewer box height stable while avoiding raw JSX whitespace
+  // nodes, which Ink rejects unless they are wrapped in <Text>.
+  const paddingCount = Math.max(0, props.overlay.viewportHeight - visibleLines.length);
   const scrollEnd = Math.min(
     props.overlay.lines.length,
     props.overlay.scrollOffset + props.overlay.viewportHeight,
@@ -600,13 +603,11 @@ function OverlayViewer(props: { overlay: RendererViewerOverlay }): React.JSX.Ele
                     key={`viewer-${props.overlay.scrollOffset + index}-${line.text}`}
                     line={line}
                   />
-                ))}                {/* Pad to viewportHeight so scrolling never changes the box height */}
-                {Array.from(
-                  { length: Math.max(0, props.overlay.viewportHeight - visibleLines.length) },
-                  (_, index) => (
-                    <Text key={`viewer-pad-${index}`}>{" "}</Text>
-                  ),
-                )}              </Box>
+                ))}
+                {Array.from({ length: paddingCount }, (_, index) => (
+                  <Text key={`viewer-pad-${index}`}>{" "}</Text>
+                ))}
+              </Box>
             </>
           )}
     </Box>
@@ -679,17 +680,15 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
 function ViewerLine(props: {
   line: RendererViewerOverlay["lines"][number];
 }): React.JSX.Element {
-  switch (props.line.tone) {
-    case "error":
-      return <RichText text={props.line.text} tone="error" />;
-    case "warning":
-      return <RichText text={props.line.text} tone="warning" />;
-    case "info":
-      return <RichText text={props.line.text} tone="info" />;
-    case "default":
-    default:
-      return <RichText text={props.line.text} />;
+  const content = props.line.format === "plain"
+    ? <PlainViewerText line={props.line} />
+    : renderViewerRichText(props.line);
+
+  if (!props.line.indent || props.line.indent <= 0) {
+    return content;
   }
+
+  return <Box marginLeft={props.line.indent}>{content}</Box>;
 }
 
 function DiffLine(props: {
@@ -713,6 +712,40 @@ function DiffLine(props: {
       {`${marker} ${oldNumber} ${newNumber} ${props.line.text}`}
     </Text>
   );
+}
+
+function renderViewerRichText(
+  line: RendererViewerOverlay["lines"][number],
+): React.JSX.Element {
+  switch (line.tone) {
+    case "error":
+      return <RichText text={line.text} tone="error" />;
+    case "warning":
+      return <RichText text={line.text} tone="warning" />;
+    case "info":
+      return <RichText text={line.text} tone="info" />;
+    case "default":
+    default:
+      return <RichText text={line.text} />;
+  }
+}
+
+function PlainViewerText(props: {
+  line: RendererViewerOverlay["lines"][number];
+}): React.JSX.Element {
+  const text = props.line.text.length === 0 ? " " : props.line.text;
+
+  switch (props.line.tone) {
+    case "error":
+      return <Text color="redBright">{text}</Text>;
+    case "warning":
+      return <Text color="#ff8c42">{text}</Text>;
+    case "info":
+      return <Text dimColor>{text}</Text>;
+    case "default":
+    default:
+      return <Text>{text}</Text>;
+  }
 }
 
 function renderSuggestionLines(state: ComposerState): Array<{

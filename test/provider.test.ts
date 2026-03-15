@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ALTERNATE_KIMI_BASE_URL,
+  DEFAULT_KIMI_BASE_URL,
   buildSafeProcessEnv,
+  normalizeProviderBaseURL,
   resolveProviderRuntimeConfig,
   resolveProviderSettings,
 } from "../src/llm/provider.js";
@@ -47,6 +50,23 @@ test("resolveProviderRuntimeConfig prefers runtime Kimi keys over environment va
   }
 });
 
+test("resolveProviderSettings normalizes Kimi base URL aliases to the matching Moonshot endpoint", () => {
+  const previousEnv = snapshotEnv();
+  process.env.MOONSHOT_BASE_URL = "https://api.moonshot.ai";
+
+  try {
+    const settings = resolveProviderSettings({
+      activeProvider: "kimi",
+    });
+
+    assert.equal(settings.kimi.baseURL, ALTERNATE_KIMI_BASE_URL);
+    assert.equal(normalizeProviderBaseURL("kimi", "moonshot-cn"), DEFAULT_KIMI_BASE_URL);
+    assert.equal(normalizeProviderBaseURL("kimi", "moonshot-ai"), ALTERNATE_KIMI_BASE_URL);
+  } finally {
+    restoreEnv(previousEnv);
+  }
+});
+
 test("buildSafeProcessEnv redacts provider API keys before subprocesses inherit them", () => {
   const safeEnv = buildSafeProcessEnv({
     ...process.env,
@@ -64,6 +84,7 @@ function snapshotEnv(): Record<string, string | undefined> {
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
     OPENAI_MODEL: process.env.OPENAI_MODEL,
     MOONSHOT_API_KEY: process.env.MOONSHOT_API_KEY,
+    MOONSHOT_BASE_URL: process.env.MOONSHOT_BASE_URL,
     MOONSHOT_MODEL: process.env.MOONSHOT_MODEL,
   };
 }

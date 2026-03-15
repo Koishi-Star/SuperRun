@@ -61,6 +61,8 @@
 - Do not introduce heavy frameworks or complex dependency trees unless clearly justified.
 - Prefer explicit types and small modules over clever abstractions.
 - When modifying code, add concise comments for the changed logic so the intent remains easy to follow.
+- For Ink anti-jitter work, prefer keeping structural regions mounted and stabilizing their height instead of mounting and unmounting prompt or overlay blocks during transient state changes.
+- In Ink JSX, never rely on raw whitespace between elements for spacing; keep padding inside `<Text>` nodes and keep comments away from inline child boundaries so Ink never receives bare text nodes under `<Box>`.
 - When adding a new subsystem, wire it through the CLI end-to-end in the smallest usable form first.
 - A heavier TUI is now justified when it replaces brittle hand-rolled terminal state management. Prefer phased introduction over a one-shot rewrite.
 
@@ -104,6 +106,7 @@
 - Command approvals, command hooks, and external-editor-based system prompt editing are already wired through the CLI.
 - The current TTY shell is already running through Ink, and the main picker and diff-review flows now render inside that single runtime.
 - The main interactive shell has now moved from a flat log flow to a turn-card layout with one active command-output pane and inline approval/review blocks.
+- The confirmed anti-jitter fix is a combination of three choices: keep the composer mounted even when inactive, pad only active suggestion/viewer sessions to a fixed viewport height, and coalesce streamed assistant chunks before rerendering instead of repainting every tiny chunk.
 - `/new [title]` is supported directly; users no longer need to create a session and immediately rename it as a second step.
 - Real API checks should stay minimal and intentional: use them only for the current risky slice after local `build`/`test` pass, and avoid broad exploratory runs that burn tokens unnecessarily.
 - The intentionally retained terminal boundary is now mostly the external-editor handoff used by `/editor`; the older readline and no-UI approval fallbacks are no longer part of the supported interactive path.

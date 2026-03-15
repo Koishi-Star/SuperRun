@@ -6,6 +6,7 @@ import {
   highlightAssistantCode,
   parseAssistantRichText,
   parseInlineSegments,
+  renderMarkdownTableLines,
 } from "../src/ui/assistant-rich-text.js";
 
 test("parseInlineSegments detects bold and inline code spans", () => {
@@ -67,6 +68,23 @@ test("parseAssistantRichText keeps an unfinished fenced block during streaming",
   );
 });
 
+test("parseAssistantRichText extracts markdown tables into table blocks", () => {
+  assert.deepEqual(
+    parseAssistantRichText("| Name | Score |\n| --- | ---: |\n| Ada | 10 |\n| Bob | 7 |"),
+    [
+      {
+        kind: "table",
+        headers: ["Name", "Score"],
+        rows: [
+          ["Ada", "10"],
+          ["Bob", "7"],
+        ],
+        alignments: ["left", "right"],
+      },
+    ],
+  );
+});
+
 test("highlightAssistantCode preserves code content even when terminal coloring is unavailable", () => {
   const highlighted = highlightAssistantCode("const answer = 42;", "ts");
 
@@ -81,6 +99,31 @@ test("formatRichTextToAnsi removes markdown markers while preserving content", (
   assert.match(rendered, /bold/);
   assert.match(rendered, /code/);
   assert.doesNotMatch(rendered, /\*\*/);
+});
+
+test("formatRichTextToAnsi renders tables as aligned grid lines", () => {
+  const rendered = formatRichTextToAnsi("| Name | Score |\n| --- | ---: |\n| Ada | 10 |");
+
+  assert.match(rendered, /\+[-=+]+\+/);
+  assert.match(rendered, /\| Name \|/);
+  assert.doesNotMatch(rendered, /\| --- \|/);
+});
+
+test("renderMarkdownTableLines aligns cells using terminal display width", () => {
+  assert.deepEqual(
+    renderMarkdownTableLines({
+      headers: ["Name", "Score"],
+      rows: [["测试", "8"]],
+      alignments: ["left", "right"],
+    }),
+    [
+      "+------+-------+",
+      "| Name | Score |",
+      "+======+=======+",
+      "| 测试 |     8 |",
+      "+------+-------+",
+    ],
+  );
 });
 
 test("createAnsiRichTextStreamWriter formats fenced blocks across streamed chunks", () => {

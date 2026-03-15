@@ -2,6 +2,7 @@ import React from "react";
 import chalk from "chalk";
 import { Box, Text } from "ink";
 import { highlight } from "cli-highlight";
+import { getDisplayWidth } from "./text-width.js";
 
 export type AssistantInlineSegment =
   | {
@@ -16,6 +17,14 @@ export type AssistantInlineSegment =
       kind: "code";
       text: string;
     };
+
+export type MarkdownTableAlignment = "left" | "center" | "right";
+
+export type MarkdownTable = {
+  headers: string[];
+  rows: string[][];
+  alignments: MarkdownTableAlignment[];
+};
 
 export type AssistantRichTextBlock =
   | {
@@ -43,6 +52,12 @@ export type AssistantRichTextBlock =
       kind: "code_block";
       language: string | null;
       code: string;
+    }
+  | {
+      kind: "table";
+      headers: string[];
+      rows: string[][];
+      alignments: MarkdownTableAlignment[];
     };
 
 export type RichTextTone =
@@ -82,7 +97,8 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
       }
     | null = null;
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     const fenceMatch = line.match(/^```([\w#+.-]+)?\s*$/);
     if (fenceMatch) {
       if (activeCodeBlock) {
@@ -107,6 +123,18 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
       continue;
     }
 
+    const tableMatch = parseMarkdownTable(lines, index);
+    if (tableMatch) {
+      blocks.push({
+        kind: "table",
+        headers: tableMatch.table.headers,
+        rows: tableMatch.table.rows,
+        alignments: tableMatch.table.alignments,
+      });
+      index = tableMatch.nextIndex - 1;
+      continue;
+    }
+
     if (!line.trim()) {
       blocks.push({ kind: "blank" });
       continue;
@@ -114,12 +142,10 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
 
     const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
     if (headingMatch) {
-      const headingLevel = headingMatch[1] ?? "";
-      const headingText = headingMatch[2] ?? "";
       blocks.push({
         kind: "heading",
-        level: headingLevel.length,
-        segments: parseInlineSegments(headingText),
+        level: (headingMatch[1] ?? "").length,
+        segments: parseInlineSegments(headingMatch[2] ?? ""),
       });
       continue;
     }
@@ -135,24 +161,20 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
 
     const unorderedListMatch = line.match(/^([-*])\s+(.*)$/);
     if (unorderedListMatch) {
-      const marker = unorderedListMatch[1] ?? "-";
-      const itemText = unorderedListMatch[2] ?? "";
       blocks.push({
         kind: "list_item",
-        marker,
-        segments: parseInlineSegments(itemText),
+        marker: unorderedListMatch[1] ?? "-",
+        segments: parseInlineSegments(unorderedListMatch[2] ?? ""),
       });
       continue;
     }
 
     const orderedListMatch = line.match(/^(\d+\.)\s+(.*)$/);
     if (orderedListMatch) {
-      const marker = orderedListMatch[1] ?? "1.";
-      const itemText = orderedListMatch[2] ?? "";
       blocks.push({
         kind: "list_item",
-        marker,
-        segments: parseInlineSegments(itemText),
+        marker: orderedListMatch[1] ?? "1.",
+        segments: parseInlineSegments(orderedListMatch[2] ?? ""),
       });
       continue;
     }
@@ -174,6 +196,75 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
   }
 
   return blocks;
+}
+
+export function parseMarkdownTable(
+  lines: string[],
+  startIndex: number,
+): {
+  table: MarkdownTable;
+  nextIndex: number;
+} | null {
+  if (startIndex + 1 >= lines.length) {
+    return null;
+  }
+
+  const headerCells = splitMarkdownTableRow(lines[startIndex] ?? "");
+  const separatorCells = splitMarkdownTableRow(lines[startIndex + 1] ?? "");
+  if (
+    headerCells.length < 2 ||
+    separatorCells.length !== headerCells.length ||
+    !separatorCells.every(isMarkdownTableSeparatorCell)
+  ) {
+    return null;
+  }
+
+  const alignments = separatorCells.map(parseMarkdownTableAlignment);
+  const rows: string[][] = [];
+  let nextIndex = startIndex + 2;
+
+  while (nextIndex < lines.length) {
+    const nextCells = splitMarkdownTableRow(lines[nextIndex] ?? "");
+    if (nextCells.length < 2) {
+      break;
+    }
+
+    rows.push(normalizeMarkdownTableCells(nextCells, headerCells.length));
+    nextIndex += 1;
+  }
+
+  return {
+    table: {
+      headers: normalizeMarkdownTableCells(headerCells, headerCells.length),
+      rows,
+      alignments,
+    },
+    nextIndex,
+  };
+}
+
+export function renderMarkdownTableLines(table: MarkdownTable): string[] {
+  const widths = table.headers.map((header, columnIndex) => {
+    const rowWidths = table.rows.map((row) => getDisplayWidth(row[columnIndex] ?? ""));
+    return Math.max(getDisplayWidth(header), ...rowWidths);
+  });
+  const border = `+${widths.map((width) => "-".repeat(width + 2)).join("+")}+`;
+  const headerBorder = `+${widths.map((width) => "=".repeat(width + 2)).join("+")}+`;
+  const renderRow = (cells: string[]) => `| ${
+    cells.map((cell, columnIndex) => padMarkdownTableCell(
+      cell,
+      widths[columnIndex] ?? 0,
+      table.alignments[columnIndex] ?? "left",
+    )).join(" | ")
+  } |`;
+
+  return [
+    border,
+    renderRow(table.headers),
+    headerBorder,
+    ...table.rows.map((row) => renderRow(row)),
+    border,
+  ];
 }
 
 export function parseInlineSegments(text: string): AssistantInlineSegment[] {
@@ -283,7 +374,7 @@ export function createAnsiRichTextStreamWriter(
 
     if (inCodeBlock) {
       const highlightedLine = highlightAssistantCode(line, codeLanguage);
-      write(`${chalk.magentaBright("│ ")}${applyToneToAnsi(highlightedLine, tone)}\n`);
+      write(`${chalk.magentaBright("| ")}${applyToneToAnsi(highlightedLine, tone)}\n`);
       return;
     }
 
@@ -313,8 +404,6 @@ export function createAnsiRichTextStreamWriter(
 
       if (inCodeBlock) {
         write(chalk.magentaBright("```"));
-        inCodeBlock = false;
-        codeLanguage = null;
       }
     },
   };
@@ -363,6 +452,18 @@ function renderRichTextBlock(
           key={`assistant-block-${index}`}
           code={block.code}
           language={block.language}
+          tone={tone}
+        />
+      );
+    case "table":
+      return (
+        <TableBlock
+          key={`assistant-block-${index}`}
+          table={{
+            headers: block.headers,
+            rows: block.rows,
+            alignments: block.alignments,
+          }}
           tone={tone}
         />
       );
@@ -434,12 +535,12 @@ function CodeBlock(props: {
       </Box>
       {lines.length === 0 ? (
         <Box flexDirection="row">
-          <Text color="magentaBright">│ </Text>
+          <Text color="magentaBright">| </Text>
         </Box>
       ) : (
         lines.map((line, index) => (
           <Box key={`code-line-${index}`} flexDirection="row">
-            <Text color="magentaBright">│ </Text>
+            <Text color="magentaBright">| </Text>
             <Text color={getBaseColor(props.tone)} dimColor={props.tone === "info"}>
               {line}
             </Text>
@@ -449,6 +550,114 @@ function CodeBlock(props: {
       <Text color="magentaBright">```</Text>
     </Box>
   );
+}
+
+function TableBlock(props: {
+  table: MarkdownTable;
+  tone: RichTextTone;
+}): React.JSX.Element {
+  const lines = renderMarkdownTableLines(props.table);
+
+  return (
+    <Box flexDirection="column">
+      {lines.map((line, index) => {
+        const isBorder = index === 0 || index === 2 || index === lines.length - 1;
+        const isHeader = index === 1;
+
+        return (
+          <Text
+            key={`table-line-${index}`}
+            color={isBorder ? "cyan" : getBaseColor(props.tone)}
+            dimColor={props.tone === "info" && !isBorder}
+            bold={isHeader}
+          >
+            {line}
+          </Text>
+        );
+      })}
+    </Box>
+  );
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  if (!line.includes("|")) {
+    return [];
+  }
+
+  let trimmed = line.trim();
+  if (trimmed.startsWith("|")) {
+    trimmed = trimmed.slice(1);
+  }
+  if (trimmed.endsWith("|")) {
+    trimmed = trimmed.slice(0, -1);
+  }
+
+  const cells: string[] = [];
+  let current = "";
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    const nextCharacter = trimmed[index + 1];
+    if (character === "\\" && nextCharacter === "|") {
+      current += "|";
+      index += 1;
+      continue;
+    }
+
+    if (character === "|") {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+
+    current += character;
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function isMarkdownTableSeparatorCell(cell: string): boolean {
+  return /^:?-{3,}:?$/.test(cell.trim());
+}
+
+function parseMarkdownTableAlignment(cell: string): MarkdownTableAlignment {
+  const trimmed = cell.trim();
+  if (trimmed.startsWith(":") && trimmed.endsWith(":")) {
+    return "center";
+  }
+  if (trimmed.endsWith(":")) {
+    return "right";
+  }
+  return "left";
+}
+
+function normalizeMarkdownTableCells(cells: string[], columnCount: number): string[] {
+  return Array.from({ length: columnCount }, (_, index) => {
+    const rawCell = cells[index] ?? "";
+    return inlineSegmentsToPlainText(parseInlineSegments(rawCell));
+  });
+}
+
+function inlineSegmentsToPlainText(segments: AssistantInlineSegment[]): string {
+  return segments.map((segment) => segment.text).join("");
+}
+
+function padMarkdownTableCell(
+  text: string,
+  width: number,
+  alignment: MarkdownTableAlignment,
+): string {
+  const gap = Math.max(0, width - getDisplayWidth(text));
+  if (alignment === "right") {
+    return `${" ".repeat(gap)}${text}`;
+  }
+  if (alignment === "center") {
+    const left = Math.floor(gap / 2);
+    const right = gap - left;
+    return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
+  }
+  return `${text}${" ".repeat(gap)}`;
 }
 
 function getBaseColor(tone: RichTextTone): string {
@@ -508,9 +717,21 @@ function formatBlockToAnsi(
         chalk.magentaBright(`\`\`\`${block.language ?? ""}`),
         ...highlightAssistantCode(block.code, block.language)
           .split("\n")
-          .map((line) => `${chalk.magentaBright("│ ")}${applyToneToAnsi(line, tone)}`),
+          .map((line) => `${chalk.magentaBright("| ")}${applyToneToAnsi(line, tone)}`),
         chalk.magentaBright("```"),
       ].join("\n");
+    case "table":
+      return renderMarkdownTableLines({
+        headers: block.headers,
+        rows: block.rows,
+        alignments: block.alignments,
+      }).map((line, index, lines) => {
+        const isBorder = index === 0 || index === 2 || index === lines.length - 1;
+        const isHeader = index === 1;
+        return isBorder
+          ? chalk.cyan(line)
+          : applyToneFormatter(line, tone, isHeader);
+      }).join("\n");
     case "paragraph":
     default:
       return applyToneFormatter(

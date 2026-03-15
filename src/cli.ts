@@ -65,8 +65,12 @@ import type {
 import {
   createAnsiRichTextStreamWriter,
   formatRichTextToAnsi,
+  parseMarkdownTable,
+  renderMarkdownTableLines,
 } from "./ui/assistant-rich-text.js";
 import {
+  ALTERNATE_KIMI_BASE_URL,
+  DEFAULT_KIMI_BASE_URL,
   getProviderApiKeyPlaceholder,
   getProviderDisplayName,
   parseProviderId,
@@ -344,7 +348,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model <name>|base-url <url>|timeout <ms>] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model <name>|base-url <url|moonshot-cn|moonshot-ai>|timeout <ms>] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -421,12 +425,13 @@ async function handleInteractivePrompt(
 
     if (providerSubcommand === "base-url") {
       const currentProviderId = state.settings.providerSettings.activeProvider;
-      if (currentProviderId !== "openai_compatible") {
-        renderError(ui, "Only the OpenAI-compatible provider supports a custom base URL.");
-        return true;
-      }
       if (!providerValue) {
-        renderError(ui, 'Usage: /provider base-url <url>');
+        renderError(
+          ui,
+          currentProviderId === "kimi"
+            ? 'Usage: /provider base-url <url|moonshot-cn|moonshot-ai>'
+            : 'Usage: /provider base-url <url>',
+        );
         return true;
       }
 
@@ -1427,7 +1432,13 @@ function renderProviderSummary(
       ui,
       'Use "/provider base-url <url>" to point the OpenAI-compatible provider at a different endpoint.',
     );
+    return;
   }
+
+  renderInfo(
+    ui,
+    `Use "/provider base-url moonshot-cn" or "/provider base-url moonshot-ai" to switch Kimi between ${DEFAULT_KIMI_BASE_URL} and ${ALTERNATE_KIMI_BASE_URL}.`,
+  );
 }
 
 function renderProviderApplied(
@@ -1852,33 +1863,79 @@ function buildHistoryViewerLines(options: {
 
     for (const [index, message] of options.history.entries()) {
       const speaker = message.role === "user" ? "You" : "Assistant";
+      const messageTone = message.role === "user" ? "info" : "default";
       lines.push({
         text: `${index + 1}. ${speaker}`,
-        tone: message.role === "user" ? "info" : "default",
+        tone: messageTone,
       });
-
-      // Track code-fence state so multi-line code blocks render with
-      // a visible gutter marker in the history viewer.
-      let inCodeFence = false;
-      const contentLines = message.content.split(/\r?\n/);
-      for (const line of contentLines) {
-        const isFence = /^```/.test(line.trimStart());
-        if (isFence) {
-          inCodeFence = !inCodeFence;
-          lines.push({ text: `   ${line}` });
-          continue;
-        }
-        if (inCodeFence) {
-          lines.push({ text: `   │ ${line}` });
-        } else {
-          lines.push({ text: `   ${line}` });
-        }
-      }
+      lines.push(...buildHistoryMessageContentLines(message.content, messageTone));
 
       if (index < options.history.length - 1) {
         lines.push({ text: "" });
       }
     }
+  }
+
+  return lines;
+}
+
+function buildHistoryMessageContentLines(
+  content: string,
+  tone: NonNullable<RendererViewerLine["tone"]>,
+): RendererViewerLine[] {
+  const lines: RendererViewerLine[] = [];
+  const contentLines = content.split(/\r?\n/);
+  let inCodeFence = false;
+
+  for (let index = 0; index < contentLines.length; index += 1) {
+    const line = contentLines[index] ?? "";
+
+    if (!inCodeFence) {
+      // Convert markdown tables into preformatted rows so the history viewer
+      // shows a readable grid instead of raw pipe syntax.
+      const tableMatch = parseMarkdownTable(contentLines, index);
+      if (tableMatch) {
+        lines.push(
+          ...renderMarkdownTableLines(tableMatch.table).map((tableLine) => ({
+            text: tableLine,
+            tone,
+            format: "plain" as const,
+            indent: 3,
+          })),
+        );
+        index = tableMatch.nextIndex - 1;
+        continue;
+      }
+    }
+
+    const isFence = /^```/.test(line.trimStart());
+    if (isFence) {
+      inCodeFence = !inCodeFence;
+      lines.push({
+        text: line,
+        tone,
+        format: "plain",
+        indent: 3,
+      });
+      continue;
+    }
+
+    if (inCodeFence) {
+      lines.push({
+        text: `| ${line}`,
+        tone,
+        format: "plain",
+        indent: 3,
+      });
+      continue;
+    }
+
+    lines.push({
+      text: line,
+      tone,
+      format: "rich_text",
+      indent: 3,
+    });
   }
 
   return lines;

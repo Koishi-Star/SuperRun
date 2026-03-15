@@ -7,9 +7,11 @@ import {
   loadSettings,
   resetSystemPrompt,
   saveActiveProvider,
+  saveProviderBaseURL,
   saveProviderModel,
   saveSystemPrompt,
 } from "../src/config/settings.js";
+import { ALTERNATE_KIMI_BASE_URL } from "../src/llm/provider.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../src/prompts/system.js";
 
 test("loadSettings falls back to the built-in prompt when no file exists", async () => {
@@ -82,6 +84,25 @@ test("provider settings persist independently from the stored system prompt", as
     const content = await readFile(afterReset.filePath, "utf8");
     assert.doesNotMatch(content, /careful reviewer/);
     assert.match(content, /"activeProvider": "kimi"/);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("saveProviderBaseURL normalizes the Kimi Moonshot domain switch aliases", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-settings-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    await saveActiveProvider("kimi");
+    const saved = await saveProviderBaseURL("kimi", "https://api.moonshot.ai");
+
+    assert.equal(saved.providerSettings.kimi.baseURL, ALTERNATE_KIMI_BASE_URL);
+
+    const reloaded = await loadSettings();
+    assert.equal(reloaded.providerSettings.kimi.baseURL, ALTERNATE_KIMI_BASE_URL);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });
