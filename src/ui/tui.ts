@@ -21,7 +21,7 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.bold.hex("#ff6b35")("SuperRun")}\n`);
       output.write(`${chalk.dim("Local coding agent interactive mode")}\n`);
       output.write(
-        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/provider")} ${chalk.cyan("/mode")} ${chalk.cyan("/approvals")} ${chalk.cyan("/duration")} ${chalk.cyan("/history")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/editor")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
+        `${chalk.dim("Commands:")} ${chalk.cyan("/help")} ${chalk.cyan("/provider")} ${chalk.cyan("/model")} ${chalk.cyan("/mode")} ${chalk.cyan("/approvals")} ${chalk.cyan("/duration")} ${chalk.cyan("/history")} ${chalk.cyan("/sessions")} ${chalk.cyan("/new")} ${chalk.cyan("/switch")} ${chalk.cyan("/rename")} ${chalk.cyan("/delete")} ${chalk.cyan("/system")} ${chalk.cyan("/editor")} ${chalk.cyan("/clear")} ${chalk.cyan("/exit")}\n\n`,
       );
     },
     renderCommands: () => {
@@ -33,12 +33,14 @@ export function createTerminalUI(output: Writable): TerminalUI {
       output.write(`${chalk.cyan("/settings")} Show the active system prompt and persistence path\n`);
       output.write(`${chalk.cyan("/session")}  Show current session status\n`);
       output.write(`${chalk.cyan("/history")}  Show the current or selected session transcript\n`);
-      output.write(`${chalk.cyan("/provider")} Show or switch the active provider, model, base URL, and runtime API key\n`);
+      output.write(`${chalk.cyan("/provider")} Show or switch the active provider, model, context budget, Kimi endpoint, base URL, runtime API key, and Kimi catalog state\n`);
+      output.write(`${chalk.cyan("/model")} Open the TTY model picker when available, or set the active model by name\n`);
       output.write(`${chalk.cyan("/sessions")} Open the saved-session picker, optionally filtered by text\n`);
       output.write(`${chalk.cyan("/new")}      Create and switch to a fresh session\n`);
       output.write(`${chalk.cyan("/switch")}   Switch to a saved session by id, title, or list index\n`);
       output.write(`${chalk.cyan("/rename")}   Rename the current saved session\n`);
       output.write(`${chalk.cyan("/delete")}   Delete the current session, one session by id/title/index, or all sessions\n`);
+      output.write(`${chalk.cyan("/trash")}    Open delete-area actions for viewing, restoring, deleting, or emptying files\n`);
       output.write(`${chalk.cyan("/system")}  Edit and persist the system prompt directly in the terminal\n`);
       output.write(`${chalk.cyan("/editor")}  Open the current system prompt in your external editor\n`);
       output.write(`${chalk.cyan("/system reset")} Restore the built-in system prompt\n`);

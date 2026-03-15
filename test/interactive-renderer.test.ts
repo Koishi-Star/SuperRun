@@ -44,6 +44,16 @@ function createKey(overrides: Partial<Key> = {}): Key {
   };
 }
 
+function createShellFrame(title: string, lineText: string) {
+  return {
+    title,
+    workspaceLines: [{ kind: "info" as const, text: lineText }],
+    statusLines: [],
+    footerLines: [],
+    contextMeter: null,
+  };
+}
+
 test("interactive renderer groups system output and agent activity into turn cards", {
   concurrency: false,
 }, () => {
@@ -52,10 +62,7 @@ test("interactive renderer groups system output and agent activity into turn car
   const renderer = createInteractiveRenderer({ input, output, enableInput: false });
 
   try {
-    renderer.setShellFrame([
-      { kind: "section", text: "SuperRun" },
-      { kind: "info", text: "Local coding agent interactive mode" },
-    ]);
+    renderer.setShellFrame(createShellFrame("SuperRun", "Local coding agent interactive mode"));
     renderer.renderInfo("History restored.");
     renderer.beginAgentTurn("inspect package scripts");
     renderer.applyToolEvent({
@@ -98,7 +105,10 @@ test("interactive renderer groups system output and agent activity into turn car
 
     const snapshot = renderer.getSnapshot();
     assert.deepEqual(
-      snapshot.headerLines.map((line) => line.text),
+      [
+        snapshot.shellFrame.title,
+        ...snapshot.shellFrame.workspaceLines.map((line) => line.text),
+      ],
       ["SuperRun", "Local coding agent interactive mode"],
     );
     assert.equal(snapshot.turns.length, 2);
@@ -130,10 +140,7 @@ test("interactive renderer keeps turn state across suspend resume and clearScree
   const renderer = createInteractiveRenderer({ input, output, enableInput: false });
 
   try {
-    renderer.setShellFrame([
-      { kind: "section", text: "SuperRun" },
-      { kind: "info", text: "Header line" },
-    ]);
+    renderer.setShellFrame(createShellFrame("SuperRun", "Header line"));
     renderer.renderInfo("Before picker");
 
     renderer.suspend();
@@ -142,7 +149,10 @@ test("interactive renderer keeps turn state across suspend resume and clearScree
 
     const resumedSnapshot = renderer.getSnapshot();
     assert.deepEqual(
-      resumedSnapshot.headerLines.map((line) => line.text),
+      [
+        resumedSnapshot.shellFrame.title,
+        ...resumedSnapshot.shellFrame.workspaceLines.map((line) => line.text),
+      ],
       ["SuperRun", "Header line"],
     );
     assert.equal(resumedSnapshot.turns.length, 1);
@@ -159,7 +169,10 @@ test("interactive renderer keeps turn state across suspend resume and clearScree
     const clearedSnapshot = renderer.getSnapshot();
     assert.equal(clearedSnapshot.turns.length, 0);
     assert.deepEqual(
-      clearedSnapshot.headerLines.map((line) => line.text),
+      [
+        clearedSnapshot.shellFrame.title,
+        ...clearedSnapshot.shellFrame.workspaceLines.map((line) => line.text),
+      ],
       ["SuperRun", "Header line"],
     );
   } finally {

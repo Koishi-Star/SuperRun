@@ -1,5 +1,17 @@
 import { chatOnce } from "../llm/router.js";
 import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types.js";
+import {
+  buildContextBudgetSnapshot,
+  createEmptyContextBudgetSnapshot,
+  estimateChatMessageTokens,
+  getSafeContextBudgetTokens,
+  type ContextBudgetSnapshot,
+} from "./context-budget.js";
+import {
+  resolveProviderRuntimeConfig,
+  resolveProviderSettings,
+  type ProviderUsage,
+} from "../llm/provider.js";
 import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
@@ -29,6 +41,7 @@ export type AgentSession = {
   systemPrompt: string;
   history: ConversationMessage[];
   maxHistoryTurns: number;
+  contextBudget: ContextBudgetSnapshot;
 };
 
 export type CreateAgentSessionOptions = {
@@ -36,6 +49,7 @@ export type CreateAgentSessionOptions = {
   systemPrompt?: string;
   history?: ConversationMessage[];
   maxHistoryTurns?: number;
+  contextBudget?: ContextBudgetSnapshot;
 };
 
 export type AgentSessionStats = {
@@ -44,6 +58,16 @@ export type AgentSessionStats = {
   historyCharCount: number;
   systemPromptCharCount: number;
   maxHistoryTurns: number;
+  currentContextTokens: number | null;
+  effectiveContextLimitTokens: number | null;
+  contextUsageSource: ContextBudgetSnapshot["usageSource"];
+};
+
+export type AgentTurnResult = {
+  reply: string;
+  usage?: ProviderUsage;
+  contextBudgetSnapshot: ContextBudgetSnapshot;
+  trimmedTurns: number;
 };
 
 export function createAgentSession(
@@ -54,6 +78,9 @@ export function createAgentSession(
     systemPrompt: options?.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT,
     history: [...(options?.history ?? [])],
     maxHistoryTurns: normalizeMaxHistoryTurns(options?.maxHistoryTurns),
+    contextBudget: options?.contextBudget
+      ? { ...options.contextBudget }
+      : createEmptyContextBudgetSnapshot(),
   };
 }
 
@@ -78,19 +105,29 @@ export async function runAgentTurn(
   session: AgentSession,
   userPrompt: string,
   options?: AgentTurnOptions,
-): Promise<string> {
+): Promise<AgentTurnResult> {
   const trimmedPrompt = userPrompt.trim();
 
   if (!trimmedPrompt) {
     throw new Error("User prompt must not be empty.");
   }
 
-  trimSessionHistory(session);
-  const reply = await resolveAgentReply(
-    buildTurnMessages(session, trimmedPrompt),
+  const providerConfig = options?.providerConfig ??
+    resolveProviderRuntimeConfig(resolveProviderSettings());
+  const trimmedTurns = trimSessionHistory(session, trimmedPrompt);
+  const baseMessages = buildTurnMessages(session, trimmedPrompt);
+  const estimatedPromptTokens = estimateChatMessageTokens(baseMessages);
+  const response = await resolveAgentReply(
+    baseMessages,
     session.mode,
     options,
   );
+  const contextBudgetSnapshot = buildContextBudgetSnapshot({
+    modelContextTokens: providerConfig.modelContextTokens,
+    configuredContextLimitTokens: providerConfig.contextLimitTokens,
+    usage: response.usage,
+    estimatedPromptTokens,
+  });
 
   session.history.push(
     {
@@ -99,12 +136,18 @@ export async function runAgentTurn(
     },
     {
       role: "assistant",
-      content: reply,
+      content: response.content,
     },
   );
   trimSessionHistory(session);
+  session.contextBudget = contextBudgetSnapshot;
 
-  return reply;
+  return {
+    reply: response.content,
+    ...(response.usage ? { usage: response.usage } : {}),
+    contextBudgetSnapshot,
+    trimmedTurns,
+  };
 }
 
 export async function runAgentLoop(
@@ -112,7 +155,8 @@ export async function runAgentLoop(
   options?: AgentTurnOptions,
 ): Promise<string> {
   const session = createAgentSession();
-  return runAgentTurn(session, userPrompt, options);
+  const result = await runAgentTurn(session, userPrompt, options);
+  return result.reply;
 }
 
 export function getAgentSessionStats(session: AgentSession): AgentSessionStats {
@@ -125,20 +169,36 @@ export function getAgentSessionStats(session: AgentSession): AgentSessionStats {
     ),
     systemPromptCharCount: session.systemPrompt.length,
     maxHistoryTurns: session.maxHistoryTurns,
+    currentContextTokens: session.contextBudget.lastPromptTokens ??
+      session.contextBudget.estimatedPromptTokens,
+    effectiveContextLimitTokens: session.contextBudget.effectiveContextLimitTokens,
+    contextUsageSource: session.contextBudget.usageSource,
   };
 }
 
-function trimSessionHistory(session: AgentSession): void {
-  session.history = trimConversationHistory(session.history, session.maxHistoryTurns);
+function trimSessionHistory(
+  session: AgentSession,
+  upcomingUserPrompt = "",
+): number {
+  const trimmed = trimConversationHistory(
+    session.history,
+    session.maxHistoryTurns,
+    session.systemPrompt,
+    session.contextBudget.effectiveContextLimitTokens,
+    upcomingUserPrompt,
+  );
+  session.history = trimmed.history;
+  return trimmed.trimmedTurns;
 }
 
 async function resolveAgentReply(
   baseMessages: ChatMessage[],
   mode: AgentMode,
   options?: AgentTurnOptions,
-): Promise<string> {
+): Promise<{ content: string; usage?: ProviderUsage }> {
   const messages = [...baseMessages];
   const tools = getAgentToolDefinitions(mode);
+  let lastUsage: ProviderUsage | undefined;
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
     const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
@@ -149,11 +209,17 @@ async function resolveAgentReply(
         ...(options?.temperature !== undefined
           ? { temperature: options.temperature }
           : {}),
+        ...(options?.providerConfig
+          ? { providerConfig: options.providerConfig }
+          : {}),
         // The last pass disables tools so the model has to summarize or explain
         // the limit instead of looping forever through more reads or commands.
         ...(isFinalAnswerAttempt ? {} : { tools }),
       },
     );
+    if (response.usage) {
+      lastUsage = response.usage;
+    }
 
     if (response.toolCalls.length === 0) {
       if (!response.content) {
@@ -166,7 +232,15 @@ async function resolveAgentReply(
         options.onChunk(response.content);
       }
 
-      return response.content;
+      const usage = response.usage ?? lastUsage;
+      return usage
+        ? {
+            content: response.content,
+            usage,
+          }
+        : {
+            content: response.content,
+          };
     }
 
     if (isFinalAnswerAttempt) {
@@ -235,7 +309,53 @@ function buildToolLoopWarning(
 function trimConversationHistory(
   history: ConversationMessage[],
   maxHistoryTurns: number,
-): ConversationMessage[] {
+  systemPrompt: string,
+  effectiveContextLimitTokens: number | null,
+  upcomingUserPrompt: string,
+): { history: ConversationMessage[]; trimmedTurns: number } {
+  const safeContextBudgetTokens = getSafeContextBudgetTokens(
+    effectiveContextLimitTokens,
+  );
+  if (safeContextBudgetTokens !== null) {
+    const nextHistory = [...history];
+    let trimmedTurns = 0;
+
+    while (nextHistory.length > 0) {
+      const estimatedTokens = estimateChatMessageTokens([
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        ...nextHistory,
+        ...(upcomingUserPrompt
+          ? [{
+              role: "user" as const,
+              content: upcomingUserPrompt,
+            }]
+          : []),
+      ]);
+      if (estimatedTokens <= safeContextBudgetTokens) {
+        return {
+          history: nextHistory,
+          trimmedTurns,
+        };
+      }
+
+      const nextTrimmed = trimOldestConversationTurn(nextHistory);
+      if (nextTrimmed.history.length === nextHistory.length) {
+        break;
+      }
+
+      trimmedTurns += nextTrimmed.trimmedTurns;
+      nextHistory.splice(0, nextHistory.length, ...nextTrimmed.history);
+    }
+
+    return {
+      history: nextHistory,
+      trimmedTurns,
+    };
+  }
+
   let turnCount = 0;
 
   for (let index = history.length - 1; index >= 0; index -= 1) {
@@ -248,11 +368,17 @@ function trimConversationHistory(
       const nextIndex = index + 1;
       const sliceStart =
         history[nextIndex]?.role === "assistant" ? nextIndex + 1 : nextIndex;
-      return history.slice(sliceStart);
+      return {
+        history: history.slice(sliceStart),
+        trimmedTurns: 1,
+      };
     }
   }
 
-  return [...history];
+  return {
+    history: [...history],
+    trimmedTurns: 0,
+  };
 }
 
 function countHistoryTurns(history: ConversationMessage[]): number {
@@ -269,4 +395,26 @@ function normalizeMaxHistoryTurns(value: number | undefined): number {
   }
 
   return value;
+}
+
+function trimOldestConversationTurn(
+  history: ConversationMessage[],
+): { history: ConversationMessage[]; trimmedTurns: number } {
+  const firstUserIndex = history.findIndex((message) => message.role === "user");
+  if (firstUserIndex === -1) {
+    return {
+      history: [...history],
+      trimmedTurns: 0,
+    };
+  }
+
+  let sliceStart = firstUserIndex + 1;
+  if (history[sliceStart]?.role === "assistant") {
+    sliceStart += 1;
+  }
+
+  return {
+    history: history.slice(sliceStart),
+    trimmedTurns: 1,
+  };
 }

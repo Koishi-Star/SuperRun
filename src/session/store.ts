@@ -1,6 +1,10 @@
 import path from "node:path";
 import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import type { ConversationMessage } from "../llm/types.js";
+import {
+  createEmptyContextBudgetSnapshot,
+  type ContextBudgetSnapshot,
+} from "../agent/context-budget.js";
 import { getConfigFilePath } from "../config/paths.js";
 import { isCommandApprovalMode } from "../tools/command_policy.js";
 import type { SessionEvent } from "./events.js";
@@ -12,6 +16,7 @@ type PersistedSessionFile = {
   history?: unknown;
   events?: unknown;
   maxHistoryTurns?: unknown;
+  contextBudget?: unknown;
   updatedAt?: unknown;
 };
 
@@ -35,6 +40,7 @@ export type SessionSnapshot = {
   history: ConversationMessage[];
   events?: SessionEvent[];
   maxHistoryTurns: number;
+  contextBudget?: ContextBudgetSnapshot;
 };
 
 export type SessionSummary = {
@@ -54,6 +60,7 @@ export type StoredSession = {
   history: ConversationMessage[];
   events: SessionEvent[];
   maxHistoryTurns: number;
+  contextBudget: ContextBudgetSnapshot;
   updatedAt: string;
   filePath: string;
 };
@@ -143,6 +150,9 @@ export async function saveSession(
     content: message.content,
   }));
   const events = [...(snapshot.events ?? [])];
+  const contextBudget = snapshot.contextBudget
+    ? { ...snapshot.contextBudget }
+    : createEmptyContextBudgetSnapshot();
   // Preserve an existing manual title when routine autosaves do not provide one.
   const existingSession = await loadExistingSession(normalizedId);
   const title = deriveSessionTitle(
@@ -175,6 +185,7 @@ export async function saveSession(
         history,
         events,
         maxHistoryTurns: snapshot.maxHistoryTurns,
+        contextBudget,
         updatedAt,
       },
       null,
@@ -204,6 +215,7 @@ export async function saveSession(
       history,
       events,
       maxHistoryTurns: snapshot.maxHistoryTurns,
+      contextBudget,
       updatedAt,
       filePath,
     },
@@ -442,6 +454,7 @@ function parseStoredSession(
 ): StoredSession {
   const history = parseHistory(parsed.history, filePath);
   const events = parseSessionEvents(parsed.events, filePath);
+  const contextBudget = parseContextBudget(parsed.contextBudget);
   const title = deriveSessionTitle(
     typeof parsed.title === "string" ? parsed.title : null,
     null,
@@ -475,8 +488,37 @@ function parseStoredSession(
     history,
     events,
     maxHistoryTurns,
+    contextBudget,
     updatedAt,
     filePath,
+  };
+}
+
+function parseContextBudget(value: unknown): ContextBudgetSnapshot {
+  if (value === undefined) {
+    return createEmptyContextBudgetSnapshot();
+  }
+
+  if (!value || typeof value !== "object") {
+    return createEmptyContextBudgetSnapshot();
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return {
+    modelContextTokens: parseOptionalPositiveInt(candidate.modelContextTokens),
+    configuredContextLimitTokens: parseOptionalPositiveInt(
+      candidate.configuredContextLimitTokens,
+    ),
+    effectiveContextLimitTokens: parseOptionalPositiveInt(
+      candidate.effectiveContextLimitTokens,
+    ),
+    lastPromptTokens: parseOptionalPositiveInt(candidate.lastPromptTokens),
+    lastTotalTokens: parseOptionalPositiveInt(candidate.lastTotalTokens),
+    estimatedPromptTokens: parseOptionalPositiveInt(candidate.estimatedPromptTokens),
+    usageSource:
+      candidate.usageSource === "response" || candidate.usageSource === "estimate"
+        ? candidate.usageSource
+        : null,
   };
 }
 
@@ -726,6 +768,12 @@ async function hydrateSessionStoreSummaries(
 
 function getSessionIndexFilePath(): string {
   return getConfigFilePath(path.join("sessions", "index.json"));
+}
+
+function parseOptionalPositiveInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : null;
 }
 
 function getSessionFilePath(sessionId: string): string {

@@ -167,6 +167,42 @@ export async function saveProviderTimeoutMs(
   });
 }
 
+export async function saveProviderContextLimitTokens(
+  providerId: ProviderId,
+  contextLimitTokens: number | null,
+): Promise<SuperRunSettings> {
+  if (
+    contextLimitTokens !== null &&
+    (!Number.isInteger(contextLimitTokens) || contextLimitTokens <= 0)
+  ) {
+    throw new Error("Provider context limit must be a positive integer.");
+  }
+
+  const currentSettings = await loadSettings();
+  const providerKey = getProviderOverrideKey(providerId);
+  const currentProfile =
+    currentSettings.providerSettingsOverrides[providerKey] ?? {};
+  const nextProfile =
+    contextLimitTokens === null
+      ? Object.fromEntries(
+          Object.entries(currentProfile).filter(([key]) => key !== "contextLimitTokens"),
+        )
+      : {
+          ...currentProfile,
+          contextLimitTokens,
+        };
+
+  return writeSettingsFile(currentSettings.filePath, {
+    ...(currentSettings.hasStoredSystemPrompt
+      ? { systemPrompt: currentSettings.systemPrompt }
+      : {}),
+    providerSettingsOverrides: {
+      ...currentSettings.providerSettingsOverrides,
+      [providerKey]: nextProfile,
+    },
+  });
+}
+
 export async function saveProviderBaseURL(
   providerId: ProviderId,
   baseURL: string,
@@ -279,6 +315,17 @@ function parseProviderProfileOverride(
       throw new Error(`Settings file has an invalid ${key}.timeoutMs value: ${filePath}`);
     }
     profile.timeoutMs = candidate.timeoutMs;
+  }
+
+  if (candidate.contextLimitTokens !== undefined) {
+    if (
+      typeof candidate.contextLimitTokens !== "number" ||
+      !Number.isInteger(candidate.contextLimitTokens) ||
+      candidate.contextLimitTokens <= 0
+    ) {
+      throw new Error(`Settings file has an invalid ${key}.contextLimitTokens value: ${filePath}`);
+    }
+    profile.contextLimitTokens = candidate.contextLimitTokens;
   }
 
   return profile;

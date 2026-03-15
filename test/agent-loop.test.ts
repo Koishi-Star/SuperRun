@@ -29,14 +29,14 @@ test("runAgentTurn appends history and sends prior turns", async () => {
     const session = createAgentSession({ systemPrompt: "Test system prompt" });
 
     const firstReply = await runAgentTurn(session, "  Hello  ");
-    assert.equal(firstReply, "First answer");
+    assert.equal(firstReply.reply, "First answer");
     assert.deepEqual(session.history, [
       { role: "user", content: "Hello" },
       { role: "assistant", content: "First answer" },
     ]);
 
     const secondReply = await runAgentTurn(session, "What did I say?");
-    assert.equal(secondReply, "Second answer");
+    assert.equal(secondReply.reply, "Second answer");
     assert.deepEqual(server.requests[1]?.messages, [
       { role: "system", content: "Test system prompt" },
       { role: "user", content: "Hello" },
@@ -92,7 +92,7 @@ test("runAgentTurn trims history to the most recent configured turns", async () 
     await runAgentTurn(session, "Second");
     const thirdReply = await runAgentTurn(session, "Third");
 
-    assert.equal(thirdReply, "Third answer");
+    assert.equal(thirdReply.reply, "Third answer");
     assert.deepEqual(server.requests[2]?.messages, [
       { role: "system", content: "Test system prompt" },
       { role: "user", content: "Second" },
@@ -127,7 +127,48 @@ test("getAgentSessionStats reports simple turn and character counts", () => {
     historyCharCount: 15,
     systemPromptCharCount: 6,
     maxHistoryTurns: 3,
+    currentContextTokens: null,
+    effectiveContextLimitTokens: null,
+    contextUsageSource: null,
   });
+});
+
+test("runAgentTurn prefers official usage when the provider returns token counts", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      content: "usage response",
+      usage: {
+        promptTokens: 42,
+        completionTokens: 7,
+        totalTokens: 49,
+      },
+    },
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const result = await runAgentTurn(session, "Hello");
+
+    assert.equal(result.reply, "usage response");
+    assert.equal(result.usage?.promptTokens, 42);
+    assert.equal(result.contextBudgetSnapshot.lastPromptTokens, 42);
+    assert.equal(result.contextBudgetSnapshot.lastTotalTokens, 49);
+    assert.equal(result.contextBudgetSnapshot.usageSource, "response");
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
 });
 
 test("runAgentTurn resolves a list_files tool call before producing the final answer", async () => {
@@ -168,7 +209,7 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
     });
     const reply = await runAgentTurn(session, "What files are here?");
 
-    assert.equal(reply, "The workspace includes alpha.ts and beta.txt.");
+    assert.equal(reply.reply, "The workspace includes alpha.ts and beta.txt.");
     assert.equal(server.requests.length, 2);
     assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "list_files");
     assert.deepEqual(server.requests[1]?.messages, [
@@ -246,7 +287,7 @@ test("runAgentTurn preserves provider reasoning_content across tool calls", asyn
     });
     const reply = await runAgentTurn(session, "What files are here?");
 
-    assert.equal(reply, "There is one file here.");
+    assert.equal(reply.reply, "There is one file here.");
     assert.equal(
       server.requests[1]?.messages[2] &&
         "reasoning_content" in server.requests[1].messages[2]
@@ -297,7 +338,7 @@ test("runAgentTurn resolves a run_command tool call in default mode", async () =
     const session = createAgentSession({ systemPrompt: "Test system prompt" });
     const reply = await runAgentTurn(session, "Where am I?");
 
-    assert.equal(reply, "The command printed the workspace path.");
+    assert.equal(reply.reply, "The command printed the workspace path.");
     assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "run_command");
 
     const toolMessage = server.requests[1]?.messages[3];
@@ -380,7 +421,7 @@ test("runAgentTurn tolerates multi-step tool loops that exceed three rounds", as
     });
     const reply = await runAgentTurn(session, "Inspect the workspace carefully.");
 
-    assert.equal(reply, "Completed after several tool rounds.");
+    assert.equal(reply.reply, "Completed after several tool rounds.");
     assert.equal(server.requests.length, 5);
   } finally {
     process.chdir(previousCwd);
@@ -427,7 +468,7 @@ test("runAgentTurn forces a final no-tool answer after repeated tool rounds", as
     });
     const reply = await runAgentTurn(session, "Inspect carefully, then stop looping.");
 
-    assert.equal(reply, "Final answer without more tools.");
+    assert.equal(reply.reply, "Final answer without more tools.");
     assert.equal(server.requests.length, 9);
     assert.equal(server.requests[8]?.tools, undefined);
     assert.match(

@@ -1,16 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { createContext, useContext, useEffect, useState } from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import { AssistantRichText, RichText } from "../assistant-rich-text.js";
 import type { ComposerState } from "../composer-state.js";
 import { getDisplayWidth, truncateForTerminal } from "../terminal_format.js";
 import type {
   RendererAgentTurn,
+  RendererContextMeter,
   RendererDiffBlock,
   RendererLine,
   RendererOverlay,
   RendererOverlayOption,
   RendererPickerOverlay,
   RendererPrompt,
+  RendererShellFrame,
   RendererToolStep,
   RendererTurnCard,
   RendererViewerOverlay,
@@ -30,8 +32,49 @@ const WORKING_SPINNER_FRAMES = [
   "⠏",
 ];
 
+// ---------------------------------------------------------------------------
+// Centralized spinner tick — a single setInterval drives all spinner
+// animations in the tree, avoiding N independent timers that each trigger
+// separate React re-renders.
+// ---------------------------------------------------------------------------
+const GLOBAL_SPINNER_INTERVAL_MS = 80;
+const SpinnerTickContext = createContext<number>(0);
+
+function SpinnerTickProvider(props: {
+  children: React.ReactNode;
+}): React.JSX.Element {
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTick((t) => t + 1);
+    }, GLOBAL_SPINNER_INTERVAL_MS);
+    return () => { clearInterval(timer); };
+  }, []);
+
+  return (
+    <SpinnerTickContext.Provider value={tick}>
+      {props.children}
+    </SpinnerTickContext.Provider>
+  );
+}
+
+/** Derive a spinner frame from the shared tick. */
+function useSpinnerFrame(options?: {
+  enabled?: boolean;
+  frames?: string[];
+}): string {
+  const tick = useContext(SpinnerTickContext);
+  const enabled = options?.enabled ?? false;
+  const frames = options?.frames ?? SPINNER_FRAMES;
+  if (!enabled || frames.length <= 1) {
+    return frames[0] ?? "|";
+  }
+  return frames[tick % frames.length] ?? frames[0] ?? "|";
+}
+
 export type InteractiveShellProps = {
-  headerLines: RendererLine[];
+  shellFrame: RendererShellFrame;
   turns: RendererTurnCard[];
   prompt: RendererPrompt;
   divider: string;
@@ -54,8 +97,10 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
   );
 
   return (
+    <SpinnerTickProvider>
     <Box flexDirection="column">
-      <HeaderCard lines={props.headerLines} />
+      <StructuredHeaderCard frame={props.shellFrame} />
+      <ContextMeterBar meter={props.shellFrame.contextMeter} width={contentWidth} />
       <TurnList
         turns={props.turns}
         commandViewportHeight={props.commandViewportHeight}
@@ -70,8 +115,87 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
         prompt={props.prompt}
         divider={props.divider}
         inputMode={props.inputMode}
+        contextMeter={props.shellFrame.contextMeter}
       />
       <StatusBar text={props.statusText} width={props.divider.length} />
+    </Box>
+    </SpinnerTickProvider>
+  );
+}
+
+function StructuredHeaderCard(props: { frame: RendererShellFrame }): React.JSX.Element {
+  if (
+    props.frame.workspaceLines.length === 0 &&
+    props.frame.statusLines.length === 0 &&
+    props.frame.footerLines.length === 0
+  ) {
+    return <></>;
+  }
+
+  const showSplitLayout = props.frame.statusLines.length > 0;
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="yellow"
+      marginBottom={1}
+      paddingX={1}
+    >
+      <Text bold color="yellow">{props.frame.title}</Text>
+      {showSplitLayout ? (
+        <Box flexDirection="row" marginTop={1}>
+          <Box flexDirection="column" width="58%">
+            <Text bold color="cyan">Workspace</Text>
+            <LineBlock lines={props.frame.workspaceLines} />
+          </Box>
+          <Box marginX={1}>
+            <Text color="yellow">|</Text>
+          </Box>
+          <Box flexDirection="column" flexGrow={1}>
+            <Text bold color="yellow">Status</Text>
+            <LineBlock lines={props.frame.statusLines} />
+          </Box>
+        </Box>
+      ) : (
+        <Box marginTop={1}>
+          <LineBlock lines={props.frame.workspaceLines} />
+        </Box>
+      )}
+      {props.frame.footerLines.length > 0 ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="yellow">-</Text>
+          <LineBlock lines={props.frame.footerLines} />
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+function ContextMeterBar(props: {
+  meter: RendererContextMeter | null;
+  width: number;
+}): React.JSX.Element {
+  const width = Math.max(10, props.width - 2);
+  const meter = props.meter;
+  if (!meter || meter.limitTokens === null || meter.limitTokens <= 0) {
+    return <Text dimColor>{`[${" ".repeat(width - 2)}]`}</Text>;
+  }
+
+  const ratio = Math.max(0, Math.min((meter.usedTokens ?? 0) / meter.limitTokens, 1));
+  const filledWidth = Math.max(0, Math.min(width - 2, Math.round((width - 2) * ratio)));
+  const color = ratio >= 0.95
+    ? "redBright"
+    : ratio >= 0.85
+      ? "#ff8c42"
+      : "cyan";
+
+  return (
+    <Box marginBottom={1}>
+      <Text>[</Text>
+      <Text color={color}>{"=".repeat(filledWidth)}</Text>
+      <Text dimColor>{"-".repeat(Math.max(0, width - 2 - filledWidth))}</Text>
+      <Text>]</Text>
     </Box>
   );
 }
@@ -179,7 +303,6 @@ function AgentTurn(props: {
   const workingSpinnerFrame = useSpinnerFrame({
     enabled: showLockedPromptStyle,
     frames: WORKING_SPINNER_FRAMES,
-    intervalMs: 90,
   });
   const showStepDetails = isFocused;
   const showAnswer = isFocused || props.turn.answerText.length > 0;
@@ -252,7 +375,7 @@ function AgentTurn(props: {
       {props.turn.answerText && showAnswer ? (
         <Box marginTop={props.turn.steps.length > 0 || props.turn.inlineBlock ? 1 : 0}>
           <Box marginLeft={isFocused ? 0 : 2}>
-            <AssistantRichText text={props.turn.answerText} />
+            <AssistantRichText text={props.turn.answerText} maxWidth={props.contentWidth} />
           </Box>
         </Box>
       ) : null}
@@ -438,20 +561,71 @@ function DiffBlock(props: { block: RendererDiffBlock }): React.JSX.Element {
 // and pad the remainder so the composer never changes height from suggestions.
 const MAX_SUGGESTION_LINES = 7;
 
+// Build the top divider for the Composer. When context meter data is
+// available, embed a compact summary like "── context 1.4k/262.1k (0.5%) ──"
+// so the user can still see context usage even when the header has scrolled
+// off-screen during long agent output.
+function buildContextDivider(
+  meter: RendererContextMeter | null,
+  width: number,
+): React.JSX.Element {
+  if (!meter || meter.limitTokens === null || meter.limitTokens <= 0) {
+    return <Text dimColor>{"-".repeat(width)}</Text>;
+  }
+
+  const used = meter.usedTokens ?? 0;
+  const limit = meter.limitTokens;
+  const ratio = Math.max(0, Math.min(used / limit, 1));
+  const pct = (ratio * 100).toFixed(ratio >= 0.1 ? 0 : 1);
+  const usedStr = formatCompactTokenCount(used);
+  const limitStr = formatCompactTokenCount(limit);
+  const label = ` context ${usedStr}/${limitStr} (${pct}%) `;
+  const labelWidth = getDisplayWidth(label);
+  const remainingDashes = Math.max(0, width - labelWidth);
+  const leftDashes = Math.floor(remainingDashes / 2);
+  const rightDashes = remainingDashes - leftDashes;
+
+  const color = ratio >= 0.95
+    ? "redBright"
+    : ratio >= 0.85
+      ? "#ff8c42"
+      : "cyan";
+
+  return (
+    <Text dimColor>
+      {"-".repeat(leftDashes)}
+      <Text color={color} dimColor={false}>{label}</Text>
+      {"-".repeat(rightDashes)}
+    </Text>
+  );
+}
+
+function formatCompactTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}m`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1)}k`;
+  }
+  return value.toString();
+}
+
 function Composer(props: {
   prompt: RendererPrompt;
   divider: string;
   inputMode: InteractiveShellProps["inputMode"];
+  contextMeter: RendererContextMeter | null;
 }): React.JSX.Element {
   const availableWidth = props.divider.length;
   const isActive = props.inputMode === "prompt";
+  const contextDivider = buildContextDivider(props.contextMeter, availableWidth);
 
   // When inactive, render the same structural lines but dimmed to avoid
   // mounting/unmounting jitter while signalling that input is unavailable.
   if (!isActive) {
     return (
       <Box flexDirection="column">
-        <Text dimColor>{props.divider}</Text>
+        {contextDivider}
         <Text dimColor color="gray">{fitSingleLine("  ...", availableWidth)}</Text>
         <Text dimColor>{props.divider}</Text>
       </Box>
@@ -472,7 +646,7 @@ function Composer(props: {
 
   return (
     <Box flexDirection="column">
-      <Text dimColor>{props.divider}</Text>
+      {contextDivider}
       <PromptLine
         label={props.prompt.label}
         state={props.prompt.state}
@@ -787,37 +961,6 @@ function renderSuggestionLines(state: ComposerState): Array<{
   }
 
   return [];
-}
-
-function useSpinnerFrame(options?: {
-  enabled?: boolean;
-  frames?: string[];
-  intervalMs?: number;
-}): string {
-  const enabled = options?.enabled ?? false;
-  const frames = useMemo(
-    () => options?.frames ?? SPINNER_FRAMES,
-    [options?.frames],
-  );
-  const intervalMs = options?.intervalMs ?? 80;
-  const [frameIndex, setFrameIndex] = useState(0);
-
-  useEffect(() => {
-    if (!enabled || frames.length <= 1) {
-      setFrameIndex(0);
-      return;
-    }
-
-    const timer = setInterval(() => {
-      setFrameIndex((current) => (current + 1) % frames.length);
-    }, intervalMs);
-
-    return () => {
-      clearInterval(timer);
-    };
-  }, [enabled, frames, intervalMs]);
-
-  return frames[frameIndex] ?? frames[0] ?? "|";
 }
 
 function fitSingleLine(text: string, width: number): string {

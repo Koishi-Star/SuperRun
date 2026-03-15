@@ -30,6 +30,20 @@ export type RendererLine = {
   text: string;
 };
 
+export type RendererContextMeter = {
+  usedTokens: number | null;
+  limitTokens: number | null;
+  source: "response" | "estimate" | null;
+};
+
+export type RendererShellFrame = {
+  title: string;
+  workspaceLines: RendererLine[];
+  statusLines: RendererLine[];
+  footerLines: RendererLine[];
+  contextMeter: RendererContextMeter | null;
+};
+
 export type RendererPrompt = {
   label: {
     kind: "user" | "editor";
@@ -194,7 +208,13 @@ export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
   setMinimumCommandPanelDurationMs: (durationMs: number) => void;
-  setShellFrame: (lines: Array<Omit<RendererLine, "id">>) => void;
+  setShellFrame: (frame: {
+    title: string;
+    workspaceLines: Array<Omit<RendererLine, "id">>;
+    statusLines: Array<Omit<RendererLine, "id">>;
+    footerLines: Array<Omit<RendererLine, "id">>;
+    contextMeter?: RendererContextMeter | null;
+  }) => void;
   renderCommands: () => void;
   renderSectionTitle: (title: string) => void;
   renderInfo: (message: string) => void;
@@ -229,7 +249,7 @@ export type InteractiveRenderer = {
 type RendererInputMode = "inactive" | "prompt" | "overlay" | "inline";
 
 type RendererState = {
-  headerLines: RendererLine[];
+  shellFrame: RendererShellFrame;
   turns: RendererTurnCard[];
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
@@ -237,7 +257,7 @@ type RendererState = {
 };
 
 export type InteractiveRendererSnapshot = {
-  headerLines: RendererLine[];
+  shellFrame: RendererShellFrame;
   turns: RendererTurnCard[];
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
@@ -277,10 +297,18 @@ export function createInteractiveRenderer(options: {
     options.minCommandPanelDurationMs,
   );
   const pendingCommandCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let pendingToolOutputEvents: ToolTurnEvent[] = [];
+  let toolOutputFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let instance: Instance | null = null;
   const shouldAnimateAssistantText = options.enableInput ?? true;
   let state: RendererState = {
-    headerLines: [],
+    shellFrame: {
+      title: "SuperRun",
+      workspaceLines: [],
+      statusLines: [],
+      footerLines: [],
+      contextMeter: null,
+    },
     turns: [],
     prompt: {
       label: {
@@ -306,7 +334,7 @@ export function createInteractiveRenderer(options: {
       stderr: process.stderr,
       exitOnCtrlC: false,
       patchConsole: false,
-      maxFps: 60,
+      maxFps: 30,
     });
   };
 
@@ -320,7 +348,7 @@ export function createInteractiveRenderer(options: {
 
   const renderApp = () => (
     <InteractiveShell
-      headerLines={state.headerLines}
+      shellFrame={state.shellFrame}
       turns={state.turns}
       prompt={state.prompt}
       divider={buildDivider(options.output)}
@@ -426,6 +454,53 @@ export function createInteractiveRenderer(options: {
     });
 
     if (updated) {
+      rerender();
+    }
+  };
+
+  // Apply a single tool event to the turn state with command-panel scheduling.
+  // Returns true if the turn was updated.
+  const applyToolEventImmediately = (event: ToolTurnEvent): boolean => {
+    const result = updateLatestAgentTurn((turn) =>
+      applyToolEventToTurn(turn, event, {
+        minCommandPanelDurationMs,
+        scheduleCommandCompletion: (stepId, completedEvent, remainingMs) => {
+          const existingTimer = pendingCommandCompletionTimers.get(stepId);
+          if (existingTimer) {
+            clearTimeout(existingTimer);
+          }
+
+          pendingCommandCompletionTimers.set(
+            stepId,
+            setTimeout(() => {
+              finalizeCommandStepById(stepId, completedEvent);
+            }, remainingMs),
+          );
+        },
+      }),
+    );
+    return result !== null;
+  };
+
+  // Drain all buffered output events in one batch and trigger a single rerender.
+  const flushPendingToolOutputEvents = () => {
+    if (toolOutputFlushTimer) {
+      clearTimeout(toolOutputFlushTimer);
+      toolOutputFlushTimer = null;
+    }
+    if (pendingToolOutputEvents.length === 0) {
+      return;
+    }
+    const batch = pendingToolOutputEvents;
+    pendingToolOutputEvents = [];
+
+    let changed = false;
+    for (const event of batch) {
+      if (applyToolEventImmediately(event)) {
+        changed = true;
+      }
+    }
+    if (changed) {
       rerender();
     }
   };
@@ -600,20 +675,33 @@ export function createInteractiveRenderer(options: {
     setMinimumCommandPanelDurationMs: (durationMs) => {
       minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(durationMs);
     },
-    setShellFrame: (lines) => {
+    setShellFrame: (frame) => {
       state = {
         ...state,
-        headerLines: lines.map((line) => ({
-          ...line,
-          id: `header_${nextLineId += 1}`,
-        })),
+        shellFrame: {
+          title: frame.title,
+          workspaceLines: frame.workspaceLines.map((line) => ({
+            ...line,
+            id: `header_${nextLineId += 1}`,
+          })),
+          statusLines: frame.statusLines.map((line) => ({
+            ...line,
+            id: `header_${nextLineId += 1}`,
+          })),
+          footerLines: frame.footerLines.map((line) => ({
+            ...line,
+            id: `header_${nextLineId += 1}`,
+          })),
+          contextMeter: frame.contextMeter ?? null,
+        },
       };
       rerender();
     },
     renderCommands: () => {
-      renderer.renderSectionTitle("Available commands");
+      appendSystemLines("body", "Available commands");
       renderer.writeBodyLine("/help  Show command help");
-      renderer.writeBodyLine("/provider Show or switch the active provider, model, base URL, and runtime API key");
+      renderer.writeBodyLine("/provider Show or switch the active provider, model, context budget, Kimi endpoint, base URL, runtime API key, and Kimi catalog state");
+      renderer.writeBodyLine("/model  Open the TTY model picker when available, or set the active model by name");
       renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict)");
       renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
       renderer.writeBodyLine("/duration Show or switch the minimum command panel duration in seconds");
@@ -625,7 +713,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/switch   Switch to a saved session by id, title, or list index");
       renderer.writeBodyLine("/rename   Rename the current saved session");
       renderer.writeBodyLine("/delete   Delete the current session, one session by id/title/index, or all sessions");
-      renderer.writeBodyLine("/trash    Manage the local delete area without going through the model");
+      renderer.writeBodyLine("/trash    Open delete-area actions for viewing, restoring, deleting, or emptying files");
       renderer.writeBodyLine("/system  Edit and persist the system prompt directly in the terminal");
       renderer.writeBodyLine("/editor  Open the current system prompt in your external editor");
       renderer.writeBodyLine("/system reset Restore the built-in system prompt");
@@ -634,7 +722,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("");
     },
     renderSectionTitle: (title) => {
-      appendSystemLines("section", title);
+      appendSystemLines("body", title);
     },
     renderInfo: (message) => {
       appendSystemLines("info", message);
@@ -703,24 +791,20 @@ export function createInteractiveRenderer(options: {
       renderer.renderError(message);
     },
     applyToolEvent: (event) => {
-      const updated = updateLatestAgentTurn((turn) =>
-        applyToolEventToTurn(turn, event, {
-          minCommandPanelDurationMs,
-          scheduleCommandCompletion: (stepId, completedEvent, remainingMs) => {
-            const existingTimer = pendingCommandCompletionTimers.get(stepId);
-            if (existingTimer) {
-              clearTimeout(existingTimer);
-            }
+      // Batch command output events to avoid per-line rerenders.
+      if (event.kind === "command_execution" && event.phase === "output") {
+        pendingToolOutputEvents.push(event);
+        if (!toolOutputFlushTimer) {
+          toolOutputFlushTimer = setTimeout(flushPendingToolOutputEvents, 50);
+        }
+        return;
+      }
 
-            pendingCommandCompletionTimers.set(
-              stepId,
-              setTimeout(() => {
-                finalizeCommandStepById(stepId, completedEvent);
-              }, remainingMs),
-            );
-          },
-        }),
-      );
+      // Non-output events (started, completed, notice, edit review) apply
+      // immediately — flush any pending output first so ordering is preserved.
+      flushPendingToolOutputEvents();
+
+      const updated = applyToolEventImmediately(event);
       if (updated) {
         rerender();
       }
@@ -918,7 +1002,7 @@ export function createInteractiveRenderer(options: {
       });
     },
     getSnapshot: () => ({
-      headerLines: state.headerLines.map(cloneRendererLine),
+      shellFrame: cloneRendererShellFrame(state.shellFrame),
       turns: state.turns.map(cloneRendererTurn),
       prompt: {
         label: { ...state.prompt.label },
@@ -1569,6 +1653,16 @@ function normalizeMinimumCommandPanelDurationMs(
 
 function cloneRendererLine(line: RendererLine): RendererLine {
   return { ...line };
+}
+
+function cloneRendererShellFrame(frame: RendererShellFrame): RendererShellFrame {
+  return {
+    title: frame.title,
+    workspaceLines: frame.workspaceLines.map(cloneRendererLine),
+    statusLines: frame.statusLines.map(cloneRendererLine),
+    footerLines: frame.footerLines.map(cloneRendererLine),
+    contextMeter: frame.contextMeter ? { ...frame.contextMeter } : null,
+  };
 }
 
 function cloneRendererTurn(turn: RendererTurnCard): RendererTurnCard {

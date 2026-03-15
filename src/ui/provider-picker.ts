@@ -27,7 +27,7 @@ export function buildProviderPickerChoices(
     {
       value: "kimi",
       name: currentProvider === "kimi" ? "Kimi (current)" : "Kimi",
-      description: "Use Moonshot Kimi with MOONSHOT_API_KEY or a runtime key entered in the TTY.",
+      description: "Use Moonshot Kimi with MOONSHOT_API_KEY or a locally stored key entered in the TTY.",
     },
     {
       value: null,

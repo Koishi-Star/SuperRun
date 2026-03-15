@@ -53,6 +53,15 @@ test("createSession persists a session and marks it active", async () => {
       ],
       events: sampleEvents,
       maxHistoryTurns: 10,
+      contextBudget: {
+        modelContextTokens: 256_000,
+        configuredContextLimitTokens: 128_000,
+        effectiveContextLimitTokens: 128_000,
+        lastPromptTokens: 12_000,
+        lastTotalTokens: 12_500,
+        estimatedPromptTokens: 11_500,
+        usageSource: "response",
+      },
     });
 
     assert.match(created.session.id, /^s_/);
@@ -74,6 +83,7 @@ test("createSession persists a session and marks it active", async () => {
       { role: "assistant", content: "Hello" },
     ]);
     assert.deepEqual(loaded.events, sampleEvents);
+    assert.equal(loaded.contextBudget.effectiveContextLimitTokens, 128_000);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

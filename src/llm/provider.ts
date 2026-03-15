@@ -12,6 +12,7 @@ export type ProviderProfileConfig = {
   baseURL: string;
   model: string;
   timeoutMs: number;
+  contextLimitTokens?: number;
 };
 
 export type ProviderSettingsOverrides = {
@@ -26,7 +27,7 @@ export type ProviderSettings = {
   kimi: ProviderProfileConfig;
 };
 
-export type ProviderApiKeySource = "runtime" | "env" | "missing";
+export type ProviderApiKeySource = "runtime" | "stored" | "env" | "missing";
 
 export type ProviderRuntimeSecretOverrides = Partial<Record<ProviderId, string>>;
 
@@ -36,6 +37,8 @@ export type ProviderRuntimeConfig = ProviderProfileConfig & {
   apiKey: string;
   apiKeySource: ProviderApiKeySource;
   apiKeyPlaceholder: string;
+  modelContextTokens: number | null;
+  modelContextSource: "catalog" | "registry" | "unknown";
 };
 
 export type ProviderUsage = {
@@ -108,6 +111,14 @@ export function resolveProviderSettings(
           DEFAULT_PROVIDER_TIMEOUT_MS,
         "OPENAI_TIMEOUT_MS",
       ),
+      ...(overrides?.openaiCompatible?.contextLimitTokens !== undefined
+        ? {
+            contextLimitTokens: normalizeContextLimitTokens(
+              overrides.openaiCompatible.contextLimitTokens,
+              "OpenAI-compatible context limit",
+            ),
+          }
+        : {}),
     },
     kimi: {
       baseURL: normalizeProviderBaseURL(
@@ -131,6 +142,14 @@ export function resolveProviderSettings(
           DEFAULT_PROVIDER_TIMEOUT_MS,
         "MOONSHOT_TIMEOUT_MS",
       ),
+      ...(overrides?.kimi?.contextLimitTokens !== undefined
+        ? {
+            contextLimitTokens: normalizeContextLimitTokens(
+              overrides.kimi.contextLimitTokens,
+              "Kimi context limit",
+            ),
+          }
+        : {}),
     },
   };
 }
@@ -152,9 +171,14 @@ export function resolveProviderRuntimeConfig(
     baseURL: profile.baseURL,
     model: profile.model,
     timeoutMs: profile.timeoutMs,
+    ...(profile.contextLimitTokens !== undefined
+      ? { contextLimitTokens: profile.contextLimitTokens }
+      : {}),
     apiKey,
     apiKeySource: runtimeApiKey ? "runtime" : envApiKey ? "env" : "missing",
     apiKeyPlaceholder: getProviderApiKeyPlaceholder(providerId),
+    modelContextTokens: null,
+    modelContextSource: "unknown",
   };
 }
 
@@ -264,4 +288,15 @@ function normalizeTimeoutMs(
   }
 
   return Math.round(parsedValue);
+}
+
+function normalizeContextLimitTokens(
+  value: number,
+  fieldName: string,
+): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${fieldName} must be a positive integer when set.`);
+  }
+
+  return value;
 }

@@ -89,6 +89,7 @@
 - Keep prompts and model-facing message construction centralized rather than scattered across files.
 - Keep the default coding-agent path centered on command execution plus explicit policy, while preserving narrow specialized tools for strict mode.
 - Avoid fake abstractions for future multi-provider support until at least one provider is working.
+- For interactive provider/model switching, prefer TTY picker flows such as `/model` over requiring typed parameter forms; keep text arguments as a fallback for non-TTY or scripting use.
 
 ## Verification
 

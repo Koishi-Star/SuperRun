@@ -8,7 +8,13 @@ import { InteractiveShell } from "../src/ui/ink/interactive-shell.js";
 test("interactive shell renders history viewer overlays without bare text nodes", () => {
   const output = renderToString(
     React.createElement(InteractiveShell, {
-      headerLines: [],
+      shellFrame: {
+        title: "SuperRun",
+        workspaceLines: [],
+        statusLines: [],
+        footerLines: [],
+        contextMeter: null,
+      },
       turns: [],
       prompt: {
         label: {

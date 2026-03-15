@@ -8,6 +8,7 @@ import {
   resetSystemPrompt,
   saveActiveProvider,
   saveProviderBaseURL,
+  saveProviderContextLimitTokens,
   saveProviderModel,
   saveSystemPrompt,
 } from "../src/config/settings.js";
@@ -103,6 +104,27 @@ test("saveProviderBaseURL normalizes the Kimi Moonshot domain switch aliases", a
 
     const reloaded = await loadSettings();
     assert.equal(reloaded.providerSettings.kimi.baseURL, ALTERNATE_KIMI_BASE_URL);
+  } finally {
+    restoreConfigDir(previousConfigDir);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("saveProviderContextLimitTokens persists and clears provider context limits", async () => {
+  const previousConfigDir = process.env.SUPERRUN_CONFIG_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-settings-"));
+  process.env.SUPERRUN_CONFIG_DIR = tempDir;
+
+  try {
+    await saveActiveProvider("kimi");
+    const saved = await saveProviderContextLimitTokens("kimi", 128_000);
+    assert.equal(saved.providerSettings.kimi.contextLimitTokens, 128_000);
+
+    const reloaded = await loadSettings();
+    assert.equal(reloaded.providerSettings.kimi.contextLimitTokens, 128_000);
+
+    const cleared = await saveProviderContextLimitTokens("kimi", null);
+    assert.equal(cleared.providerSettings.kimi.contextLimitTokens, undefined);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

@@ -2,7 +2,7 @@ import React from "react";
 import chalk from "chalk";
 import { Box, Text } from "ink";
 import { highlight } from "cli-highlight";
-import { getDisplayWidth } from "./text-width.js";
+import { getDisplayWidth, truncateForTerminal } from "./terminal_format.js";
 
 export type AssistantInlineSegment =
   | {
@@ -72,19 +72,23 @@ const WARNING_COLOR = "#ff8c42";
 export function RichText(props: {
   text: string;
   tone?: RichTextTone;
+  maxWidth?: number;
 }): React.JSX.Element {
   const blocks = parseAssistantRichText(props.text);
   const tone = props.tone ?? "default";
 
   return (
     <Box flexDirection="column">
-      {blocks.map((block, index) => renderRichTextBlock(block, index, tone))}
+      {blocks.map((block, index) => renderRichTextBlock(block, index, tone, props.maxWidth))}
     </Box>
   );
 }
 
-export function AssistantRichText(props: { text: string }): React.JSX.Element {
-  return <RichText text={props.text} tone="assistant" />;
+export function AssistantRichText(props: {
+  text: string;
+  maxWidth?: number;
+}): React.JSX.Element {
+  return <RichText text={props.text} tone="assistant" {...(props.maxWidth !== undefined ? { maxWidth: props.maxWidth } : {})} />;
 }
 
 export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
@@ -243,11 +247,43 @@ export function parseMarkdownTable(
   };
 }
 
-export function renderMarkdownTableLines(table: MarkdownTable): string[] {
-  const widths = table.headers.map((header, columnIndex) => {
+export function renderMarkdownTableLines(
+  table: MarkdownTable,
+  maxWidth?: number,
+): string[] {
+  const columnCount = table.headers.length;
+  // Natural width of each column: max(header, max row cell).
+  const naturalWidths = table.headers.map((header, columnIndex) => {
     const rowWidths = table.rows.map((row) => getDisplayWidth(row[columnIndex] ?? ""));
     return Math.max(getDisplayWidth(header), ...rowWidths);
   });
+
+  // Total width of the rendered table at natural size:
+  // "| " (2) + col + (" | " between cols = 3*(n-1)) + " |" (2)
+  const separatorOverhead = 2 + 2 + Math.max(0, columnCount - 1) * 3;
+  const naturalTotal = naturalWidths.reduce((sum, w) => sum + w, 0) + separatorOverhead;
+
+  let widths = naturalWidths;
+  if (maxWidth !== undefined && maxWidth > 0 && naturalTotal > maxWidth) {
+    // Proportionally compress columns to fit maxWidth.
+    const MIN_COL_WIDTH = 4;
+    const availableForColumns = Math.max(
+      columnCount * MIN_COL_WIDTH,
+      maxWidth - separatorOverhead,
+    );
+    const naturalColumnTotal = naturalWidths.reduce((sum, w) => sum + w, 0);
+    widths = naturalWidths.map((w) => {
+      const ratio = naturalColumnTotal > 0 ? w / naturalColumnTotal : 1 / columnCount;
+      return Math.max(MIN_COL_WIDTH, Math.round(availableForColumns * ratio));
+    });
+    // Adjust rounding error on the last column.
+    const allocated = widths.reduce((sum, w) => sum + w, 0);
+    const lastIndex = widths.length - 1;
+    if (lastIndex >= 0) {
+      widths[lastIndex] = Math.max(MIN_COL_WIDTH, (widths[lastIndex] ?? 0) + (availableForColumns - allocated));
+    }
+  }
+
   const border = `+${widths.map((width) => "-".repeat(width + 2)).join("+")}+`;
   const headerBorder = `+${widths.map((width) => "=".repeat(width + 2)).join("+")}+`;
   const renderRow = (cells: string[]) => `| ${
@@ -413,6 +449,7 @@ function renderRichTextBlock(
   block: AssistantRichTextBlock,
   index: number,
   tone: RichTextTone,
+  maxWidth?: number,
 ): React.JSX.Element {
   switch (block.kind) {
     case "blank":
@@ -465,6 +502,7 @@ function renderRichTextBlock(
             alignments: block.alignments,
           }}
           tone={tone}
+          {...(maxWidth !== undefined ? { maxWidth } : {})}
         />
       );
     case "paragraph":
@@ -555,8 +593,9 @@ function CodeBlock(props: {
 function TableBlock(props: {
   table: MarkdownTable;
   tone: RichTextTone;
+  maxWidth?: number;
 }): React.JSX.Element {
-  const lines = renderMarkdownTableLines(props.table);
+  const lines = renderMarkdownTableLines(props.table, props.maxWidth);
 
   return (
     <Box flexDirection="column">
@@ -648,16 +687,20 @@ function padMarkdownTableCell(
   width: number,
   alignment: MarkdownTableAlignment,
 ): string {
-  const gap = Math.max(0, width - getDisplayWidth(text));
+  // Truncate cell content when it exceeds the (possibly compressed) column width.
+  const displayText = getDisplayWidth(text) > width
+    ? truncateForTerminal(text, width)
+    : text;
+  const gap = Math.max(0, width - getDisplayWidth(displayText));
   if (alignment === "right") {
-    return `${" ".repeat(gap)}${text}`;
+    return `${" ".repeat(gap)}${displayText}`;
   }
   if (alignment === "center") {
     const left = Math.floor(gap / 2);
     const right = gap - left;
-    return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
+    return `${" ".repeat(left)}${displayText}${" ".repeat(right)}`;
   }
-  return `${text}${" ".repeat(gap)}`;
+  return `${displayText}${" ".repeat(gap)}`;
 }
 
 function getBaseColor(tone: RichTextTone): string {
@@ -725,7 +768,7 @@ function formatBlockToAnsi(
         headers: block.headers,
         rows: block.rows,
         alignments: block.alignments,
-      }).map((line, index, lines) => {
+      }, process.stdout.columns || undefined).map((line, index, lines) => {
         const isBorder = index === 0 || index === 2 || index === lines.length - 1;
         const isHeader = index === 1;
         return isBorder

@@ -8,6 +8,7 @@ import {
   getAgentSessionStats,
   runAgentTurn,
 } from "./agent/loop.js";
+import { createEmptyContextBudgetSnapshot } from "./agent/context-budget.js";
 import {
   getAgentModeSummary,
   parseAgentMode,
@@ -18,11 +19,17 @@ import {
   resetSystemPrompt,
   saveActiveProvider,
   saveProviderBaseURL,
+  saveProviderContextLimitTokens,
   saveProviderModel,
   saveProviderTimeoutMs,
   saveSystemPrompt,
   type SuperRunSettings,
 } from "./config/settings.js";
+import {
+  clearPersistedProviderApiKey,
+  loadPersistedProviderApiKeys,
+  savePersistedProviderApiKey,
+} from "./config/provider-secrets.js";
 import {
   createSession,
   deleteAllSessions,
@@ -76,22 +83,41 @@ import {
   parseProviderId,
   resolveProviderRuntimeConfig,
   type ProviderId,
+  type ProviderApiKeySource,
   type ProviderRuntimeConfig,
   type ProviderRuntimeSecretOverrides,
 } from "./llm/provider.js";
+import {
+  attachProviderCatalogMetadata,
+  createProviderCatalogState,
+  describeProviderCatalogStatus,
+  refreshProviderCatalog,
+  summarizeProviderCatalogRefresh,
+  type ProviderCatalogRefreshFeedback,
+  type ProviderCatalogState,
+} from "./llm/provider-catalog.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
   createInteractiveRenderer,
+  type RendererContextMeter,
   type InteractiveRenderer,
   type RendererPickerOption,
   type RendererLine,
   type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
 import { buildModePickerChoices } from "./ui/mode-picker.js";
+import { buildKimiBaseURLPickerChoices } from "./ui/kimi-base-url-picker.js";
+import { buildProviderContextPickerChoices } from "./ui/provider-context-picker.js";
+import { buildProviderModelPickerChoices } from "./ui/provider-model-picker.js";
 import { buildProviderPickerChoices } from "./ui/provider-picker.js";
 import { runSessionBrowser } from "./ui/session-browser.js";
 import { promptHiddenInput } from "./ui/secret-input.js";
+import {
+  buildTrashActionChoices,
+  buildTrashEntryChoices,
+  type TrashActionValue,
+} from "./ui/trash-picker.js";
 
 export const program = new Command();
 
@@ -124,6 +150,7 @@ program
       }>();
       const mode = parseAgentMode(options.mode);
       const approvalMode = parseCommandApprovalMode(options.approvals);
+      const persistedProviderApiKeys = await loadPersistedProviderApiKeysSafely();
       const session = createAgentSession({
         mode,
         systemPrompt: settings.systemPrompt,
@@ -149,7 +176,14 @@ program
           workspaceFiles: null,
           sessionEvents: [],
           deleteAreaStatus: await getWorkspaceDeleteAreaStatus(),
-          providerApiKeyOverrides: {},
+          providerCatalog: createProviderCatalogState(),
+          providerApiKeyOverrides: { ...persistedProviderApiKeys },
+          providerApiKeySources: Object.fromEntries(
+            Object.keys(persistedProviderApiKeys).map((providerId) => [
+              providerId,
+              "stored",
+            ]),
+          ) as Partial<Record<ProviderId, ProviderApiKeySource>>,
           minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         });
         return;
@@ -161,7 +195,12 @@ program
         );
       }
 
-      const state = await createInteractiveState(settings, session, approvalMode);
+      const state = await createInteractiveState(
+        settings,
+        session,
+        approvalMode,
+        persistedProviderApiKeys,
+      );
       await runInteractiveSession(session, state);
     } catch (error) {
       const message = formatAgentTurnFailureMessage(error);
@@ -183,7 +222,9 @@ type InteractiveState = {
     fileCount: number;
     totalBytes: number;
   };
+  providerCatalog: ProviderCatalogState;
   providerApiKeyOverrides: ProviderRuntimeSecretOverrides;
+  providerApiKeySources: Partial<Record<ProviderId, ProviderApiKeySource>>;
   minCommandPanelDurationMs: number;
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
@@ -198,6 +239,7 @@ async function createInteractiveState(
   settings: SuperRunSettings,
   session: AgentSession,
   approvalMode: CommandApprovalMode,
+  persistedProviderApiKeys: ProviderRuntimeSecretOverrides,
 ): Promise<InteractiveState> {
   let sessionStore = await loadSessionStore();
   let currentSessionId: string | null = null;
@@ -219,7 +261,14 @@ async function createInteractiveState(
         workspaceFiles: null,
         sessionEvents: [...storedSession.events],
         deleteAreaStatus,
-        providerApiKeyOverrides: {},
+        providerCatalog: createProviderCatalogState(),
+        providerApiKeyOverrides: { ...persistedProviderApiKeys },
+        providerApiKeySources: Object.fromEntries(
+          Object.keys(persistedProviderApiKeys).map((providerId) => [
+            providerId,
+            "stored",
+          ]),
+        ) as Partial<Record<ProviderId, ProviderApiKeySource>>,
         minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         commandApprovalMode: approvalMode,
         commandHookRunner,
@@ -239,7 +288,14 @@ async function createInteractiveState(
     workspaceFiles: null,
     sessionEvents: [],
     deleteAreaStatus,
-    providerApiKeyOverrides: {},
+    providerCatalog: createProviderCatalogState(),
+    providerApiKeyOverrides: { ...persistedProviderApiKeys },
+    providerApiKeySources: Object.fromEntries(
+      Object.keys(persistedProviderApiKeys).map((providerId) => [
+        providerId,
+        "stored",
+      ]),
+    ) as Partial<Record<ProviderId, ProviderApiKeySource>>,
     minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
     commandApprovalMode: approvalMode,
     commandHookRunner,
@@ -258,7 +314,7 @@ async function runSingleTurn(
   console.log("user:", prompt);
   process.stdout.write("assistant: ");
 
-  const reply = await runAgentTurn(session, prompt, {
+  const result = await runAgentTurn(session, prompt, {
     providerConfig: getActiveProviderConfig(state),
     toolContext: createToolExecutionContext(session, state, null, turnEvents),
     onChunk: (chunk) => {
@@ -266,7 +322,7 @@ async function runSingleTurn(
     },
   });
 
-  if (!reply) {
+  if (!result.reply) {
     assistantWriter.writeChunk("(empty response)");
   }
 
@@ -284,7 +340,7 @@ async function runInteractiveSession(
     output,
     minCommandPanelDurationMs: state.minCommandPanelDurationMs,
   });
-  renderInteractiveShell(ui, session, state);
+  await initializeProviderCatalogForStartup(session, state, ui);
 
   try {
     while (true) {
@@ -303,6 +359,17 @@ async function runInteractiveSession(
   } finally {
     ui.dispose();
   }
+}
+
+async function initializeProviderCatalogForStartup(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): Promise<void> {
+  const activeProviderId = state.settings.providerSettings.activeProvider;
+  const refreshFeedback = await maybeRefreshProviderCatalog(activeProviderId, state);
+  renderInteractiveShell(ui, session, state);
+  renderProviderCatalogRefreshFeedback(ui, refreshFeedback);
 }
 
 async function handleInteractiveInput(
@@ -348,8 +415,14 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model <name>|base-url <url|moonshot-cn|moonshot-ai>|timeout <ms>] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
+    return true;
+  }
+
+  if (matchesCommand(prompt, "/model")) {
+    const modelArgument = parseCommandArgument(prompt, "/model");
+    await handleProviderModelShortcut(session, state, ui, modelArgument);
     return true;
   }
 
@@ -368,7 +441,13 @@ async function handleInteractivePrompt(
         }
 
         state.settings = await saveActiveProvider(selectedProvider);
-        await maybePromptForMissingProviderApiKey(selectedProvider, state, ui);
+        await maybePickKimiBaseURL(selectedProvider, session, state, ui);
+        if (selectedProvider !== "kimi") {
+          await maybePromptForMissingProviderApiKey(selectedProvider, state, ui);
+        }
+        const refreshFeedback = await maybeRefreshProviderCatalog(selectedProvider, state);
+        renderInteractiveShell(ui, session, state);
+        renderProviderCatalogRefreshFeedback(ui, refreshFeedback);
         renderProviderApplied(ui, getActiveProviderConfig(state));
         return true;
       }
@@ -394,6 +473,10 @@ async function handleInteractivePrompt(
       const currentProviderId = state.settings.providerSettings.activeProvider;
       await promptForProviderApiKey(currentProviderId, state, ui);
       renderInteractiveShell(ui, session, state);
+      renderProviderCatalogRefreshFeedback(
+        ui,
+        await maybeRefreshProviderCatalog(currentProviderId, state),
+      );
       renderProviderSummary(ui, state);
       return true;
     }
@@ -401,30 +484,111 @@ async function handleInteractivePrompt(
     if (providerSubcommand === "clear-key") {
       const currentProviderId = state.settings.providerSettings.activeProvider;
       delete state.providerApiKeyOverrides[currentProviderId];
+      delete state.providerApiKeySources[currentProviderId];
+      let clearedPersistedSecret = true;
+      try {
+        await clearPersistedProviderApiKey(currentProviderId);
+      } catch (error) {
+        clearedPersistedSecret = false;
+        renderWarning(
+          ui,
+          error instanceof Error
+            ? `Cleared the current-process API key for ${getProviderDisplayName(currentProviderId)}, but failed to remove the persisted secret: ${error.message}`
+            : `Cleared the current-process API key for ${getProviderDisplayName(currentProviderId)}, but failed to remove the persisted secret.`,
+        );
+      }
       if (ui) {
         renderInteractiveShell(ui, session, state);
       }
-      renderInfo(ui, `Cleared the in-memory API key for ${getProviderDisplayName(currentProviderId)}.`);
+      renderInfo(
+        ui,
+        clearedPersistedSecret
+          ? `Cleared the stored API key for ${getProviderDisplayName(currentProviderId)}.`
+          : `Cleared the current-process API key for ${getProviderDisplayName(currentProviderId)}.`,
+      );
       return true;
     }
 
     if (providerSubcommand === "model") {
-      if (!providerValue) {
-        renderError(ui, 'Usage: /provider model <name>');
-        return true;
-      }
+      await handleProviderModelShortcut(session, state, ui, providerValue);
+      return true;
+    }
 
+    if (providerSubcommand === "context") {
       const currentProviderId = state.settings.providerSettings.activeProvider;
-      state.settings = await saveProviderModel(currentProviderId, providerValue);
+      try {
+        if (ui && !providerValue) {
+          const provider = getActiveProviderConfig(state);
+          const selectedContextLimit = await runProviderContextPicker(
+            provider,
+            ui,
+          );
+          renderInteractiveShell(ui, session, state);
+          if (selectedContextLimit === undefined) {
+            return true;
+          }
+
+          state.settings = await saveProviderContextLimitTokens(
+            currentProviderId,
+            selectedContextLimit,
+          );
+          renderProviderApplied(ui, getActiveProviderConfig(state));
+          return true;
+        }
+
+        if (!providerValue) {
+          renderError(ui, 'Usage: /provider context <value|auto>');
+          return true;
+        }
+
+        const parsedContextLimit = parseProviderContextLimit(providerValue);
+        state.settings = await saveProviderContextLimitTokens(
+          currentProviderId,
+          parsedContextLimit,
+        );
+        if (ui) {
+          renderInteractiveShell(ui, session, state);
+        }
+        renderProviderApplied(ui, getActiveProviderConfig(state));
+      } catch (error) {
+        renderError(ui, error instanceof Error ? error.message : "Failed to update the provider context.");
+      }
+      return true;
+    }
+
+    if (providerSubcommand === "refresh-models") {
+      const currentProviderId = state.settings.providerSettings.activeProvider;
       if (ui) {
         renderInteractiveShell(ui, session, state);
       }
-      renderProviderApplied(ui, getActiveProviderConfig(state));
+      renderProviderCatalogRefreshFeedback(
+        ui,
+        await maybeRefreshProviderCatalog(currentProviderId, state),
+      );
+      renderProviderSummary(ui, state);
       return true;
     }
 
     if (providerSubcommand === "base-url") {
       const currentProviderId = state.settings.providerSettings.activeProvider;
+      if (ui && currentProviderId === "kimi" && !providerValue) {
+        const selectedBaseURL = await runKimiBaseURLPicker(
+          state.settings.providerSettings.kimi.baseURL,
+          ui,
+        );
+        renderInteractiveShell(ui, session, state);
+        if (!selectedBaseURL) {
+          return true;
+        }
+
+        state.settings = await saveProviderBaseURL(currentProviderId, selectedBaseURL);
+        const refreshFeedback = await maybeRefreshProviderCatalog(currentProviderId, state);
+        renderInteractiveShell(ui, session, state);
+        renderProviderCatalogRefreshFeedback(ui, refreshFeedback);
+        renderProviderApplied(ui, getActiveProviderConfig(state));
+        return true;
+      }
+
       if (!providerValue) {
         renderError(
           ui,
@@ -436,9 +600,11 @@ async function handleInteractivePrompt(
       }
 
       state.settings = await saveProviderBaseURL(currentProviderId, providerValue);
+      const refreshFeedback = await maybeRefreshProviderCatalog(currentProviderId, state);
       if (ui) {
         renderInteractiveShell(ui, session, state);
       }
+      renderProviderCatalogRefreshFeedback(ui, refreshFeedback);
       renderProviderApplied(ui, getActiveProviderConfig(state));
       return true;
     }
@@ -467,10 +633,15 @@ async function handleInteractivePrompt(
     try {
       const nextProviderId = parseProviderId(providerSubcommand);
       state.settings = await saveActiveProvider(nextProviderId);
-      await maybePromptForMissingProviderApiKey(nextProviderId, state, ui);
+      await maybePickKimiBaseURL(nextProviderId, session, state, ui);
+      if (nextProviderId !== "kimi") {
+        await maybePromptForMissingProviderApiKey(nextProviderId, state, ui);
+      }
+      const refreshFeedback = await maybeRefreshProviderCatalog(nextProviderId, state);
       if (ui) {
         renderInteractiveShell(ui, session, state);
       }
+      renderProviderCatalogRefreshFeedback(ui, refreshFeedback);
       renderProviderApplied(ui, getActiveProviderConfig(state));
     } catch (error) {
       renderError(
@@ -643,6 +814,7 @@ async function handleInteractivePrompt(
             history: session.history,
             events: state.sessionEvents,
             maxHistoryTurns: session.maxHistoryTurns,
+            contextBudget: session.contextBudget,
           });
           state.sessionStore = result.store;
           state.currentSessionId = result.session.id;
@@ -750,6 +922,7 @@ async function handleInteractivePrompt(
       history: session.history,
       events: state.sessionEvents,
       maxHistoryTurns: session.maxHistoryTurns,
+      contextBudget: session.contextBudget,
     });
     state.sessionStore = result.store;
     state.currentSessionId = result.session.id;
@@ -902,7 +1075,7 @@ async function handleInteractivePrompt(
 
   let reply = "";
   try {
-    reply = await runAgentTurn(session, prompt, {
+    const result = await runAgentTurn(session, prompt, {
       providerConfig: getActiveProviderConfig(state),
       toolContext: createToolExecutionContext(session, state, ui, turnEvents),
       onChunk: (chunk) => {
@@ -914,6 +1087,13 @@ async function handleInteractivePrompt(
         process.stdout.write(chunk);
       },
     });
+    reply = result.reply;
+    if (result.trimmedTurns > 0) {
+      renderWarning(
+        ui,
+        `Context budget trimmed ${result.trimmedTurns} older turn${result.trimmedTurns === 1 ? "" : "s"} before this request.`,
+      );
+    }
   } catch (error) {
     const message = formatAgentTurnFailureMessage(error);
     if (ui) {
@@ -1086,6 +1266,7 @@ function resetCurrentSession(
 ): void {
   session.systemPrompt = systemPrompt;
   session.history = [];
+  session.contextBudget = createEmptyContextBudgetSnapshot();
 }
 
 function getTTYPromptLabel(
@@ -1108,16 +1289,25 @@ function getPendingSystemPromptDraft(
 function buildInteractiveShellFrame(
   session: AgentSession,
   state: InteractiveState,
-): Array<Omit<RendererLine, "id">> {
+): {
+  title: string;
+  workspaceLines: Array<Omit<RendererLine, "id">>;
+  statusLines: Array<Omit<RendererLine, "id">>;
+  footerLines: Array<Omit<RendererLine, "id">>;
+  contextMeter: RendererContextMeter | null;
+} {
   const stats = getAgentSessionStats(session);
   const provider = getActiveProviderConfig(state);
+  const effectiveContextLimitTokens =
+    provider.contextLimitTokens ??
+    provider.modelContextTokens ??
+    stats.effectiveContextLimitTokens;
   const sessionLabel = state.currentSessionId
     ? formatSessionLabel(state.currentSessionTitle, state.currentSessionId)
     : state.sessionStore.sessions.length === 0
       ? "unsaved"
       : "not loaded";
-  const lines: Array<Omit<RendererLine, "id">> = [
-    { kind: "section", text: "SuperRun" },
+  const workspaceLines: Array<Omit<RendererLine, "id">> = [
     {
       kind: "info",
       text: `${provider.label}  ${provider.model}  ${process.cwd()}`,
@@ -1130,33 +1320,45 @@ function buildInteractiveShellFrame(
       kind: "info",
       text: `provider ${formatProviderStatus(provider)}  mode ${session.mode}  approvals ${state.commandApprovalMode}`,
     },
+  ];
+  const statusLines: Array<Omit<RendererLine, "id">> = [
     {
       kind: "info",
-      text: `history ${stats.historyTurnCount}/${stats.maxHistoryTurns}  saved ${state.sessionStore.sessions.length}  duration ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s`,
+      text: `context ${formatContextUsage(stats.currentContextTokens, effectiveContextLimitTokens)}  saved ${state.sessionStore.sessions.length}  duration ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s`,
+    },
+    {
+      kind: "info",
+      text: `catalog ${describeProviderCatalogStatus(provider, state.providerCatalog)}  source ${stats.contextUsageSource ?? "unknown"}`,
     },
   ];
 
   const deleteAreaBanner = getDeleteAreaBannerText(state.deleteAreaStatus);
   if (deleteAreaBanner) {
-    lines.push({
+    statusLines.push({
       kind: "warning",
       text: deleteAreaBanner,
     });
   }
 
   if (state.sessionStore.sessions.length === 0) {
-    lines.push({
+    statusLines.push({
       kind: "info",
       text: "No saved sessions yet.",
     });
   }
 
-  lines.push({
-    kind: "body",
-    text: "commands /help /provider /sessions /new [title] /mode /approvals /duration /system /clear /exit",
-  });
-
-  return lines;
+  return {
+    title: "SuperRun",
+    workspaceLines,
+    statusLines,
+    footerLines: [
+      {
+        kind: "body",
+        text: "commands /help /provider /model /sessions /new [title] /mode /approvals /duration /system /clear /exit",
+      },
+    ],
+    contextMeter: buildContextMeter(stats, effectiveContextLimitTokens),
+  };
 }
 
 function buildDeleteAreaBannerLines(
@@ -1220,7 +1422,7 @@ function renderSessionPromptHint(
   );
   renderInfo(
     ui,
-    `History: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+    `Context: ${formatContextUsage(stats.currentContextTokens, stats.effectiveContextLimitTokens)} used, source ${stats.contextUsageSource ?? "unknown"}.`,
   );
   renderInfo(ui, 'Use "/approvals" to review file-edit and command approval behavior.');
   renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
@@ -1260,6 +1462,11 @@ async function handleTrashCommand(
   ui: InteractiveRenderer | null,
 ): Promise<void> {
   const argument = parseCommandArgument(prompt, "/trash");
+  if (ui && !argument) {
+    await runTrashBrowser(session, state, ui);
+    return;
+  }
+
   const [subcommand = "list", ...restParts] = argument.split(/\s+/).filter(Boolean);
   const value = restParts.join(" ").trim();
 
@@ -1324,6 +1531,103 @@ async function handleTrashCommand(
   renderError(ui, `Unknown /trash command: ${subcommand}. Use /trash help.`);
 }
 
+async function runTrashBrowser(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): Promise<void> {
+  while (true) {
+    const trash = await listWorkspaceTrashEntries();
+    const selectedAction = await ui.selectOption({
+      title: "Delete Area",
+      subtitle:
+        `${trash.status.fileCount} file${trash.status.fileCount === 1 ? "" : "s"} | ${formatDeleteAreaKilobytes(trash.status.totalBytes)} KB`,
+      helpText: "Up/Down move  Enter select  Esc cancel",
+      options: buildTrashActionChoices(trash.status.fileCount).map((choice) => ({
+        value: choice.value,
+        label: choice.name,
+        description: choice.description,
+        tone: choice.tone,
+      })),
+    });
+    renderInteractiveShell(ui, session, state);
+
+    if (selectedAction === null) {
+      return;
+    }
+
+    if (selectedAction === "view") {
+      await ui.viewText({
+        title: "Delete Area",
+        subtitle:
+          `${trash.status.fileCount} file${trash.status.fileCount === 1 ? "" : "s"} | ${formatDeleteAreaKilobytes(trash.status.totalBytes)} KB`,
+        helpText: "Up/Down scroll  PgUp/PgDn page  q close  Esc close",
+        emptyMessage: "Delete area is empty.",
+        lines: buildTrashViewerLines(trash),
+      });
+      renderInteractiveShell(ui, session, state);
+      continue;
+    }
+
+    if (selectedAction === "empty") {
+      const confirmed = await runTrashEmptyConfirmationPicker(
+        trash.status.fileCount,
+        ui,
+      );
+      renderInteractiveShell(ui, session, state);
+      if (!confirmed) {
+        continue;
+      }
+
+      try {
+        const result = await emptyWorkspaceTrash();
+        await refreshDeleteAreaBanner(session, state, ui);
+        renderInfo(ui, `Emptied delete area: ${result.purgedCount} file${result.purgedCount === 1 ? "" : "s"} permanently removed.`);
+      } catch (error) {
+        renderError(ui, error instanceof Error ? error.message : "Failed to empty the delete area.");
+      }
+      return;
+    }
+
+    if (selectedAction !== "restore" && selectedAction !== "purge") {
+      renderError(ui, `Unknown delete-area action: ${selectedAction}`);
+      return;
+    }
+
+    const selectedEntryId = await runTrashEntryPicker(
+      trash.entries,
+      selectedAction,
+      ui,
+    );
+    renderInteractiveShell(ui, session, state);
+    if (!selectedEntryId) {
+      continue;
+    }
+
+    try {
+      if (selectedAction === "restore") {
+        const result = await restoreWorkspaceFileFromTrash(selectedEntryId);
+        await refreshDeleteAreaBanner(session, state, ui);
+        renderInfo(ui, `Restored deleted file: ${result.entry.originalPath} -> ${result.restoredPath}`);
+      } else {
+        const result = await purgeWorkspaceFileFromTrash(selectedEntryId);
+        await refreshDeleteAreaBanner(session, state, ui);
+        renderInfo(ui, `Purged deleted file: ${result.entry.originalPath} [${result.entry.id}]`);
+      }
+    } catch (error) {
+      renderError(
+        ui,
+        error instanceof Error
+          ? error.message
+          : selectedAction === "restore"
+            ? "Failed to restore deleted file."
+            : "Failed to purge deleted file.",
+      );
+    }
+    return;
+  }
+}
+
 function renderTrashHelp(ui: InteractiveRenderer | null): void {
   if (ui) {
     ui.renderSectionTitle("Delete Area");
@@ -1331,10 +1635,60 @@ function renderTrashHelp(ui: InteractiveRenderer | null): void {
     console.log("Delete Area");
   }
 
+  renderInfo(ui, "/trash");
   renderInfo(ui, "/trash list");
   renderInfo(ui, "/trash restore <id>");
   renderInfo(ui, "/trash purge <id>");
   renderInfo(ui, "/trash empty YES");
+}
+
+async function runTrashEntryPicker(
+  entries: Awaited<ReturnType<typeof listWorkspaceTrashEntries>>["entries"],
+  action: Exclude<TrashActionValue, "view" | "empty">,
+  ui: InteractiveRenderer,
+): Promise<string | null> {
+  return ui.selectOption({
+    title: action === "restore" ? "Restore Deleted File" : "Delete Permanently",
+    subtitle:
+      action === "restore"
+        ? "Choose one deleted file to restore into the workspace."
+        : "Choose one deleted file to remove permanently from the delete area.",
+    helpText: "Up/Down move  Enter select  Esc back",
+    options: buildTrashEntryChoices(entries, action).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.tone,
+    })),
+  });
+}
+
+async function runTrashEmptyConfirmationPicker(
+  fileCount: number,
+  ui: InteractiveRenderer,
+): Promise<boolean> {
+  const selectedValue = await ui.selectOption({
+    title: "Empty Delete Area",
+    subtitle:
+      `Permanently remove ${fileCount} file${fileCount === 1 ? "" : "s"} from the delete area.`,
+    helpText: "Up/Down move  Enter confirm  Esc cancel",
+    options: [
+      {
+        value: "confirm",
+        label: "Empty delete area",
+        description: "Delete every file in the delete area permanently.",
+        tone: "danger",
+      },
+      {
+        value: null,
+        label: "Keep deleted files",
+        description: "Return to the delete area without removing anything.",
+        tone: "default",
+      },
+    ],
+  });
+
+  return selectedValue === "confirm";
 }
 
 function renderTrashList(
@@ -1365,18 +1719,56 @@ function renderTrashList(
   }
 }
 
+function buildTrashViewerLines(
+  trash: Awaited<ReturnType<typeof listWorkspaceTrashEntries>>,
+): RendererViewerLine[] {
+  const lines: RendererViewerLine[] = [
+    {
+      text:
+        `Delete area: ${trash.status.fileCount} file${trash.status.fileCount === 1 ? "" : "s"}, about ${formatDeleteAreaKilobytes(trash.status.totalBytes)} KB.`,
+      tone: "info",
+    },
+  ];
+
+  if (trash.entries.length === 0) {
+    return lines;
+  }
+
+  lines.push({ text: "" });
+
+  for (const [index, entry] of trash.entries.entries()) {
+    lines.push({
+      text: `${index + 1}. ${entry.originalPath}`,
+      tone: "default",
+    });
+    lines.push({
+      text: `${entry.id}  ${formatDeleteAreaKilobytes(entry.sizeBytes)} KB  ${formatTimestamp(entry.deletedAt)}`,
+      tone: "info",
+      indent: 3,
+      format: "plain",
+    });
+  }
+
+  return lines;
+}
+
 function renderSettingsSummary(
   ui: InteractiveRenderer | null,
   session: AgentSession,
   settings: SuperRunSettings,
-  state: Pick<InteractiveState, "minCommandPanelDurationMs" | "providerApiKeyOverrides">,
+  state: Pick<
+    InteractiveState,
+    "minCommandPanelDurationMs" | "providerApiKeyOverrides" | "providerApiKeySources" | "providerCatalog"
+  >,
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
-  const provider = resolveProviderRuntimeConfig(
-    settings.providerSettings,
-    state.providerApiKeyOverrides,
-  );
+  const provider = getActiveProviderConfig({
+    settings,
+    providerApiKeyOverrides: state.providerApiKeyOverrides,
+    providerApiKeySources: state.providerApiKeySources,
+    providerCatalog: state.providerCatalog,
+  });
 
   if (ui) {
     ui.renderSectionTitle("System Prompt");
@@ -1389,17 +1781,21 @@ function renderSettingsSummary(
   renderInfo(ui, `Tool mode: ${getAgentModeSummary(session.mode)}.`);
   renderInfo(
     ui,
-    `History policy: keep the most recent ${stats.maxHistoryTurns} turns.`,
+    `Context policy: ${formatContextUsage(stats.currentContextTokens, stats.effectiveContextLimitTokens)} used, source ${stats.contextUsageSource ?? "unknown"}.`,
   );
   renderInfo(
     ui,
-    `Current history: ${stats.historyTurnCount} turns, ${stats.historyMessageCount} messages, ${stats.historyCharCount} chars.`,
+    `Current transcript: ${stats.historyTurnCount} turns, ${stats.historyMessageCount} messages, ${stats.historyCharCount} chars.`,
   );
   renderInfo(
     ui,
     `Provider: ${provider.label}  model ${provider.model}  timeout ${provider.timeoutMs}ms  key ${formatProviderApiKeyStatus(provider)}.`,
   );
   renderInfo(ui, `Provider base URL: ${provider.baseURL}`);
+  renderInfo(
+    ui,
+    `Provider context: configured ${formatTokenCount(provider.contextLimitTokens)}  model ${formatTokenCount(provider.modelContextTokens)}  effective ${formatTokenCount(stats.effectiveContextLimitTokens)}.`,
+  );
   renderInfo(
     ui,
     `Minimum command panel duration: ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s.`,
@@ -1415,9 +1811,16 @@ function renderSettingsSummary(
 
 function renderProviderSummary(
   ui: InteractiveRenderer | null,
-  state: Pick<InteractiveState, "settings" | "providerApiKeyOverrides">,
+  state: Pick<
+    InteractiveState,
+    "settings" | "providerApiKeyOverrides" | "providerApiKeySources" | "providerCatalog"
+  >,
 ): void {
   const provider = getActiveProviderConfig(state);
+  const selectedCatalogModel =
+    provider.id === "kimi"
+      ? state.providerCatalog.kimi.models.find((model) => model.id === provider.model)
+      : null;
   renderInfo(
     ui,
     `Provider: ${provider.label}  model ${provider.model}  timeout ${provider.timeoutMs}ms  key ${formatProviderApiKeyStatus(provider)}.`,
@@ -1425,7 +1828,25 @@ function renderProviderSummary(
   renderInfo(ui, `Base URL: ${provider.baseURL}`);
   renderInfo(
     ui,
-    'Use "/provider key" to set a hidden in-memory API key, "/provider clear-key" to remove it, and "/provider model <name>" to change the default model.',
+    `Catalog: ${describeProviderCatalogStatus(provider, state.providerCatalog)}.`,
+  );
+  renderInfo(
+    ui,
+    `Context: configured ${formatTokenCount(provider.contextLimitTokens)}  model ${formatTokenCount(provider.modelContextTokens)}  source ${provider.modelContextSource}.`,
+  );
+  if (provider.id === "kimi") {
+    renderInfo(
+      ui,
+      selectedCatalogModel
+        ? `Current model access: listed in the loaded catalog with ${formatTokenCount(selectedCatalogModel.contextTokens)} context.`
+        : state.providerCatalog.kimi.status === "ready"
+          ? 'Current model access: not present in the loaded Kimi catalog. Use "/model" to switch.'
+          : "Current model access: unknown until the Kimi catalog loads successfully.",
+    );
+  }
+  renderInfo(
+    ui,
+    'Use "/provider key" to set a locally stored API key, "/provider clear-key" to remove it, "/model" or "/provider model" to choose a Kimi model, and "/provider context" to adjust the provider token budget.',
   );
   if (provider.id === "openai_compatible") {
     renderInfo(
@@ -1437,7 +1858,7 @@ function renderProviderSummary(
 
   renderInfo(
     ui,
-    `Use "/provider base-url moonshot-cn" or "/provider base-url moonshot-ai" to switch Kimi between ${DEFAULT_KIMI_BASE_URL} and ${ALTERNATE_KIMI_BASE_URL}.`,
+    `Use "/provider base-url" to pick a Kimi endpoint, "/provider refresh-models" to reload the Kimi catalog, or pass moonshot-cn / moonshot-ai directly to switch between ${DEFAULT_KIMI_BASE_URL} and ${ALTERNATE_KIMI_BASE_URL}.`,
   );
 }
 
@@ -1447,7 +1868,7 @@ function renderProviderApplied(
 ): void {
   renderInfo(
     ui,
-    `Active provider: ${provider.label}  model ${provider.model}  key ${formatProviderApiKeyStatus(provider)}.`,
+    `Active provider: ${provider.label}  model ${provider.model}  key ${formatProviderApiKeyStatus(provider)}  context ${formatTokenCount(provider.contextLimitTokens)} / ${formatTokenCount(provider.modelContextTokens)}.`,
   );
 }
 
@@ -1687,6 +2108,11 @@ function renderCurrentSessionSummary(
   state: InteractiveState,
 ): void {
   const currentStats = getAgentSessionStats(session);
+  const provider = getActiveProviderConfig(state);
+  const effectiveContextLimitTokens =
+    provider.contextLimitTokens ??
+    provider.modelContextTokens ??
+    currentStats.effectiveContextLimitTokens;
 
   if (ui) {
     ui.renderSectionTitle("Session");
@@ -1709,7 +2135,11 @@ function renderCurrentSessionSummary(
   );
   renderInfo(
     ui,
-    `Current session: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
+    `Current transcript: ${currentStats.historyTurnCount} turns, ${currentStats.historyMessageCount} messages, ${currentStats.historyCharCount} chars.`,
+  );
+  renderInfo(
+    ui,
+    `Context budget: ${formatContextUsage(currentStats.currentContextTokens, effectiveContextLimitTokens)}  source ${currentStats.contextUsageSource ?? "unknown"}.`,
   );
   renderInfo(ui, `Recorded events: ${state.sessionEvents.length}.`);
   renderInfo(ui, `Current behavior: ${summarizePrompt(session.systemPrompt)}`);
@@ -1896,7 +2326,7 @@ function buildHistoryMessageContentLines(
       const tableMatch = parseMarkdownTable(contentLines, index);
       if (tableMatch) {
         lines.push(
-          ...renderMarkdownTableLines(tableMatch.table).map((tableLine) => ({
+          ...renderMarkdownTableLines(tableMatch.table, process.stdout.columns || undefined).map((tableLine) => ({
             text: tableLine,
             tone,
             format: "plain" as const,
@@ -1992,7 +2422,7 @@ function renderSystemPromptApplied(
   }
   renderInfo(
     ui,
-    `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+    `Context: ${formatContextUsage(stats.currentContextTokens, stats.effectiveContextLimitTokens)} used, source ${stats.contextUsageSource ?? "unknown"}.`,
   );
   renderInfo(ui, `This agent will now behave as: ${summarizePrompt(settings.systemPrompt)}`);
 }
@@ -2019,6 +2449,7 @@ function renderSessionSwitched(
       systemPrompt: storedSession.systemPrompt,
       history: storedSession.history,
       maxHistoryTurns: storedSession.maxHistoryTurns,
+      contextBudget: storedSession.contextBudget,
     }),
   );
 
@@ -2028,7 +2459,7 @@ function renderSessionSwitched(
   );
   renderInfo(
     ui,
-    `Current history: ${stats.historyTurnCount}/${stats.maxHistoryTurns} turns, ${stats.historyCharCount} chars.`,
+    `Context: ${formatContextUsage(stats.currentContextTokens, stats.effectiveContextLimitTokens)} used, source ${stats.contextUsageSource ?? "unknown"}.`,
   );
   renderInfo(ui, `Mode: ${getAgentModeSummary(mode)}.`);
   renderInfo(ui, storedSession.preview);
@@ -2264,6 +2695,7 @@ function restoreStoredSession(
   session.systemPrompt = storedSession.systemPrompt;
   session.history = [...storedSession.history];
   session.maxHistoryTurns = storedSession.maxHistoryTurns;
+  session.contextBudget = { ...storedSession.contextBudget };
 }
 
 async function persistCurrentSession(
@@ -2284,6 +2716,7 @@ async function persistCurrentSession(
       history: session.history,
       events: state.sessionEvents,
       maxHistoryTurns: session.maxHistoryTurns,
+      contextBudget: session.contextBudget,
     });
     state.sessionStore = result.store;
     state.currentSessionId = result.session.id;
@@ -2298,6 +2731,7 @@ async function persistCurrentSession(
     history: session.history,
     events: state.sessionEvents,
     maxHistoryTurns: session.maxHistoryTurns,
+    contextBudget: session.contextBudget,
   });
   state.sessionStore = result.store;
   state.currentSessionId = result.session.id;
@@ -2381,6 +2815,127 @@ async function runProviderPicker(
   return selectedProvider ? parseProviderId(selectedProvider) : null;
 }
 
+async function runKimiBaseURLPicker(
+  currentBaseURL: string,
+  ui: InteractiveRenderer,
+): Promise<string | null> {
+  return ui.selectOption({
+    title: "Kimi Endpoint",
+    subtitle: "Choose which Moonshot API host this Kimi profile should use.",
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildKimiBaseURLPickerChoices(currentBaseURL).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.value === currentBaseURL ? "accent" : "default",
+    })),
+  });
+}
+
+async function runProviderModelPicker(
+  currentModel: string,
+  models: ProviderCatalogState["kimi"]["models"],
+  ui: InteractiveRenderer,
+): Promise<string | null> {
+  if (models.length === 0) {
+    return null;
+  }
+
+  return ui.selectOption({
+    title: "Kimi Model",
+    subtitle: "Choose which Kimi model to use for future requests.",
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildProviderModelPickerChoices(currentModel, models).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.value === currentModel ? "accent" : "default",
+    })),
+  });
+}
+
+async function handleProviderModelShortcut(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+  modelValue: string,
+): Promise<void> {
+  const currentProviderId = state.settings.providerSettings.activeProvider;
+
+  if (!modelValue && ui && currentProviderId === "kimi") {
+    const selectedModel = await runProviderModelPicker(
+      state.settings.providerSettings.kimi.model,
+      state.providerCatalog.kimi.models,
+      ui,
+    );
+    renderInteractiveShell(ui, session, state);
+    if (!selectedModel) {
+      if (state.providerCatalog.kimi.status !== "ready") {
+        renderWarning(
+          ui,
+          "Kimi model catalog is not loaded yet. Use /provider refresh-models or /model <name>.",
+        );
+      }
+      return;
+    }
+
+    state.settings = await saveProviderModel(currentProviderId, selectedModel);
+    renderProviderApplied(ui, getActiveProviderConfig(state));
+    return;
+  }
+
+  if (!modelValue) {
+    renderError(ui, 'Usage: /model <name> or /provider model <name>');
+    return;
+  }
+
+  state.settings = await saveProviderModel(currentProviderId, modelValue);
+  if (ui) {
+    renderInteractiveShell(ui, session, state);
+  }
+  renderProviderApplied(ui, getActiveProviderConfig(state));
+}
+
+async function runProviderContextPicker(
+  provider: ProviderRuntimeConfig,
+  ui: InteractiveRenderer,
+): Promise<number | null | undefined> {
+  const selectedValue = await ui.selectOption({
+    title: "Context Budget",
+    subtitle: `Choose the default token budget for ${provider.label}.`,
+    helpText: "Up/Down move  Enter apply  Esc cancel",
+    options: buildProviderContextPickerChoices({
+      ...(provider.contextLimitTokens !== undefined
+        ? { configuredContextLimitTokens: provider.contextLimitTokens }
+        : {}),
+      modelContextTokens: provider.modelContextTokens,
+    }).map((choice) => ({
+      value: choice.value,
+      label: choice.name,
+      description: choice.description,
+      tone: choice.tone,
+    })),
+  });
+
+  if (selectedValue === null) {
+    return undefined;
+  }
+
+  if (selectedValue === "auto") {
+    return null;
+  }
+
+  if (selectedValue === "custom") {
+    const enteredValue = await ui.readPrompt({
+      promptLabel: "context > ",
+      workspaceFiles: [],
+    });
+    return parseProviderContextLimit(enteredValue);
+  }
+
+  return Number.parseInt(selectedValue, 10);
+}
+
 async function runModePicker(
   currentMode: AgentMode,
   ui: InteractiveRenderer,
@@ -2412,6 +2967,77 @@ async function runApprovalPicker(
   });
 
   return selectedMode ? parseCommandApprovalMode(selectedMode) : null;
+}
+
+async function maybePickKimiBaseURL(
+  providerId: ProviderId,
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<void> {
+  if (!ui || providerId !== "kimi") {
+    return;
+  }
+
+  // When the user switches to Kimi from the provider picker, offer the endpoint
+  // choice immediately so they do not need to remember a follow-up slash command.
+  const selectedBaseURL = await runKimiBaseURLPicker(
+    state.settings.providerSettings.kimi.baseURL,
+    ui,
+  );
+  renderInteractiveShell(ui, session, state);
+  if (!selectedBaseURL) {
+    return;
+  }
+
+  state.settings = await saveProviderBaseURL(providerId, selectedBaseURL);
+  await promptForProviderApiKeyInline(providerId, state, ui);
+}
+
+async function maybeRefreshProviderCatalog(
+  providerId: ProviderId,
+  state: InteractiveState,
+): Promise<ProviderCatalogRefreshFeedback | null> {
+  if (providerId !== "kimi") {
+    state.providerCatalog[providerId] = {
+      status: "idle",
+      models: [],
+      errorMessage: null,
+      fetchedAt: null,
+    };
+    return null;
+  }
+
+  const provider = getActiveProviderConfig(state);
+  if (provider.apiKeySource === "missing") {
+    state.providerCatalog.kimi = {
+      status: "error",
+      models: [],
+      errorMessage: `No API key is configured for ${provider.label}.`,
+      fetchedAt: new Date().toISOString(),
+    };
+    return summarizeProviderCatalogRefresh(provider, state.providerCatalog.kimi);
+  }
+
+  const catalog = await refreshProviderCatalog(provider);
+  state.providerCatalog.kimi = catalog;
+  return summarizeProviderCatalogRefresh(provider, catalog);
+}
+
+function renderProviderCatalogRefreshFeedback(
+  ui: InteractiveRenderer | null,
+  feedback: ProviderCatalogRefreshFeedback | null,
+): void {
+  if (!feedback) {
+    return;
+  }
+
+  if (feedback.level === "warning") {
+    renderWarning(ui, feedback.message);
+    return;
+  }
+
+  renderInfo(ui, feedback.message);
 }
 
 function createToolExecutionContext(
@@ -2625,12 +3251,27 @@ function buildApprovalPickerOptions(
 }
 
 function getActiveProviderConfig(
-  state: Pick<InteractiveState, "settings" | "providerApiKeyOverrides">,
+  state: Pick<
+    InteractiveState,
+    "settings" | "providerApiKeyOverrides" | "providerApiKeySources" | "providerCatalog"
+  >,
 ): ProviderRuntimeConfig {
-  return resolveProviderRuntimeConfig(
-    state.settings.providerSettings,
-    state.providerApiKeyOverrides,
+  const provider = attachProviderCatalogMetadata(
+    resolveProviderRuntimeConfig(
+      state.settings.providerSettings,
+      state.providerApiKeyOverrides,
+    ),
+    state.providerCatalog,
   );
+  const apiKeySourceOverride = state.providerApiKeySources[provider.id];
+  if (apiKeySourceOverride && provider.apiKeySource === "runtime") {
+    return {
+      ...provider,
+      apiKeySource: apiKeySourceOverride,
+    };
+  }
+
+  return provider;
 }
 
 function formatProviderApiKeyStatus(
@@ -2647,6 +3288,70 @@ function formatProviderStatus(
   provider: ProviderRuntimeConfig,
 ): string {
   return `${provider.id} ${formatProviderApiKeyStatus(provider)}`;
+}
+
+function parseProviderContextLimit(value: string): number | null {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    throw new Error("Provider context limit must not be empty.");
+  }
+
+  if (normalized === "auto") {
+    return null;
+  }
+
+  const kiloMatch = normalized.match(/^(\d+(?:\.\d+)?)k$/);
+  if (kiloMatch) {
+    const amount = Number(kiloMatch[1]);
+    if (Number.isFinite(amount) && amount > 0) {
+      return Math.round(amount * 1_000);
+    }
+  }
+
+  const parsed = Number.parseInt(normalized, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('Invalid context limit. Use a positive integer or a value like "128k".');
+  }
+
+  return parsed;
+}
+
+function formatContextUsage(
+  usedTokens: number | null,
+  limitTokens: number | null,
+): string {
+  return `${formatTokenCount(usedTokens)}/${formatTokenCount(limitTokens)}`;
+}
+
+function buildContextMeter(
+  stats: ReturnType<typeof getAgentSessionStats>,
+  effectiveContextLimitTokens = stats.effectiveContextLimitTokens,
+): RendererContextMeter | null {
+  if (stats.currentContextTokens === null && effectiveContextLimitTokens === null) {
+    return null;
+  }
+
+  return {
+    usedTokens: stats.currentContextTokens,
+    limitTokens: effectiveContextLimitTokens,
+    source: stats.contextUsageSource,
+  };
+}
+
+function formatTokenCount(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}m`;
+  }
+
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1)}k`;
+  }
+
+  return value.toString();
 }
 
 async function maybePromptForMissingProviderApiKey(
@@ -2693,10 +3398,72 @@ async function promptForProviderApiKey(
   }
 
   state.providerApiKeyOverrides[providerId] = secretValue;
-  renderInfo(
-    ui,
-    `Stored an in-memory API key for ${providerLabel} as ${getProviderApiKeyPlaceholder(providerId)}.`,
-  );
+  try {
+    await savePersistedProviderApiKey(providerId, secretValue);
+    state.providerApiKeySources[providerId] = "stored";
+    renderInfo(
+      ui,
+      `Stored a locally persisted API key for ${providerLabel} as ${getProviderApiKeyPlaceholder(providerId)}.`,
+    );
+  } catch (error) {
+    state.providerApiKeySources[providerId] = "runtime";
+    renderWarning(
+      ui,
+      error instanceof Error
+        ? `Stored the API key for ${providerLabel} only for this process because local key storage failed: ${error.message}`
+        : `Stored the API key for ${providerLabel} only for this process because local key storage failed.`,
+    );
+  }
+}
+
+async function loadPersistedProviderApiKeysSafely(): Promise<ProviderRuntimeSecretOverrides> {
+  try {
+    return await loadPersistedProviderApiKeys();
+  } catch (error) {
+    console.error(
+      "warning:",
+      error instanceof Error
+        ? `Failed to load locally stored provider API keys: ${error.message}`
+        : "Failed to load locally stored provider API keys.",
+    );
+    return {};
+  }
+}
+
+async function promptForProviderApiKeyInline(
+  providerId: ProviderId,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): Promise<void> {
+  const providerLabel = getProviderDisplayName(providerId);
+  const enteredValue = await ui.readPrompt({
+    promptLabel: `${providerLabel} api key (visible; empty keeps current) > `,
+    workspaceFiles: [],
+  });
+
+  const secretValue = enteredValue.trim();
+  if (!secretValue) {
+    renderInfo(ui, `Kept the current API key source for ${providerLabel}.`);
+    return;
+  }
+
+  state.providerApiKeyOverrides[providerId] = secretValue;
+  try {
+    await savePersistedProviderApiKey(providerId, secretValue);
+    state.providerApiKeySources[providerId] = "stored";
+    renderInfo(
+      ui,
+      `Stored a locally persisted API key for ${providerLabel} as ${getProviderApiKeyPlaceholder(providerId)}.`,
+    );
+  } catch (error) {
+    state.providerApiKeySources[providerId] = "runtime";
+    renderWarning(
+      ui,
+      error instanceof Error
+        ? `Stored the API key for ${providerLabel} only for this process because local key storage failed: ${error.message}`
+        : `Stored the API key for ${providerLabel} only for this process because local key storage failed.`,
+    );
+  }
 }
 
 async function runWithSuspendedRenderer<T>(
