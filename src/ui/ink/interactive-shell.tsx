@@ -460,7 +460,15 @@ function Composer(props: {
 
   const suggestionLines = renderSuggestionLines(props.prompt.state);
   const visibleSuggestions = suggestionLines.slice(0, MAX_SUGGESTION_LINES);
-  const paddingCount = Math.max(0, MAX_SUGGESTION_LINES - visibleSuggestions.length);
+  // Pad to a fixed height only while a suggestion session is active
+  // (@file or /command). This avoids blank space during normal typing
+  // while keeping height stable when suggestions change within a session.
+  const inSuggestionSession =
+    props.prompt.state.activeReference !== null ||
+    props.prompt.state.activeSlashCommand !== null;
+  const paddingCount = inSuggestionSession
+    ? Math.max(0, MAX_SUGGESTION_LINES - visibleSuggestions.length)
+    : 0;
 
   return (
     <Box flexDirection="column">
@@ -483,11 +491,9 @@ function Composer(props: {
           {fitSingleLine(line.text, availableWidth)}
         </Text>
       ))}
-      {suggestionLines.length > 0
-        ? Array.from({ length: paddingCount }, (_, index) => (
-            <Text key={`suggestion-pad-${index}`}>{" "}</Text>
-          ))
-        : null}
+      {Array.from({ length: paddingCount }, (_, index) => (
+        <Text key={`suggestion-pad-${index}`}>{" "}</Text>
+      ))}
       <Text dimColor>{props.divider}</Text>
     </Box>
   );
@@ -594,8 +600,13 @@ function OverlayViewer(props: { overlay: RendererViewerOverlay }): React.JSX.Ele
                     key={`viewer-${props.overlay.scrollOffset + index}-${line.text}`}
                     line={line}
                   />
-                ))}
-              </Box>
+                ))}                {/* Pad to viewportHeight so scrolling never changes the box height */}
+                {Array.from(
+                  { length: Math.max(0, props.overlay.viewportHeight - visibleLines.length) },
+                  (_, index) => (
+                    <Text key={`viewer-pad-${index}`}>{" "}</Text>
+                  ),
+                )}              </Box>
             </>
           )}
     </Box>

@@ -1857,9 +1857,22 @@ function buildHistoryViewerLines(options: {
         tone: message.role === "user" ? "info" : "default",
       });
 
+      // Track code-fence state so multi-line code blocks render with
+      // a visible gutter marker in the history viewer.
+      let inCodeFence = false;
       const contentLines = message.content.split(/\r?\n/);
       for (const line of contentLines) {
-        lines.push({ text: `   ${line}` });
+        const isFence = /^```/.test(line.trimStart());
+        if (isFence) {
+          inCodeFence = !inCodeFence;
+          lines.push({ text: `   ${line}` });
+          continue;
+        }
+        if (inCodeFence) {
+          lines.push({ text: `   │ ${line}` });
+        } else {
+          lines.push({ text: `   ${line}` });
+        }
       }
 
       if (index < options.history.length - 1) {
