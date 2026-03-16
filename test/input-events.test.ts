@@ -107,4 +107,8 @@ test("normalizeInkInput maps navigation and submit keys to semantic events", () 
     normalizeInkInput("", createKey({ tab: true })),
     { type: "apply_suggestion" },
   );
+  assert.deepEqual(
+    normalizeInkInput("", createKey({ tab: true, shift: true })),
+    { type: "toggle_plan_mode" },
+  );
 });

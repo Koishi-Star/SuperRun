@@ -311,6 +311,80 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
   }
 });
 
+test("runAgentTurn uses the plan-mode prompt and plan-only tools", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "request_user_input",
+          arguments: JSON.stringify({
+            title: "Rendering boundary",
+            question: "Which rendering boundary should stay fixed?",
+            options: [
+              {
+                value: "keep-renderer",
+                label: "Keep renderer boundary",
+                description: "Preserve the current offscreen renderer and screen diff path.",
+              },
+              {
+                value: "refactor-shell",
+                label: "Refactor shell only",
+                description: "Reshape shell state but keep the diff driver intact.",
+              },
+            ],
+          }),
+        },
+      ],
+    },
+    "Plan mode can now continue with the clarified constraint.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({
+      mode: "plan",
+      systemPrompt: "Test system prompt",
+    });
+    const reply = await runAgentTurn(session, "Design the plan mode.", {
+      toolContext: {
+        userInput: {
+          requestUserInput: async () => ({
+            kind: "option",
+            value: "keep-renderer",
+            label: "Keep renderer boundary",
+            answer: "Keep renderer boundary",
+          }),
+        },
+      },
+    });
+
+    assert.equal(reply.reply, "Plan mode can now continue with the clarified constraint.");
+    assert.match(String(server.requests[0]?.messages[0]?.content ?? ""), /currently in plan mode/i);
+    assert.deepEqual(
+      server.requests[0]?.tools?.map((tool) => tool.function?.name),
+      ["list_files", "read_file", "request_user_input"],
+    );
+    const toolMessage = server.requests[1]?.messages[3];
+    assert.equal(toolMessage?.role, "tool");
+    assert.match(String(toolMessage?.content ?? ""), /"kind":"option"/);
+    assert.match(String(toolMessage?.content ?? ""), /"value":"keep-renderer"/);
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
 test("runAgentTurn preserves provider reasoning_content across tool calls", async () => {
   const server = await startMockOpenAIServer([
     {
@@ -401,7 +475,10 @@ test("runAgentTurn resolves a run_command tool call in default mode", async () =
     const reply = await runAgentTurn(session, "Where am I?");
 
     assert.equal(reply.reply, "The command printed the workspace path.");
-    assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "run_command");
+    assert.equal(
+      server.requests[0]?.tools?.some((tool) => tool.function?.name === "run_command"),
+      true,
+    );
 
     const toolMessage = server.requests[1]?.messages[3];
     assert.equal(toolMessage?.role, "tool");
@@ -416,6 +493,183 @@ test("runAgentTurn resolves a run_command tool call in default mode", async () =
     restoreEnv(previousEnv);
     await server.close();
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn enforces outline-before-article for fetch_webpage", async () => {
+  const pageHits = { count: 0 };
+  const pageServer = createServer((req, res) => {
+    if (req.url !== "/page") {
+      res.writeHead(404).end();
+      return;
+    }
+
+    pageHits.count += 1;
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html>
+      <html>
+        <head>
+          <title>Policy Test</title>
+          <meta name="description" content="Outline first." />
+        </head>
+        <body>
+          <main>
+            <h1>Overview</h1>
+            <p>Detailed article body.</p>
+          </main>
+        </body>
+      </html>`);
+  });
+
+  pageServer.listen(0, "127.0.0.1");
+  await once(pageServer, "listening");
+  const pageAddress = pageServer.address() as AddressInfo;
+  const pageUrl = `http://${pageAddress.address}:${pageAddress.port}/page`;
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "fetch_webpage",
+          arguments: JSON.stringify({
+            url: pageUrl,
+            mode: "article",
+          }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_2",
+          name: "fetch_webpage",
+          arguments: JSON.stringify({
+            url: pageUrl,
+            mode: "article",
+          }),
+        },
+      ],
+    },
+    "Finished staged web retrieval.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const reply = await runAgentTurn(session, "Read the page.");
+
+    assert.equal(reply.reply, "Finished staged web retrieval.");
+    assert.equal(pageHits.count, 2);
+    assert.equal(server.requests.length, 3);
+
+    const firstToolContent = findLastToolMessageContent(server.requests[1]?.messages);
+    assert.match(firstToolContent, /"mode":"outline"/);
+    assert.match(firstToolContent, /"requestedMode":"article"/);
+    assert.match(firstToolContent, /"policyApplied":"outline_before_article"/);
+    assert.match(
+      String(server.requests[1]?.messages.at(-1)?.content ?? ""),
+      /outline-before-article retrieval/,
+    );
+
+    const secondToolContent = findLastToolMessageContent(server.requests[2]?.messages);
+    assert.match(secondToolContent, /"mode":"article"/);
+    assert.doesNotMatch(secondToolContent, /"policyApplied":"outline_before_article"/);
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+    pageServer.close();
+    await once(pageServer, "close");
+  }
+});
+
+test("runAgentTurn reuses cached fetch_webpage results across turns in the same session", async () => {
+  const pageHits = { count: 0 };
+  const pageServer = createServer((req, res) => {
+    if (req.url !== "/page") {
+      res.writeHead(404).end();
+      return;
+    }
+
+    pageHits.count += 1;
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html>
+      <html>
+        <head><title>Cache Test</title></head>
+        <body><main><h1>Cached Outline</h1></main></body>
+      </html>`);
+  });
+
+  pageServer.listen(0, "127.0.0.1");
+  await once(pageServer, "listening");
+  const pageAddress = pageServer.address() as AddressInfo;
+  const pageUrl = `http://${pageAddress.address}:${pageAddress.port}/page`;
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "fetch_webpage",
+          arguments: JSON.stringify({
+            url: pageUrl,
+            mode: "outline",
+          }),
+        },
+      ],
+    },
+    "First web answer.",
+    {
+      toolCalls: [
+        {
+          id: "call_2",
+          name: "fetch_webpage",
+          arguments: JSON.stringify({
+            url: pageUrl,
+            mode: "outline",
+          }),
+        },
+      ],
+    },
+    "Second web answer.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const firstReply = await runAgentTurn(session, "Read the page once.");
+    const secondReply = await runAgentTurn(session, "Read the same page again.");
+
+    assert.equal(firstReply.reply, "First web answer.");
+    assert.equal(secondReply.reply, "Second web answer.");
+    assert.equal(pageHits.count, 1);
+
+    const cachedToolContent = findLastToolMessageContent(server.requests[3]?.messages);
+    assert.match(cachedToolContent, /"mode":"outline"/);
+    assert.match(cachedToolContent, /"cacheHit":true/);
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+    pageServer.close();
+    await once(pageServer, "close");
   }
 });
 
@@ -602,4 +856,16 @@ function restoreEnv(previousEnv: Record<string, string | undefined>): void {
 
     process.env[key] = value;
   }
+}
+
+function findLastToolMessageContent(messages: Array<Record<string, unknown>> | undefined): string {
+  if (!messages) {
+    return "";
+  }
+
+  const toolMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "tool" && typeof message.content === "string");
+
+  return typeof toolMessage?.content === "string" ? toolMessage.content : "";
 }

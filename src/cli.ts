@@ -67,6 +67,8 @@ import type {
   CommandApprovalRequest,
   ToolTurnEvent,
   ToolExecutionContext,
+  UserInputRequest,
+  UserInputResponse,
   WorkspaceEditApprovalRequest,
 } from "./tools/types.js";
 import {
@@ -132,9 +134,9 @@ program
   .addOption(
     new Option(
       "--mode <mode>",
-      'agent tool mode: "default" enables guarded command execution, "strict" keeps only specialized read-only tools',
+      'agent tool mode: "default" enables guarded command execution, "strict" keeps only specialized read-only tools, and "plan" keeps the agent read-only with planning-only guidance',
     )
-      .choices(["default", "strict"])
+      .choices(["default", "strict", "plan"])
       .default("default"),
   )
   .addOption(
@@ -190,6 +192,7 @@ program
             ]),
           ) as Partial<Record<ProviderId, ProviderApiKeySource>>,
           minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
+          lastNonPlanMode: getInitialPlanReturnMode(session.mode),
         });
         return;
       }
@@ -233,9 +236,11 @@ type InteractiveState = {
   minCommandPanelDurationMs: number;
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
+  lastNonPlanMode: InteractiveNonPlanMode;
 };
 
 type SlashApprovalMode = Exclude<CommandApprovalMode, "crazy_auto">;
+type InteractiveNonPlanMode = Exclude<AgentMode, "plan">;
 
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
@@ -279,6 +284,7 @@ async function createInteractiveState(
         minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
         commandApprovalMode: approvalMode,
         commandHookRunner,
+        lastNonPlanMode: getInitialPlanReturnMode(session.mode),
       };
     } catch {
       sessionStore = await setActiveSession(null);
@@ -306,6 +312,7 @@ async function createInteractiveState(
     minCommandPanelDurationMs: DEFAULT_MIN_COMMAND_PANEL_DURATION_MS,
     commandApprovalMode: approvalMode,
     commandHookRunner,
+    lastNonPlanMode: getInitialPlanReturnMode(session.mode),
   };
 }
 
@@ -346,6 +353,13 @@ async function runInteractiveSession(
     input,
     output,
     minCommandPanelDurationMs: state.minCommandPanelDurationMs,
+    onShortcut: (shortcut) => {
+      if (shortcut !== "toggle_plan_mode") {
+        return;
+      }
+
+      togglePlanMode(session, state, ui);
+    },
   });
   await initializeProviderCatalogForStartup(session, state, ui);
 
@@ -353,7 +367,8 @@ async function runInteractiveSession(
     while (true) {
       await refreshDeleteAreaBanner(session, state, ui);
       const prompt = await ui.readPrompt({
-        promptLabel: getTTYPromptLabel(ui, state),
+        promptLabel: getTTYPromptLabel(ui, state, session),
+        promptKind: "primary",
         workspaceFiles: state.pendingSystemPromptLines
           ? []
           : await ensureWorkspaceFilesLoaded(state),
@@ -422,7 +437,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|plan|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -1310,10 +1325,13 @@ function resetCurrentSession(
 function getTTYPromptLabel(
   ui: InteractiveRenderer,
   state: InteractiveState,
+  session: AgentSession,
 ): string {
   return state.pendingSystemPromptLines
     ? ui.editorPromptLabel
-    : ui.promptLabel;
+    : session.mode === "plan"
+      ? "plan > "
+      : ui.promptLabel;
 }
 
 function getPendingSystemPromptDraft(
@@ -1322,6 +1340,17 @@ function getPendingSystemPromptDraft(
 ): string {
   const draft = lines.join("\n").trim();
   return draft || currentPrompt;
+}
+
+function getInitialPlanReturnMode(mode: AgentMode): InteractiveNonPlanMode {
+  return mode === "strict" ? "strict" : "default";
+}
+
+function formatApprovalModeDisplay(
+  mode: AgentMode,
+  approvalMode: CommandApprovalMode,
+): string {
+  return mode === "plan" ? "inactive" : approvalMode;
 }
 
 function buildInteractiveShellFrame(
@@ -1362,7 +1391,7 @@ function buildInteractiveShellFrame(
     },
     {
       kind: "info",
-      text: `provider ${formatProviderStatus(provider)}  mode ${formatInteractiveModeLabel(session.mode, state.commandApprovalMode)}  approvals ${state.commandApprovalMode}`,
+      text: `provider ${formatProviderStatus(provider)}  mode ${formatInteractiveModeLabel(session.mode, state.commandApprovalMode)}  approvals ${formatApprovalModeDisplay(session.mode, state.commandApprovalMode)}`,
     },
   ];
   const statusLines: Array<Omit<RendererLine, "id">> = [
@@ -1405,31 +1434,45 @@ function buildInteractiveShellFrame(
     title: "SuperRun",
     workspaceLines,
     statusLines,
-    noticeLines: buildDeleteAreaBannerLines(state),
+    noticeLines: buildNoticeBannerLines(session, state),
     footerLines: [
       {
         kind: "body",
         text: "commands /help /provider /model /sessions /new [title] /mode /approvals /duration /system /clear /exit",
+      },
+      {
+        kind: "body",
+        text: session.mode === "plan"
+          ? "keys Shift+Tab exit plan mode  Enter submit  Plan mode is read-only and suggestions-only"
+          : "keys Shift+Tab start plan mode  Enter submit  Plan mode keeps the agent read-only",
       },
     ],
     contextMeter: buildContextMeter(stats, effectiveContextLimitTokens, provider.model),
   };
 }
 
-function buildDeleteAreaBannerLines(
+function buildNoticeBannerLines(
+  session: AgentSession,
   state: InteractiveState,
 ): Array<Omit<RendererLine, "id">> {
-  const bannerText = getDeleteAreaBannerText(state.deleteAreaStatus);
-  if (!bannerText) {
-    return [];
+  const lines: Array<Omit<RendererLine, "id">> = [];
+
+  if (session.mode === "plan") {
+    lines.push({
+      kind: "info",
+      text: "Plan mode active: the agent can inspect local files, ask focused clarifying questions, and propose changes, but it cannot edit files or run commands.",
+    });
   }
 
-  return [
-    {
+  const deleteAreaBannerText = getDeleteAreaBannerText(state.deleteAreaStatus);
+  if (deleteAreaBannerText) {
+    lines.push({
       kind: "warning",
-      text: bannerText,
-    },
-  ];
+      text: deleteAreaBannerText,
+    });
+  }
+
+  return lines;
 }
 
 export function getDeleteAreaBannerText(status: {
@@ -1460,6 +1503,7 @@ async function refreshDeleteAreaBanner(
   state.deleteAreaStatus = await getWorkspaceDeleteAreaStatus();
   if (ui) {
     ui.setShellFrame(buildInteractiveShellFrame(session, state));
+    ui.setPromptLabel(getTTYPromptLabel(ui, state, session));
   }
 }
 
@@ -1484,7 +1528,7 @@ function renderSessionPromptHint(
   );
   renderInfo(
     ui,
-    'Use "/approvals" to tune normal approval behavior, or "/mode crazy-auto" to remove the remaining guardrails for this session.',
+    'Use "/mode plan" or Shift+Tab for read-only planning, "/approvals" to tune normal approval behavior, or "/mode crazy-auto" to remove the remaining guardrails for this session.',
   );
   renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
 }
@@ -2588,7 +2632,7 @@ function renderAgentModeSummary(
   renderInfo(ui, `Current tool mode: ${getInteractiveModeSummary(mode, approvalMode)}.`);
   renderInfo(
     ui,
-    'Use "/mode strict" for specialized read-only tools, "/mode default" for guarded command execution, or "/mode crazy-auto" to auto-approve elevated-risk local actions.',
+    'Use Shift+Tab to toggle plan mode quickly, "/mode plan" for read-only planning, "/mode strict" for specialized read-only tools, "/mode default" for guarded command execution, or "/mode crazy-auto" to auto-approve elevated-risk local actions.',
   );
 }
 
@@ -2598,6 +2642,36 @@ function renderAgentModeChanged(
   approvalMode: CommandApprovalMode,
 ): void {
   renderInfo(ui, `Tool mode changed to ${getInteractiveModeSummary(mode, approvalMode)}.`);
+}
+
+function togglePlanMode(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): void {
+  if (state.pendingSystemPromptLines) {
+    return;
+  }
+
+  if (session.mode === "plan") {
+    session.mode = state.lastNonPlanMode;
+    ui.setPromptLabel(getTTYPromptLabel(ui, state, session));
+    ui.setShellFrame(buildInteractiveShellFrame(session, state));
+    renderInfo(
+      ui,
+      `Plan mode disabled. Restored ${getInteractiveModeSummary(session.mode, state.commandApprovalMode)}.`,
+    );
+    return;
+  }
+
+  state.lastNonPlanMode = session.mode === "strict" ? "strict" : "default";
+  session.mode = "plan";
+  ui.setPromptLabel(getTTYPromptLabel(ui, state, session));
+  ui.setShellFrame(buildInteractiveShellFrame(session, state));
+  renderInfo(
+    ui,
+    "Plan mode enabled. The agent is now limited to read-only repository inspection, focused clarification questions, and suggested changes.",
+  );
 }
 
 function parseInteractiveModeChoice(
@@ -2628,7 +2702,7 @@ function getInteractiveModeSummary(
   mode: AgentMode,
   approvalMode: CommandApprovalMode,
 ): string {
-  if (approvalMode === "crazy_auto") {
+  if (mode === "default" && approvalMode === "crazy_auto") {
     return "crazy-auto (default tools plus auto-approved file edits and elevated-risk shell commands)";
   }
 
@@ -2639,7 +2713,7 @@ function formatInteractiveModeLabel(
   mode: AgentMode,
   approvalMode: CommandApprovalMode,
 ): string {
-  return approvalMode === "crazy_auto" ? CRAZY_AUTO_MODE_VALUE : mode;
+  return mode === "default" && approvalMode === "crazy_auto" ? CRAZY_AUTO_MODE_VALUE : mode;
 }
 
 function applyInteractiveModeChange(
@@ -2650,14 +2724,21 @@ function applyInteractiveModeChange(
 ): void {
   if (nextMode === CRAZY_AUTO_MODE_VALUE) {
     session.mode = "default";
+    state.lastNonPlanMode = "default";
     applyApprovalModeChange(session, state, ui, "crazy_auto", "slash_command");
     renderAgentModeChanged(ui, session.mode, state.commandApprovalMode);
     return;
   }
 
   session.mode = nextMode;
-  if (state.commandApprovalMode === "crazy_auto") {
+  if (nextMode !== "plan") {
+    state.lastNonPlanMode = nextMode;
+  }
+  if (session.mode !== "plan" && state.commandApprovalMode === "crazy_auto") {
     applyApprovalModeChange(session, state, ui, "ask", "slash_command");
+  }
+  if (ui) {
+    ui.setPromptLabel(getTTYPromptLabel(ui, state, session));
   }
   renderAgentModeChanged(ui, session.mode, state.commandApprovalMode);
 }
@@ -3267,6 +3348,94 @@ function createToolExecutionContext(
         ui?.applyToolEvent(event);
       },
     },
+    ...(ui
+      ? {
+          userInput: {
+            requestUserInput: async (request: UserInputRequest) =>
+              promptPlanUserInput(request, session, state, ui),
+          },
+        }
+      : {}),
+  };
+}
+
+async function promptPlanUserInput(
+  request: UserInputRequest,
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer,
+): Promise<UserInputResponse> {
+  const selectedValue = await ui.selectOption({
+    title: request.title,
+    subtitle: request.question,
+    helpText: "Up/Down move  Enter select  Esc dismiss",
+    options: [
+      ...request.options.map((option, index) => ({
+        value: option.value,
+        label: option.label,
+        description: option.description,
+        tone: index === 0 ? "accent" as const : "default" as const,
+      })),
+      {
+        value: "__custom__",
+        label: "Custom input",
+        description: "Type a custom answer instead of picking one of the listed options.",
+        tone: "default" as const,
+      },
+    ],
+  });
+  ui.setShellFrame(buildInteractiveShellFrame(session, state));
+
+  if (selectedValue === null) {
+    return {
+      kind: "dismissed",
+      value: null,
+      label: null,
+      answer: "",
+    };
+  }
+
+  if (selectedValue === "__custom__") {
+    const customAnswer = (await ui.readPrompt({
+      promptLabel: "plan answer > ",
+      promptKind: "auxiliary",
+      workspaceFiles: [],
+    })).trim();
+    ui.setShellFrame(buildInteractiveShellFrame(session, state));
+    ui.setPromptLabel(getTTYPromptLabel(ui, state, session));
+
+    if (!customAnswer) {
+      return {
+        kind: "dismissed",
+        value: null,
+        label: null,
+        answer: "",
+      };
+    }
+
+    return {
+      kind: "custom",
+      value: "custom",
+      label: "Custom input",
+      answer: customAnswer,
+    };
+  }
+
+  const selectedOption = request.options.find((option) => option.value === selectedValue);
+  if (!selectedOption) {
+    return {
+      kind: "dismissed",
+      value: null,
+      label: null,
+      answer: "",
+    };
+  }
+
+  return {
+    kind: "option",
+    value: selectedOption.value,
+    label: selectedOption.label,
+    answer: selectedOption.label,
   };
 }
 

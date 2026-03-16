@@ -1,5 +1,10 @@
 import { chatOnce } from "../llm/router.js";
-import type { ChatMessage, ChatOptions, ConversationMessage } from "../llm/types.js";
+import type {
+  ChatMessage,
+  ChatOptions,
+  ConversationMessage,
+  ToolCall,
+} from "../llm/types.js";
 import {
   buildContextBudgetSnapshot,
   createEmptyContextBudgetSnapshot,
@@ -12,10 +17,22 @@ import {
   resolveProviderSettings,
   type ProviderUsage,
 } from "../llm/provider.js";
-import { DEFAULT_SYSTEM_PROMPT } from "../prompts/system.js";
+import {
+  DEFAULT_SYSTEM_PROMPT,
+  buildSessionSystemPrompt,
+} from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 import type { ToolExecutionContext } from "../tools/types.js";
+import {
+  FETCH_WEBPAGE_TOOL_NAME,
+  createFetchWebpageSessionCache,
+  executeFetchWebpageToolCall,
+  hasCachedFetchWebpageOutline,
+  normalizeFetchWebpageUrl,
+  parseFetchWebpageArgs,
+  type FetchWebpageSessionCache,
+} from "../tools/fetch_webpage.js";
 
 export type AgentTurnOptions = ChatOptions & {
   toolContext?: ToolExecutionContext;
@@ -43,6 +60,7 @@ export type AgentSession = {
   history: ConversationMessage[];
   maxHistoryTurns: number;
   contextBudget: ContextBudgetSnapshot;
+  webpageFetchCache: FetchWebpageSessionCache;
 };
 
 export type CreateAgentSessionOptions = {
@@ -82,6 +100,7 @@ export function createAgentSession(
     contextBudget: options?.contextBudget
       ? { ...options.contextBudget }
       : createEmptyContextBudgetSnapshot(),
+    webpageFetchCache: createFetchWebpageSessionCache(),
   };
 }
 
@@ -92,7 +111,7 @@ export function buildTurnMessages(
   return [
     {
       role: "system",
-      content: session.systemPrompt,
+      content: getEffectiveSystemPrompt(session),
     },
     ...session.history,
     {
@@ -121,7 +140,7 @@ export async function runAgentTurn(
   const estimatedPromptTokens = estimateChatMessageTokens(baseMessages);
   const response = await resolveAgentReply(
     baseMessages,
-    session.mode,
+    session,
     options,
   );
   const contextBudgetSnapshot = buildContextBudgetSnapshot({
@@ -185,7 +204,7 @@ function trimSessionHistory(
   const trimmed = trimConversationHistory(
     session.history,
     session.maxHistoryTurns,
-    session.systemPrompt,
+    getEffectiveSystemPrompt(session),
     session.contextBudget.effectiveContextLimitTokens,
     upcomingUserPrompt,
   );
@@ -195,11 +214,11 @@ function trimSessionHistory(
 
 async function resolveAgentReply(
   baseMessages: ChatMessage[],
-  mode: AgentMode,
+  session: AgentSession,
   options?: AgentTurnOptions,
 ): Promise<{ content: string; usage?: ProviderUsage }> {
   const messages = [...baseMessages];
-  const tools = getAgentToolDefinitions(mode);
+  const tools = getAgentToolDefinitions(session.mode);
   let lastUsage: ProviderUsage | undefined;
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
@@ -257,6 +276,8 @@ async function resolveAgentReply(
       throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
     }
 
+    const outlinedUrlsAtRoundStart = buildOutlinedUrlSnapshot(session.webpageFetchCache);
+
     messages.push({
       role: "assistant",
       content: response.content,
@@ -268,21 +289,98 @@ async function resolveAgentReply(
 
     for (const toolCall of response.toolCalls) {
       throwIfAborted(options?.abortSignal);
-      const toolResult = await executeAgentTool(
+      const toolExecution = await executeToolCallForAgentRound(
         toolCall,
-        mode,
+        session.mode,
+        session.webpageFetchCache,
+        outlinedUrlsAtRoundStart,
         options?.toolContext,
       );
       messages.push({
         role: "tool",
         toolCallId: toolCall.id,
         toolName: toolCall.name,
-        content: toolResult,
+        content: toolExecution.toolResult,
       });
+
+      if (toolExecution.policyMessage) {
+        messages.push({
+          role: "system",
+          content: toolExecution.policyMessage,
+        });
+      }
     }
   }
 
   throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
+}
+
+type ToolExecutionOutcome = {
+  toolResult: string;
+  policyMessage?: string;
+};
+
+async function executeToolCallForAgentRound(
+  toolCall: ToolCall,
+  mode: AgentMode,
+  webpageFetchCache: FetchWebpageSessionCache,
+  outlinedUrlsAtRoundStart: ReadonlySet<string>,
+  toolContext?: ToolExecutionContext,
+): Promise<ToolExecutionOutcome> {
+  if (toolCall.name !== FETCH_WEBPAGE_TOOL_NAME) {
+    return {
+      toolResult: await executeAgentTool(toolCall, mode, toolContext),
+    };
+  }
+
+  const parsedArgs = parseFetchWebpageArgs(toolCall.arguments);
+  const requestedMode = parsedArgs.mode ?? "outline";
+  if (requestedMode !== "article") {
+    return {
+      toolResult: await executeFetchWebpageToolCall(toolCall.arguments, {
+        cache: webpageFetchCache,
+        context: toolContext,
+      }),
+    };
+  }
+
+  const normalizedUrl = normalizeFetchWebpageUrl(parsedArgs.url);
+  if (outlinedUrlsAtRoundStart.has(normalizedUrl)) {
+    return {
+      toolResult: await executeFetchWebpageToolCall(toolCall.arguments, {
+        cache: webpageFetchCache,
+        context: toolContext,
+      }),
+    };
+  }
+
+  const note =
+    "Agent retrieval policy deferred the article read until an outline has been reviewed. Use this outline result first, then request article mode in a later round only if more detail is still necessary.";
+  return {
+    toolResult: await executeFetchWebpageToolCall(toolCall.arguments, {
+      cache: webpageFetchCache,
+      requestedModeOverride: "outline",
+      policyApplied: "outline_before_article",
+      note,
+      context: toolContext,
+    }),
+    policyMessage:
+      `The agent enforced outline-before-article retrieval for ${normalizedUrl}. The prior fetch_webpage call returned outline mode instead of article mode. Review that outline first and only call article mode in a later round if it is still necessary.`,
+  };
+}
+
+function buildOutlinedUrlSnapshot(
+  webpageFetchCache: FetchWebpageSessionCache,
+): ReadonlySet<string> {
+  const outlinedUrls = new Set<string>();
+
+  for (const url of webpageFetchCache.keys()) {
+    if (hasCachedFetchWebpageOutline(webpageFetchCache, url)) {
+      outlinedUrls.add(url);
+    }
+  }
+
+  return outlinedUrls;
 }
 
 function buildRoundMessages(
@@ -390,6 +488,10 @@ function trimConversationHistory(
     history: [...history],
     trimmedTurns: 0,
   };
+}
+
+function getEffectiveSystemPrompt(session: AgentSession): string {
+  return buildSessionSystemPrompt(session.systemPrompt, session.mode);
 }
 
 function countHistoryTurns(history: ConversationMessage[]): number {

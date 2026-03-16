@@ -21,6 +21,11 @@ test("mode picker choices mark the active mode and include an exit option", () =
       description: "Specialized read-only tools only, with command execution disabled.",
     },
     {
+      value: "plan",
+      name: "plan",
+      description: "Read-only file inspection plus architecture and implementation suggestions only.",
+    },
+    {
       value: CRAZY_AUTO_MODE_VALUE,
       name: "crazy-auto",
       description:
@@ -39,11 +44,19 @@ test("mode picker swaps the current marker when strict mode is active", () => {
 
   assert.equal(choices[0]?.name, "default");
   assert.equal(choices[1]?.name, "strict (current)");
+  assert.equal(choices[2]?.name, "plan");
+});
+
+test("mode picker marks plan as current when plan mode is active", () => {
+  const choices = buildModePickerChoices("plan", "ask");
+
+  assert.equal(choices[2]?.name, "plan (current)");
+  assert.equal(choices[3]?.name, "crazy-auto");
 });
 
 test("mode picker marks crazy-auto as current when elevated approvals are active", () => {
   const choices = buildModePickerChoices("default", "crazy_auto");
 
   assert.equal(choices[0]?.name, "default");
-  assert.equal(choices[2]?.name, "crazy-auto (current)");
+  assert.equal(choices[3]?.name, "crazy-auto (current)");
 });

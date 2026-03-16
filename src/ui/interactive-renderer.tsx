@@ -57,6 +57,7 @@ export type RendererPrompt = {
     text: string;
   };
   state: ComposerState;
+  kind: "primary" | "auxiliary";
 };
 
 export type RendererPickerOption = {
@@ -228,6 +229,7 @@ export type InteractiveRenderer = {
   setActiveRequestCancel: (cancel: (() => void) | null) => void;
   setActiveRequestInterrupt: (interrupt: (() => void) | null) => void;
   setMinimumCommandPanelDurationMs: (durationMs: number) => void;
+  setPromptLabel: (promptLabel: string) => void;
   setShellFrame: (frame: {
     title: string;
     workspaceLines: Array<Omit<RendererLine, "id">>;
@@ -250,6 +252,7 @@ export type InteractiveRenderer = {
   clearScreen: () => void;
   readPrompt: (options: {
     promptLabel: string;
+    promptKind?: "primary" | "auxiliary";
     workspaceFiles: string[];
   }) => Promise<string>;
   selectOption: (options: RendererSelectOptions) => Promise<string | null>;
@@ -303,6 +306,7 @@ export function createInteractiveRenderer(options: {
   output: NodeJS.WriteStream;
   enableInput?: boolean;
   minCommandPanelDurationMs?: number;
+  onShortcut?: (shortcut: "toggle_plan_mode") => void;
 }): InteractiveRenderer {
   const promptLabel = "> ";
   const editorPromptLabel = "system > ";
@@ -353,6 +357,7 @@ export function createInteractiveRenderer(options: {
         text: promptLabel,
       },
       state: createComposerState(),
+      kind: "primary",
     },
     inputMode: "inactive",
     overlay: null,
@@ -804,6 +809,23 @@ export function createInteractiveRenderer(options: {
     setMinimumCommandPanelDurationMs: (durationMs) => {
       minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(durationMs);
     },
+    setPromptLabel: (nextPromptLabel) => {
+      if (state.prompt.kind !== "primary") {
+        return;
+      }
+
+      state = {
+        ...state,
+        prompt: {
+          ...state.prompt,
+          label: {
+            ...state.prompt.label,
+            text: nextPromptLabel,
+          },
+        },
+      };
+      rerender();
+    },
     setShellFrame: (frame) => {
       state = {
         ...state,
@@ -835,7 +857,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/help  Show command help");
       renderer.writeBodyLine("/provider Show or switch the active provider, model, context budget, Kimi endpoint, base URL, runtime API key, and Kimi catalog state");
       renderer.writeBodyLine("/model  Open the TTY model picker when available, or set the active model by name");
-      renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict|crazy-auto)");
+      renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict|plan|crazy-auto)");
       renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|reject)");
       renderer.writeBodyLine("/duration Show or switch the minimum command panel duration in seconds");
       renderer.writeBodyLine("/settings Show the active system prompt and persistence path");
@@ -852,6 +874,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/system reset Restore the built-in system prompt");
       renderer.writeBodyLine("/clear Clear the screen and redraw the header");
       renderer.writeBodyLine("/exit  Exit the session (also: exit, exit())");
+      renderer.writeBodyLine("Shift+Tab Toggle plan mode on or off");
       renderer.writeBodyLine("");
     },
     renderSectionTitle: (title) => {
@@ -953,7 +976,7 @@ export function createInteractiveRenderer(options: {
       screen.clear();
       rerender();
     },
-    readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
+    readPrompt: async ({ promptLabel: nextLabel, promptKind, workspaceFiles }) => {
       if (promptResolver || overlayResolver || inlineApprovalResolver || diffResolver || diffReviewResolver) {
         throw new Error("Interactive renderer is already waiting for input.");
       }
@@ -974,6 +997,7 @@ export function createInteractiveRenderer(options: {
             text: nextLabel,
           },
           state: syncComposerState(createComposerState(), workspaceFiles),
+          kind: promptKind ?? "auxiliary",
         },
       };
       rerender();
@@ -1145,6 +1169,7 @@ export function createInteractiveRenderer(options: {
       prompt: {
         label: { ...state.prompt.label },
         state: { ...state.prompt.state },
+        kind: state.prompt.kind,
       },
       inputMode: state.inputMode,
       inputActive: state.inputMode !== "inactive",
@@ -1275,6 +1300,17 @@ export function createInteractiveRenderer(options: {
       promptCursorIndex: state.prompt.state.cursorIndex,
     });
     if (!event) {
+      return;
+    }
+
+    if (
+      event.type === "toggle_plan_mode" &&
+      (
+        state.inputMode === "inactive" ||
+        (state.inputMode === "prompt" && state.prompt.kind === "primary")
+      )
+    ) {
+      options.onShortcut?.("toggle_plan_mode");
       return;
     }
 
@@ -2174,7 +2210,9 @@ function buildStatusText(state: RendererState): string {
   }
 
   if (state.inputMode === "prompt" && state.prompt.state.activeReference) {
-    return "Tab insert file  Up/Down choose  Enter submit  Esc clear";
+    return state.prompt.kind === "primary"
+      ? "Tab insert file  Up/Down choose  Enter submit  Shift+Tab plan  Esc clear"
+      : "Tab insert file  Up/Down choose  Enter submit  Esc clear";
   }
 
   if (
@@ -2182,7 +2220,9 @@ function buildStatusText(state: RendererState): string {
     state.prompt.state.activeSlashCommand &&
     state.prompt.state.suggestions.length > 0
   ) {
-    return "Enter accept command  Tab accept  Up/Down choose  Esc clear";
+    return state.prompt.kind === "primary"
+      ? "Enter accept command  Tab accept  Up/Down choose  Shift+Tab plan  Esc clear"
+      : "Enter accept command  Tab accept  Up/Down choose  Esc clear";
   }
 
   if (!state.transcriptViewport.followLatest) {
@@ -2195,7 +2235,9 @@ function buildStatusText(state: RendererState): string {
   }
 
   if (state.inputMode === "prompt") {
-    return "Enter submit  Ctrl+C exit";
+    return state.prompt.kind === "primary"
+      ? "Enter submit  Shift+Tab plan  Ctrl+C exit"
+      : "Enter submit  Ctrl+C exit";
   }
 
   if (state.canCancelActiveRequest || state.canInterruptActiveRequest) {

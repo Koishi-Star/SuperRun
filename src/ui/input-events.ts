@@ -15,6 +15,7 @@ export type SemanticInputEvent =
   | { type: "move_end" }
   | { type: "cancel" }
   | { type: "apply_suggestion" }
+  | { type: "toggle_plan_mode" }
   | { type: "insert_text"; text: string };
 
 export type SemanticInputContext = {
@@ -92,6 +93,10 @@ export function normalizeInkInput(
 
   if (key.escape) {
     return { type: "cancel" };
+  }
+
+  if (key.tab && key.shift) {
+    return { type: "toggle_plan_mode" };
   }
 
   if (key.tab) {

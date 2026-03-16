@@ -253,6 +253,39 @@ test("interactive renderer handles backspace and left right cursor movement thro
   }
 });
 
+test("interactive renderer routes Shift+Tab to the primary prompt shortcut handler", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const shortcuts: string[] = [];
+  const renderer = createInteractiveRenderer({
+    input,
+    output,
+    enableInput: false,
+    onShortcut: (shortcut) => {
+      shortcuts.push(shortcut);
+    },
+  });
+
+  try {
+    const promptPromise = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      promptKind: "primary",
+      workspaceFiles: [],
+    });
+
+    renderer.dispatchInput("", createKey({ tab: true, shift: true }));
+    renderer.dispatchInput("plan", createKey());
+    renderer.dispatchInput("", createKey({ return: true }));
+
+    assert.deepEqual(shortcuts, ["toggle_plan_mode"]);
+    assert.equal(await promptPromise, "plan");
+  } finally {
+    renderer.dispose();
+  }
+});
+
 test("interactive renderer applies file suggestions with Tab and clears submit errors with Escape", {
   concurrency: false,
 }, async () => {

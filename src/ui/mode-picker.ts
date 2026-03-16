@@ -23,7 +23,9 @@ export function buildModePickerChoices(
   currentApprovalMode: CommandApprovalMode,
 ): ModePickerChoice[] {
   const activeMode =
-    currentApprovalMode === "crazy_auto" ? CRAZY_AUTO_MODE_VALUE : currentMode;
+    currentMode === "default" && currentApprovalMode === "crazy_auto"
+      ? CRAZY_AUTO_MODE_VALUE
+      : currentMode;
 
   return [
     {
@@ -35,6 +37,11 @@ export function buildModePickerChoices(
       value: "strict",
       name: activeMode === "strict" ? "strict (current)" : "strict",
       description: "Specialized read-only tools only, with command execution disabled.",
+    },
+    {
+      value: "plan",
+      name: activeMode === "plan" ? "plan (current)" : "plan",
+      description: "Read-only file inspection plus architecture and implementation suggestions only.",
     },
     {
       value: CRAZY_AUTO_MODE_VALUE,

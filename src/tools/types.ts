@@ -181,9 +181,46 @@ export type ToolTurnEventContext = {
   addEvent: (event: ToolTurnEvent) => void;
 };
 
+export type UserInputRequestOption = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+export type UserInputRequest = {
+  title: string;
+  question: string;
+  options: UserInputRequestOption[];
+};
+
+export type UserInputResponse =
+  | {
+      kind: "option";
+      value: string;
+      label: string;
+      answer: string;
+    }
+  | {
+      kind: "custom";
+      value: "custom";
+      label: "Custom input";
+      answer: string;
+    }
+  | {
+      kind: "dismissed";
+      value: null;
+      label: null;
+      answer: "";
+    };
+
+export type UserInputContext = {
+  requestUserInput?: (request: UserInputRequest) => Promise<UserInputResponse>;
+};
+
 export type ToolExecutionContext = {
   commandPolicy?: CommandPolicyContext;
   workspaceEditPolicy?: WorkspaceEditPolicyContext;
   notices?: ToolNoticeContext;
   turnEvents?: ToolTurnEventContext;
+  userInput?: UserInputContext;
 };
