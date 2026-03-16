@@ -20,9 +20,12 @@ What works today:
 - simple history truncation that keeps the most recent 10 turns
 - simple session stats based on turn count and character count
 - lightweight TUI in real terminal sessions
+- fixed-height transcript viewport with internal scrolling
+- offscreen-rendered full-screen TTY surface with line-diff updates instead of full-screen repainting
 - packaged TTY prompts with post-submit `@file` resolution
 - local prompt validation that blocks unresolved `@file` references before they reach the model
 - strict-mode specialized tool support, with `list_files` as the first read-only tool
+- bounded `/history` viewer overlays that take over the main shell viewport instead of stacking under transcript history
 - focused tests for env parsing, agent history, and CLI interaction
 
 What does not exist yet:
@@ -108,6 +111,12 @@ Interactive multi-turn mode:
 ```bash
 npm run dev --
 ```
+
+Inside the TTY shell:
+
+- transcript history lives inside a fixed-height internal viewport
+- `PgUp` / `PgDn` / `Home` / `End` browse transcript history when no overlay is active
+- `/history` opens a bounded viewer that owns the main viewport while it is open, so no part of the viewer becomes permanently unreachable
 
 Interactive multi-turn mode in strict mode:
 

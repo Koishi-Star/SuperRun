@@ -40,10 +40,11 @@
 - `src/ui/mode-picker.ts` provides the option list shown by the `/mode` picker in TTY mode.
 - `src/ui/provider-picker.ts`, `src/ui/provider-model-picker.ts`, `src/ui/provider-context-picker.ts`, and `src/ui/kimi-base-url-picker.ts` provide the current TTY-first provider/model/context/endpoint picker flows.
 - `src/ui/external-editor.ts` opens an external text editor (resolved from `VISUAL`/`EDITOR` env vars) so users can edit the system prompt in a temp file, diffing before/after to detect changes.
-- `src/ui/interactive-renderer.tsx` provides a React + Ink-based renderer that manages the interactive TTY surface through turn cards: compact header state, agent/system turns, a single active command-output pane, inline approval/review blocks, overlay pickers/viewers for global flows, minimum command-panel dwell timing, lightweight progressive answer rendering, and real-time file/slash suggestion updates.
+- `src/ui/interactive-renderer.tsx` owns the interactive TTY render loop: it keeps renderer state, renders the shell offscreen, and pushes fixed-height line-diff updates to the terminal so prompt edits, spinner ticks, transcript scrolling, and overlays do not trigger full-screen clears.
 - `src/ui/assistant-rich-text.tsx` parses and renders the current lightweight rich-text subset used across assistant replies, history/body lines, overlay summaries, and non-interactive ANSI output, including fenced code highlighting via `cli-highlight`.
 - `src/ui/text-width.ts` re-exports terminal display-width utilities from `terminal_format` for measuring multi-byte/wide character widths.
-- `src/ui/ink/interactive-shell.tsx` is the top-level Ink React component that composes the full interactive shell: multi-section welcome/status card, current-versus-history turn hierarchy, a hidden-while-busy composer prompt, inline approval/review surfaces, overlay pickers/viewers, spinner-backed running states, single-line anti-jitter truncation, and status bar messaging.
+- `src/ui/ink/interactive-shell.tsx` defines the shell document and JSX building blocks for the interactive TTY surface: multi-section welcome/status card, transcript viewport, inline approval/review surfaces, overlay pickers/viewers, composer, and status bar. The live path now renders these sections offscreen and lets overlays own the main body viewport while they are active.
+- `src/ui/terminal-screen.ts` is the terminal diff driver for the live TTY shell: it keeps a fixed-height screen buffer, applies line-level patches, and is now the single place to fix whole-screen flicker or redraw regressions.
 - `src/agent/mode.ts` defines the agent mode enum (`default` | `strict`), parsing helpers, and mode summary strings used throughout the agent loop and UI.
 - `src/tools/types.ts` defines TypeScript types for the command policy system: approval modes, risk categories, command assessment, hooks, and tool execution context.
 - `src/tools/command_policy.ts` implements risk assessment for shell commands, including compound-command splitting, highest-risk aggregation, trigger-command surfacing, and classification into read, general execution, network/env mutation, VCS mutation, shell-based workspace writes, and higher-risk download/execute or destructive paths with per-mode policy actions.
@@ -66,6 +67,7 @@
 - Prefer explicit types and small modules over clever abstractions.
 - When modifying code, add concise comments for the changed logic so the intent remains easy to follow.
 - For Ink anti-jitter work, prefer keeping structural regions mounted and stabilizing their height instead of mounting and unmounting prompt or overlay blocks during transient state changes.
+- For full-screen TTY stability work, treat `src/ui/terminal-screen.ts` plus the shell document renderer as the only valid place to fix redraw/flicker issues; do not reintroduce a live full-screen Ink mount that can clear the terminal on every rerender.
 - In Ink JSX, never rely on raw whitespace between elements for spacing; keep padding inside `<Text>` nodes and keep comments away from inline child boundaries so Ink never receives bare text nodes under `<Box>`.
 - When adding a new subsystem, wire it through the CLI end-to-end in the smallest usable form first.
 - A heavier TUI is now justified when it replaces brittle hand-rolled terminal state management. Prefer phased introduction over a one-shot rewrite.
@@ -109,11 +111,11 @@
 - Session titles, previews, rename, history inspection, and `/sessions [query]` filtering are already in place for the current saved-session UX slice.
 - System prompt overrides are already persisted locally and reset the current conversation when changed.
 - Command approvals, command hooks, and external-editor-based system prompt editing are already wired through the CLI.
-- The current TTY shell is already running through Ink, and the main picker and diff-review flows now render inside that single runtime.
+- The current TTY shell still uses Ink for layout primitives and rich-text rendering, but the live terminal path is now offscreen-rendered and diff-applied through `src/ui/terminal-screen.ts` rather than mounted as a full-screen live Ink tree.
 - The main interactive shell has now moved from a flat log flow to a turn-card layout with one active command-output pane and inline approval/review blocks.
 - Kimi startup now attempts a model-catalog refresh automatically, and TTY users can switch models through `/model` without typing a raw model argument first.
 - Provider API keys entered interactively are now stored locally in the app config directory using lightweight obfuscation rather than requiring environment variables every run.
-- The confirmed anti-jitter fix is a combination of three choices: keep the composer mounted even when inactive, pad only active suggestion/viewer sessions to a fixed viewport height, and coalesce streamed assistant chunks before rerendering instead of repainting every tiny chunk.
+- The current anti-jitter / anti-flicker fix is layered: keep the composer mounted even when inactive, pad only active suggestion/viewer sessions to a fixed viewport height, coalesce streamed assistant chunks before rerendering, render the shell offscreen, and apply terminal updates through the line-diff screen driver so full-screen rerenders never clear the entire TTY.
 - `/new [title]` is supported directly; users no longer need to create a session and immediately rename it as a second step.
 - Real API checks should stay minimal and intentional: use them only for the current risky slice after local `build`/`test` pass, and avoid broad exploratory runs that burn tokens unnecessarily.
 - The intentionally retained terminal boundary is now mostly the external-editor handoff used by `/editor`; the older readline and no-UI approval fallbacks are no longer part of the supported interactive path.

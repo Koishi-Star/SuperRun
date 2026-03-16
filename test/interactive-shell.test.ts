@@ -3,7 +3,10 @@ import test from "node:test";
 import { renderToString } from "ink";
 import React from "react";
 import { createComposerState } from "../src/ui/composer-state.js";
-import { InteractiveShell } from "../src/ui/ink/interactive-shell.js";
+import {
+  InteractiveShell,
+  renderInteractiveShellDocument,
+} from "../src/ui/ink/interactive-shell.js";
 
 function createTranscriptViewport() {
   return {
@@ -246,4 +249,65 @@ test("interactive shell preserves transcript rich text formatting inside the vie
   assert.match(output, /\| print\(1\)/);
   assert.doesNotMatch(output, /\*\*bold\*\*/);
   assert.doesNotMatch(output, /`code`/);
+});
+
+test("interactive shell gives viewer overlays the main body viewport instead of stacking them after transcript", () => {
+  const document = renderInteractiveShellDocument({
+    shellFrame: {
+      title: "SuperRun",
+      workspaceLines: [
+        { id: "workspace_1", kind: "info", text: "Workspace line 1" },
+      ],
+      statusLines: [],
+      noticeLines: [],
+      footerLines: [],
+      contextMeter: null,
+    },
+    turns: [
+      {
+        id: "turn_1",
+        kind: "agent",
+        status: "completed",
+        promptText: "older question",
+        steps: [],
+        answerText: Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+        inlineBlock: null,
+      },
+    ],
+    prompt: {
+      label: {
+        kind: "user",
+        text: "You",
+      },
+      state: createComposerState(),
+    },
+    divider: "-".repeat(60),
+    shellHeight: 28,
+    inputEnabled: false,
+    inputMode: "overlay",
+    overlay: {
+      kind: "viewer",
+      title: "History",
+      subtitle: "Current session",
+      helpText: null,
+      emptyMessage: null,
+      scrollOffset: 48,
+      viewportHeight: 18,
+      lines: Array.from({ length: 66 }, (_, index) => ({
+        text: `line ${index + 1}`,
+      })),
+    },
+    statusText: "history 49/66",
+    commandViewportHeight: 6,
+    transcriptViewport: createTranscriptViewport(),
+    transcriptViewportFallbackHeight: 8,
+    onInput: () => {},
+    onTranscriptViewportChange: () => {},
+  });
+
+  assert.match(document.output, /History/);
+  assert.match(document.output, /Showing lines 49-\d+ of 66/);
+  assert.doesNotMatch(document.output, /Showing lines 49-66 of 66/);
+  assert.doesNotMatch(document.output, /newer lines/);
+  assert.doesNotMatch(document.output, /older question/);
 });

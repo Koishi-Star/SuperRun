@@ -234,14 +234,6 @@ export function renderInteractiveShellDocument(
         contentWidth,
       )
     : [];
-  const overlayLines = props.overlay
-    ? renderSectionToLines(
-        props.overlay.kind === "picker"
-          ? <OverlayPicker overlay={props.overlay} />
-          : <OverlayViewer overlay={props.overlay} />,
-        contentWidth,
-      )
-    : [];
   const composerLines = renderSectionToLines(
     (
       <Composer
@@ -261,10 +253,9 @@ export function renderInteractiveShellDocument(
     headerLines.length +
     contextMeterLines.length +
     noticeLines.length +
-    overlayLines.length +
     composerLines.length +
     statusLines.length;
-  const transcriptViewportHeight = Math.max(1, props.shellHeight - reservedLines);
+  const mainViewportHeight = Math.max(1, props.shellHeight - reservedLines);
 
   // Keep the shell layout pure and offscreen-renderable. The live renderer now
   // owns terminal diffing itself because Ink clears fullscreen output whenever
@@ -278,24 +269,33 @@ export function renderInteractiveShellDocument(
   });
   const visibleTranscript = sliceTranscriptItems(
     transcriptLines,
-    transcriptViewportHeight,
+    mainViewportHeight,
     props.transcriptViewport.scrollOffsetLines,
     props.transcriptViewport.followLatest,
   );
   const renderableViewportLines = buildRenderableViewportLines(
     visibleTranscript,
-    transcriptViewportHeight,
+    mainViewportHeight,
   );
-  const renderedTranscriptLines = renderSectionToLines(
+  const renderedTranscriptLines = padSectionLines(
+    renderSectionToLines(
     <TranscriptViewportBody lines={renderableViewportLines} />,
     contentWidth,
+    ),
+    mainViewportHeight,
   );
+  const renderedOverlayLines = props.overlay
+    ? fitOverlayBodyLines(props.overlay, mainViewportHeight, contentWidth)
+    : [];
+  // Overlays replace the central body viewport instead of stacking after the
+  // transcript. Otherwise the viewer's own viewport math drifts from the real
+  // visible area and part of /history becomes permanently unreachable.
+  const bodyLines = props.overlay ? renderedOverlayLines : renderedTranscriptLines;
   const shellLines = [
     ...headerLines,
     ...contextMeterLines,
     ...noticeLines,
-    ...renderedTranscriptLines,
-    ...overlayLines,
+    ...bodyLines,
     ...composerLines,
     ...statusLines,
   ];
@@ -658,6 +658,54 @@ function renderSectionToLines(
   }
 
   return output.replace(/\r\n/g, "\n").split("\n");
+}
+
+function padSectionLines(
+  lines: string[],
+  height: number,
+): string[] {
+  const padded = lines.slice(0, height);
+
+  while (padded.length < height) {
+    padded.push(" ");
+  }
+
+  return padded;
+}
+
+function fitOverlayBodyLines(
+  overlay: RendererOverlay,
+  availableHeight: number,
+  contentWidth: number,
+): string[] {
+  if (overlay.kind !== "viewer") {
+    return padSectionLines(
+      renderSectionToLines(<OverlayPicker overlay={overlay} />, contentWidth),
+      availableHeight,
+    );
+  }
+
+  let nextOverlay: RendererViewerOverlay = {
+    ...overlay,
+    viewportHeight: Math.max(1, Math.min(overlay.viewportHeight, availableHeight)),
+  };
+  let renderedLines = renderSectionToLines(
+    <OverlayViewer overlay={nextOverlay} />,
+    contentWidth,
+  );
+
+  while (renderedLines.length > availableHeight && nextOverlay.viewportHeight > 1) {
+    nextOverlay = {
+      ...nextOverlay,
+      viewportHeight: nextOverlay.viewportHeight - 1,
+    };
+    renderedLines = renderSectionToLines(
+      <OverlayViewer overlay={nextOverlay} />,
+      contentWidth,
+    );
+  }
+
+  return padSectionLines(renderedLines, availableHeight);
 }
 
 function pickSpinnerFrame(
