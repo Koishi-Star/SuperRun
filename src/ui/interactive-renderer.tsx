@@ -226,6 +226,7 @@ export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
   setActiveRequestCancel: (cancel: (() => void) | null) => void;
+  setActiveRequestInterrupt: (interrupt: (() => void) | null) => void;
   setMinimumCommandPanelDurationMs: (durationMs: number) => void;
   setShellFrame: (frame: {
     title: string;
@@ -276,6 +277,7 @@ type RendererState = {
   overlay: RendererOverlay | null;
   transcriptViewport: RendererTranscriptViewport;
   canCancelActiveRequest: boolean;
+  canInterruptActiveRequest: boolean;
 };
 
 export type InteractiveRendererSnapshot = {
@@ -313,6 +315,7 @@ export function createInteractiveRenderer(options: {
   let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffReviewResolver: (() => void) | null = null;
   let activeRequestCancel: (() => void) | null = null;
+  let activeRequestInterrupt: (() => void) | null = null;
   let assistantAnimationTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingAssistantChunks: string[] = [];
   let pendingTurnStatus: RendererAgentTurn["status"] | null = null;
@@ -357,6 +360,7 @@ export function createInteractiveRenderer(options: {
       getTranscriptViewportFallbackHeight(options.output),
     ),
     canCancelActiveRequest: false,
+    canInterruptActiveRequest: false,
   };
 
   const mount = () => {
@@ -569,7 +573,23 @@ export function createInteractiveRenderer(options: {
   const setLatestAgentInlineBlock = (
     block: RendererInlineBlock | null,
     status?: RendererAgentTurn["status"],
+    options?: {
+      followLatest?: boolean;
+    },
   ) => {
+    if (options?.followLatest && !state.transcriptViewport.followLatest) {
+      state = {
+        ...state,
+        transcriptViewport: {
+          ...state.transcriptViewport,
+          followLatest: true,
+          scrollOffsetLines: state.transcriptViewport.maxScrollOffsetLines,
+          pendingBelowLines: 0,
+          hiddenBelowLines: 0,
+        },
+      };
+    }
+
     const updated = updateLatestAgentTurn((turn) => ({
       ...turn,
       ...(status ? { status } : {}),
@@ -706,6 +726,19 @@ export function createInteractiveRenderer(options: {
     rerender();
   };
 
+  const setActiveRequestInterrupt = (interrupt: (() => void) | null) => {
+    activeRequestInterrupt = interrupt;
+    if (state.canInterruptActiveRequest === Boolean(interrupt)) {
+      return;
+    }
+
+    state = {
+      ...state,
+      canInterruptActiveRequest: Boolean(interrupt),
+    };
+    rerender();
+  };
+
   const cancelActiveRequest = () => {
     const cancel = activeRequestCancel;
     if (!cancel) {
@@ -714,6 +747,16 @@ export function createInteractiveRenderer(options: {
 
     setActiveRequestCancel(null);
     cancel();
+  };
+
+  const interruptActiveRequest = () => {
+    const interrupt = activeRequestInterrupt;
+    if (!interrupt) {
+      return;
+    }
+
+    setActiveRequestInterrupt(null);
+    interrupt();
   };
 
   const resolveInlineApproval = (value: CommandApprovalDecision) => {
@@ -757,6 +800,7 @@ export function createInteractiveRenderer(options: {
     promptLabel,
     editorPromptLabel,
     setActiveRequestCancel,
+    setActiveRequestInterrupt,
     setMinimumCommandPanelDurationMs: (durationMs) => {
       minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(durationMs);
     },
@@ -791,8 +835,8 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/help  Show command help");
       renderer.writeBodyLine("/provider Show or switch the active provider, model, context budget, Kimi endpoint, base URL, runtime API key, and Kimi catalog state");
       renderer.writeBodyLine("/model  Open the TTY model picker when available, or set the active model by name");
-      renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict)");
-      renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|crazy_auto|reject)");
+      renderer.writeBodyLine("/mode     Show or switch the active tool mode (default|strict|crazy-auto)");
+      renderer.writeBodyLine("/approvals Show or switch the approval mode for file edits and commands (ask|allow-all|reject)");
       renderer.writeBodyLine("/duration Show or switch the minimum command panel duration in seconds");
       renderer.writeBodyLine("/settings Show the active system prompt and persistence path");
       renderer.writeBodyLine("/session  Show current session status");
@@ -1018,7 +1062,7 @@ export function createInteractiveRenderer(options: {
         helpText: approval.helpText ?? "Up/Down move  Enter approve once  a allow-all  Esc reject",
         options: approval.options,
         selectedIndex: onceIndex >= 0 ? onceIndex : 0,
-      }, "awaiting_approval");
+      }, "awaiting_approval", { followLatest: true });
       state = {
         ...state,
         inputMode: "inline",
@@ -1050,7 +1094,7 @@ export function createInteractiveRenderer(options: {
         lines: review.lines,
         scrollOffset: 0,
         viewportHeight: getDiffViewportHeight(options.output),
-      }, "awaiting_approval");
+      }, "awaiting_approval", { followLatest: true });
       state = {
         ...state,
         inputMode: "inline",
@@ -1082,7 +1126,9 @@ export function createInteractiveRenderer(options: {
         lines: review.lines,
         scrollOffset: 0,
         viewportHeight: getDiffViewportHeight(options.output),
-      }, getLatestAgentTurn()?.status === "failed" ? "failed" : "completed");
+      }, getLatestAgentTurn()?.status === "failed" ? "failed" : "completed", {
+        followLatest: true,
+      });
       state = {
         ...state,
         inputMode: "inline",
@@ -1141,6 +1187,7 @@ export function createInteractiveRenderer(options: {
         spinnerTimer = null;
       }
       detachInput();
+      options.input.pause?.();
       options.output.off?.("resize", handleResize);
       mounted = false;
       screen.dispose();
@@ -1228,6 +1275,15 @@ export function createInteractiveRenderer(options: {
       promptCursorIndex: state.prompt.state.cursorIndex,
     });
     if (!event) {
+      return;
+    }
+
+    if (
+      state.inputMode === "inactive" &&
+      event.type === "interrupt" &&
+      state.canInterruptActiveRequest
+    ) {
+      interruptActiveRequest();
       return;
     }
 
@@ -2134,14 +2190,23 @@ function buildStatusText(state: RendererState): string {
       ? `  ${state.transcriptViewport.pendingBelowLines} new below`
       : "";
     const cancelText = state.canCancelActiveRequest ? "  Esc cancel request" : "";
-    return `Browsing transcript  ${state.transcriptViewport.hiddenBelowLines} lines from latest  PgUp/PgDn scroll  End/Esc follow latest${pendingText}${cancelText}`;
+    const interruptText = state.canInterruptActiveRequest ? "  Ctrl+C exit" : "";
+    return `Browsing transcript  ${state.transcriptViewport.hiddenBelowLines} lines from latest  PgUp/PgDn scroll  End/Esc follow latest${pendingText}${cancelText}${interruptText}`;
   }
 
   if (state.inputMode === "prompt") {
     return "Enter submit  Ctrl+C exit";
   }
 
-  return state.canCancelActiveRequest ? "Agent is working  Esc cancel request" : "Agent is working";
+  if (state.canCancelActiveRequest || state.canInterruptActiveRequest) {
+    const actions = [
+      state.canCancelActiveRequest ? "Esc cancel request" : null,
+      state.canInterruptActiveRequest ? "Ctrl+C exit" : null,
+    ].filter(Boolean).join("  ");
+    return `Agent is working  ${actions}`;
+  }
+
+  return "Agent is working";
 }
 
 function buildDivider(output: Writable): string {

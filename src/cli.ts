@@ -107,7 +107,11 @@ import {
   type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
 import { buildContextIndicatorDisplay } from "./ui/context-indicator.js";
-import { buildModePickerChoices } from "./ui/mode-picker.js";
+import {
+  buildModePickerChoices,
+  CRAZY_AUTO_MODE_VALUE,
+  type InteractiveModeChoiceValue,
+} from "./ui/mode-picker.js";
 import { buildKimiBaseURLPickerChoices } from "./ui/kimi-base-url-picker.js";
 import { buildProviderContextPickerChoices } from "./ui/provider-context-picker.js";
 import { buildProviderModelPickerChoices } from "./ui/provider-model-picker.js";
@@ -136,9 +140,9 @@ program
   .addOption(
     new Option(
       "--approvals <mode>",
-      'approval mode: "ask" prompts before file edits and shell commands, "allow-all" auto-approves ordinary commands but still gates elevated-risk shell actions, "crazy_auto" removes those guardrails, "reject" disables local mutations and command execution',
+      'approval mode: "ask" prompts before file edits and shell commands, "allow-all" auto-approves ordinary commands but still gates elevated-risk shell actions, "reject" disables local mutations and command execution',
     )
-      .choices(["ask", "allow-all", "crazy_auto", "reject"])
+      .choices(["ask", "allow-all", "reject"])
       .default("ask"),
   )
   .argument("[prompt]", "prompt to send to the model")
@@ -230,6 +234,8 @@ type InteractiveState = {
   commandApprovalMode: CommandApprovalMode;
   commandHookRunner: ReturnType<typeof createEnvCommandHookRunner>;
 };
+
+type SlashApprovalMode = Exclude<CommandApprovalMode, "crazy_auto">;
 
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
@@ -416,7 +422,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict] /approvals [ask|allow-all|crazy_auto|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -659,24 +665,30 @@ async function handleInteractivePrompt(
     const requestedMode = parseCommandArgument(prompt, "/mode");
 
     if (ui && !requestedMode) {
-      const selectedMode = await runModePicker(session.mode, ui);
+      const selectedMode = await runModePicker(
+        session.mode,
+        state.commandApprovalMode,
+        ui,
+      );
       renderInteractiveShell(ui, session, state);
       if (selectedMode) {
-        session.mode = selectedMode;
-        renderAgentModeChanged(ui, selectedMode);
+        applyInteractiveModeChange(session, state, ui, selectedMode);
       }
       return true;
     }
 
     if (!requestedMode) {
-      renderAgentModeSummary(ui, session.mode);
+      renderAgentModeSummary(ui, session.mode, state.commandApprovalMode);
       return true;
     }
 
     try {
-      const nextMode = parseAgentMode(requestedMode);
-      session.mode = nextMode;
-      renderAgentModeChanged(ui, nextMode);
+      applyInteractiveModeChange(
+        session,
+        state,
+        ui,
+        parseInteractiveModeChoice(requestedMode),
+      );
     } catch (error) {
       renderError(ui, error instanceof Error ? error.message : "Failed to change mode.");
     }
@@ -707,7 +719,7 @@ async function handleInteractivePrompt(
         session,
         state,
         ui,
-        parseCommandApprovalMode(requestedMode),
+        parseSlashApprovalMode(requestedMode),
         "slash_command",
       );
       await persistSessionMetadataIfNeeded(session, state);
@@ -1076,6 +1088,7 @@ async function handleInteractivePrompt(
 
   let reply = "";
   const requestAbortController = ui ? new AbortController() : null;
+  let exitRequestedDuringTurn = false;
   try {
     const result = await runAgentTurn(session, prompt, {
       providerConfig: getActiveProviderConfig(state),
@@ -1087,6 +1100,12 @@ async function handleInteractivePrompt(
         ui?.setActiveRequestCancel(active
           ? () => {
               requestAbortController?.abort(new Error("Cancelled the active AI request."));
+            }
+          : null);
+        ui?.setActiveRequestInterrupt(active
+          ? () => {
+              exitRequestedDuringTurn = true;
+              requestAbortController?.abort(new Error("Interrupted the active session."));
             }
           : null);
       },
@@ -1107,6 +1126,10 @@ async function handleInteractivePrompt(
       );
     }
   } catch (error) {
+    if (exitRequestedDuringTurn) {
+      return false;
+    }
+
     const message = formatAgentTurnFailureMessage(error);
     if (ui) {
       ui.failActiveTurn(message);
@@ -1116,6 +1139,7 @@ async function handleInteractivePrompt(
     throw new Error(message);
   } finally {
     ui?.setActiveRequestCancel(null);
+    ui?.setActiveRequestInterrupt(null);
   }
 
   applyTurnEventsToSession(state, turnEvents);
@@ -1338,7 +1362,7 @@ function buildInteractiveShellFrame(
     },
     {
       kind: "info",
-      text: `provider ${formatProviderStatus(provider)}  mode ${session.mode}  approvals ${state.commandApprovalMode}`,
+      text: `provider ${formatProviderStatus(provider)}  mode ${formatInteractiveModeLabel(session.mode, state.commandApprovalMode)}  approvals ${state.commandApprovalMode}`,
     },
   ];
   const statusLines: Array<Omit<RendererLine, "id">> = [
@@ -1446,7 +1470,10 @@ function renderSessionPromptHint(
 ): void {
   const stats = getAgentSessionStats(session);
   const source = settings.hasStoredSystemPrompt ? "saved profile" : "built-in default";
-  renderInfo(ui, `Tool mode: ${getAgentModeSummary(session.mode)}.`);
+  renderInfo(
+    ui,
+    `Tool mode: ${getAgentModeSummary(session.mode)}.`,
+  );
   renderInfo(
     ui,
     `Active behavior (${source}): ${summarizePrompt(session.systemPrompt)}`,
@@ -1455,7 +1482,10 @@ function renderSessionPromptHint(
     ui,
     `Context: ${formatContextUsage(stats.currentContextTokens, stats.effectiveContextLimitTokens)} used, source ${stats.contextUsageSource ?? "unknown"}.`,
   );
-  renderInfo(ui, 'Use "/approvals" to review file-edit and command approval behavior.');
+  renderInfo(
+    ui,
+    'Use "/approvals" to tune normal approval behavior, or "/mode crazy-auto" to remove the remaining guardrails for this session.',
+  );
   renderInfo(ui, 'Use "/system" to change the default behavior for new work.');
 }
 
@@ -2553,19 +2583,83 @@ function renderSessionRenamed(
 function renderAgentModeSummary(
   ui: InteractiveRenderer | null,
   mode: AgentMode,
+  approvalMode: CommandApprovalMode,
 ): void {
-  renderInfo(ui, `Current tool mode: ${getAgentModeSummary(mode)}.`);
+  renderInfo(ui, `Current tool mode: ${getInteractiveModeSummary(mode, approvalMode)}.`);
   renderInfo(
     ui,
-    'Use "/mode strict" for specialized read-only tools, or "/mode default" to re-enable command execution.',
+    'Use "/mode strict" for specialized read-only tools, "/mode default" for guarded command execution, or "/mode crazy-auto" to auto-approve elevated-risk local actions.',
   );
 }
 
 function renderAgentModeChanged(
   ui: InteractiveRenderer | null,
   mode: AgentMode,
+  approvalMode: CommandApprovalMode,
 ): void {
-  renderInfo(ui, `Tool mode changed to ${getAgentModeSummary(mode)}.`);
+  renderInfo(ui, `Tool mode changed to ${getInteractiveModeSummary(mode, approvalMode)}.`);
+}
+
+function parseInteractiveModeChoice(
+  value: string | null | undefined,
+): InteractiveModeChoiceValue {
+  const normalized = value?.trim().toLowerCase() ?? "default";
+  if (normalized === CRAZY_AUTO_MODE_VALUE || normalized === "crazy_auto") {
+    return CRAZY_AUTO_MODE_VALUE;
+  }
+
+  return parseAgentMode(normalized);
+}
+
+function parseSlashApprovalMode(
+  value: string | null | undefined,
+): SlashApprovalMode {
+  const parsedMode = parseCommandApprovalMode(value);
+  if (parsedMode === "crazy_auto") {
+    throw new Error(
+      'Invalid approval mode: crazy_auto. Use "ask", "allow-all", or "reject". Use "/mode crazy-auto" for full auto-approval.',
+    );
+  }
+
+  return parsedMode;
+}
+
+function getInteractiveModeSummary(
+  mode: AgentMode,
+  approvalMode: CommandApprovalMode,
+): string {
+  if (approvalMode === "crazy_auto") {
+    return "crazy-auto (default tools plus auto-approved file edits and elevated-risk shell commands)";
+  }
+
+  return getAgentModeSummary(mode);
+}
+
+function formatInteractiveModeLabel(
+  mode: AgentMode,
+  approvalMode: CommandApprovalMode,
+): string {
+  return approvalMode === "crazy_auto" ? CRAZY_AUTO_MODE_VALUE : mode;
+}
+
+function applyInteractiveModeChange(
+  session: AgentSession,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+  nextMode: InteractiveModeChoiceValue,
+): void {
+  if (nextMode === CRAZY_AUTO_MODE_VALUE) {
+    session.mode = "default";
+    applyApprovalModeChange(session, state, ui, "crazy_auto", "slash_command");
+    renderAgentModeChanged(ui, session.mode, state.commandApprovalMode);
+    return;
+  }
+
+  session.mode = nextMode;
+  if (state.commandApprovalMode === "crazy_auto") {
+    applyApprovalModeChange(session, state, ui, "ask", "slash_command");
+  }
+  renderAgentModeChanged(ui, session.mode, state.commandApprovalMode);
 }
 
 function renderInfo(ui: InteractiveRenderer | null, message: string): void {
@@ -2969,35 +3063,44 @@ async function runProviderContextPicker(
 
 async function runModePicker(
   currentMode: AgentMode,
+  currentApprovalMode: CommandApprovalMode,
   ui: InteractiveRenderer,
-): Promise<AgentMode | null> {
+): Promise<InteractiveModeChoiceValue | null> {
+  const activeMode = formatInteractiveModeLabel(currentMode, currentApprovalMode);
   const selectedMode = await ui.selectOption({
     title: "Tool Mode",
     subtitle: "Choose how the agent can inspect and execute local work.",
     helpText: "Up/Down move  Enter apply  Esc cancel",
-    options: buildModePickerChoices(currentMode).map((choice) => ({
+    options: buildModePickerChoices(currentMode, currentApprovalMode).map((choice) => ({
       value: choice.value,
       label: choice.name,
       description: choice.description,
-      tone: choice.value === currentMode ? "accent" : "default",
+      tone: choice.value === null
+        ? "default"
+        : choice.value === CRAZY_AUTO_MODE_VALUE
+          ? "danger"
+          : choice.value === activeMode
+            ? "accent"
+            : "default",
     })),
   });
 
-  return selectedMode ? parseAgentMode(selectedMode) : null;
+  return selectedMode ? parseInteractiveModeChoice(selectedMode) : null;
 }
 
 async function runApprovalPicker(
   currentMode: CommandApprovalMode,
   ui: InteractiveRenderer,
-): Promise<CommandApprovalMode | null> {
+): Promise<SlashApprovalMode | null> {
   const selectedMode = await ui.selectOption({
     title: "Approvals",
-    subtitle: "Choose how file edits and shell execution are approved in this process.",
+    subtitle:
+      'Choose how file edits and shell execution are approved in this process. Use "/mode crazy-auto" for full auto-approval.',
     helpText: "Up/Down move  Enter apply  Esc cancel",
     options: buildApprovalPickerOptions(currentMode),
   });
 
-  return selectedMode ? parseCommandApprovalMode(selectedMode) : null;
+  return selectedMode ? parseSlashApprovalMode(selectedMode) : null;
 }
 
 async function maybePickKimiBaseURL(
@@ -3259,12 +3362,6 @@ function buildApprovalPickerOptions(
       label: currentMode === "allow-all" ? "allow-all (current)" : "allow-all",
       description: "Auto-approve file edits and ordinary shell commands, but still gate elevated-risk shell actions.",
       tone: currentMode === "allow-all" ? "accent" : "default",
-    },
-    {
-      value: "crazy_auto",
-      label: currentMode === "crazy_auto" ? "crazy_auto (current)" : "crazy_auto",
-      description: "Auto-approve file edits and all shell commands, including elevated-risk actions.",
-      tone: currentMode === "crazy_auto" ? "danger" : "danger",
     },
     {
       value: "reject",

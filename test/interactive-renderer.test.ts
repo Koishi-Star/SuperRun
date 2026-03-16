@@ -7,12 +7,18 @@ import { createInteractiveRenderer } from "../src/ui/interactive-renderer.js";
 class FakeTTYInput extends PassThrough {
   isTTY = true;
   resumeCallCount = 0;
+  pauseCallCount = 0;
 
   setRawMode(_mode: boolean): void {}
 
   override resume(): this {
     this.resumeCallCount += 1;
     return super.resume();
+  }
+
+  override pause(): this {
+    this.pauseCallCount += 1;
+    return super.pause();
   }
 }
 
@@ -360,6 +366,46 @@ test("interactive renderer supports inline approval blocks", {
     }
     assert.equal(snapshot.turns[0].inlineBlock, null);
     assert.equal(snapshot.turns[0].status, "running_tools");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer brings approval cards back into view when transcript browsing is offset", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    renderer.beginAgentTurn("run tests");
+    renderer.appendAssistantChunk(
+      Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+    );
+    await waitForRender();
+
+    renderer.dispatchInput("", createKey({ pageUp: true }));
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, false);
+
+    const approvalPromise = renderer.requestApproval({
+      title: "Approve read command?",
+      subtitle: "Read-only test command",
+      options: [
+        { value: "once", label: "Approve once", description: "Run it now.", tone: "accent" },
+        { value: "always", label: "Allow all this session", description: "Switch to allow-all.", tone: "default" },
+        { value: "reject", label: "Reject", description: "Block the command.", tone: "danger" },
+      ],
+    });
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.inputMode, "inline");
+    assert.equal(snapshot.transcriptViewport.followLatest, true);
+    assert.equal(snapshot.transcriptViewport.pendingBelowLines, 0);
+
+    renderer.dispatchInput("", createKey({ return: true }));
+    assert.equal(await approvalPromise, "once");
   } finally {
     renderer.dispose();
   }
@@ -819,4 +865,54 @@ test("interactive renderer exposes Esc cancellation while an AI request is activ
   } finally {
     renderer.dispose();
   }
+});
+
+test("interactive renderer exposes Ctrl+C exit while an AI request is active", {
+  concurrency: false,
+}, () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+  let interruptCount = 0;
+
+  try {
+    renderer.beginAgentTurn("stream response");
+    renderer.setActiveRequestInterrupt(() => {
+      interruptCount += 1;
+    });
+
+    let snapshot = renderer.getSnapshot();
+    assert.match(snapshot.statusText, /Ctrl\+C exit/);
+
+    renderer.dispatchInput("c", createKey({ ctrl: true }));
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(interruptCount, 1);
+    assert.doesNotMatch(snapshot.statusText, /Ctrl\+C exit/);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer pauses stdin on dispose so the process can exit cleanly", {
+  concurrency: false,
+}, () => {
+  const input = new FakeTTYInput();
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({
+    input: input as unknown as NodeJS.ReadStream,
+    output,
+    enableInput: false,
+  });
+
+  try {
+    void renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: [],
+    });
+  } finally {
+    renderer.dispose();
+  }
+
+  assert.equal(input.pauseCallCount, 1);
 });

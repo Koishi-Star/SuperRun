@@ -146,8 +146,9 @@ export function parseCommandApprovalMode(
   value: string | null | undefined,
 ): (typeof COMMAND_APPROVAL_MODES)[number] {
   const normalized = value?.trim().toLowerCase() ?? "ask";
-  if (isCommandApprovalMode(normalized)) {
-    return normalized;
+  const canonical = normalized === "crazy-auto" ? "crazy_auto" : normalized;
+  if (isCommandApprovalMode(canonical)) {
+    return canonical;
   }
 
   throw new Error(
@@ -159,7 +160,7 @@ export function getCommandApprovalSummary(
   mode: (typeof COMMAND_APPROVAL_MODES)[number],
 ): string {
   if (mode === "crazy_auto") {
-    return "crazy_auto (auto-approve file edits and even elevated-risk shell commands for this session)";
+    return "crazy-auto (auto-approve file edits and even elevated-risk shell commands for this session)";
   }
 
   if (mode === "allow-all") {
@@ -240,7 +241,7 @@ export async function authorizeCommand(
   const requestApproval = policy?.requestApproval;
   if (!requestApproval) {
     if (approvalMode === "crazy_auto") {
-      throw new Error("run_command entered an unreachable approval state under crazy_auto.");
+      throw new Error("run_command entered an unreachable approval state under crazy-auto mode.");
     }
 
     throw new Error(buildApprovalRequiredMessage(assessment, approvalMode));
@@ -575,25 +576,27 @@ function buildApprovalRequiredMessage(
   approvalMode: Exclude<CommandApprovalMode, "reject" | "crazy_auto">,
 ): string {
   if (approvalMode === "allow-all") {
-    return `run_command requires interactive approval for ${assessment.category} commands.${buildTriggerSuffix(assessment)} This elevated-risk command still stays gated under allow-all. Re-run in the Ink TTY shell to approve it, or switch approvals to crazy_auto.`;
+    return `run_command requires interactive approval for ${assessment.category} commands.${buildTriggerSuffix(assessment)} This elevated-risk command still stays gated under allow-all. Re-run in the Ink TTY shell to approve it, or switch to /mode crazy-auto.`;
   }
 
   const escalationTarget =
-    assessment.modeActions.allowAll === "allow" ? "allow-all" : "crazy_auto";
+    assessment.modeActions.allowAll === "allow"
+      ? "switch approvals to allow-all"
+      : "switch to /mode crazy-auto";
 
-  return `run_command requires approval for ${assessment.category} commands.${buildTriggerSuffix(assessment)} Re-run in a TTY to approve it, or switch approvals to ${escalationTarget}.`;
+  return `run_command requires approval for ${assessment.category} commands.${buildTriggerSuffix(assessment)} Re-run in a TTY to approve it, or ${escalationTarget}.`;
 }
 
 function buildPolicyDenialMessage(assessment: CommandAssessment): string {
   switch (assessment.category) {
     case "download-exec":
-      return `run_command blocked by policy: downloaded scripts cannot be piped straight into a shell outside crazy_auto.${buildTriggerSuffix(assessment)} Download the script first, inspect it, then run it.`;
+      return `run_command blocked by policy: downloaded scripts cannot be piped straight into a shell outside crazy-auto mode.${buildTriggerSuffix(assessment)} Download the script first, inspect it, then run it.`;
     case "workspace-write":
-      return `run_command blocked by policy: shell-based workspace writes must go through the explicit file edit tools unless approvals are set to crazy_auto.${buildTriggerSuffix(assessment)}`;
+      return `run_command blocked by policy: shell-based workspace writes must go through the explicit file edit tools unless /mode is set to crazy-auto.${buildTriggerSuffix(assessment)}`;
     case "destructive":
-      return `run_command blocked by policy: destructive shell commands are disabled outside crazy_auto.${buildTriggerSuffix(assessment)}`;
+      return `run_command blocked by policy: destructive shell commands are disabled outside crazy-auto mode.${buildTriggerSuffix(assessment)}`;
     default:
-      return `run_command blocked by policy: ${assessment.summary.toLowerCase()} is disabled outside crazy_auto.${buildTriggerSuffix(assessment)}`;
+      return `run_command blocked by policy: ${assessment.summary.toLowerCase()} is disabled outside crazy-auto mode.${buildTriggerSuffix(assessment)}`;
   }
 }
 

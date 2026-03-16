@@ -40,7 +40,7 @@ export async function authorizeWorkspaceEdit(
   const requestApproval = policy?.requestApproval;
   if (!requestApproval) {
     throw new Error(
-      `${assessment.tool} requires approval. Re-run in the Ink TTY shell or switch approvals to allow-all or crazy_auto.`,
+      `${assessment.tool} requires approval. Re-run in the Ink TTY shell, switch approvals to allow-all, or use /mode crazy-auto.`,
     );
   }
 

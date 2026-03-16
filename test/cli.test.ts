@@ -127,8 +127,34 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
-      /requires approval for env-mutate commands\. Re-run in a TTY to approve it, or switch approvals to crazy_auto\./,
+      /requires approval for env-mutate commands\. Re-run in a TTY to approve it, or switch to \/mode crazy-auto\./,
     );
+  } finally {
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI no longer accepts crazy_auto through the startup approvals flag", async () => {
+  const server = await startMockOpenAIServer([]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
+
+  try {
+    const result = await spawnCLI(
+      ["--approvals", "crazy_auto", "Hello there."],
+      {
+        ...process.env,
+        OPENAI_API_KEY: "test-key",
+        OPENAI_BASE_URL: server.baseURL,
+        OPENAI_MODEL: "mock-model",
+        OPENAI_TIMEOUT_MS: "5000",
+        SUPERRUN_CONFIG_DIR: tempDir,
+      },
+    );
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(server.requests.length, 0);
+    assert.match(result.stderr, /Allowed choices are ask, allow-all, reject/i);
   } finally {
     await server.close();
     await rm(tempDir, { recursive: true, force: true });
@@ -174,7 +200,7 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
-      /write_file requires approval\. Re-run in the Ink TTY shell or switch approvals to allow-all or crazy_auto\./,
+      /write_file requires approval\. Re-run in the Ink TTY shell, switch approvals to allow-all, or use \/mode crazy-auto\./,
     );
   } finally {
     await server.close();

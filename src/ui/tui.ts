@@ -27,8 +27,8 @@ export function createTerminalUI(output: Writable): TerminalUI {
     renderCommands: () => {
       output.write(`${chalk.bold("Available commands")}\n`);
       output.write(`${chalk.cyan("/help")}  Show command help\n`);
-      output.write(`${chalk.cyan("/mode")}     Show or switch the active tool mode (default|strict)\n`);
-      output.write(`${chalk.cyan("/approvals")} Show or switch the command approval mode (ask|allow-all|crazy_auto|reject)\n`);
+      output.write(`${chalk.cyan("/mode")}     Show or switch the active tool mode (default|strict|crazy-auto)\n`);
+      output.write(`${chalk.cyan("/approvals")} Show or switch the command approval mode (ask|allow-all|reject)\n`);
       output.write(`${chalk.cyan("/duration")} Show or switch the minimum command panel duration in seconds\n`);
       output.write(`${chalk.cyan("/settings")} Show the active system prompt and persistence path\n`);
       output.write(`${chalk.cyan("/session")}  Show current session status\n`);

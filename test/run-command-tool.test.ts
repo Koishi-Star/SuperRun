@@ -77,7 +77,7 @@ test("run_command rejects obviously file-modifying commands", async () => {
   assert.match(result.error ?? "", /blocked by policy/i);
 });
 
-test("run_command blocks download-and-execute commands outside crazy_auto", async () => {
+test("run_command blocks download-and-execute commands outside crazy-auto mode", async () => {
   const result = JSON.parse(
     await executeAgentTool(
       {
@@ -123,7 +123,7 @@ test("run_command keeps env mutation commands gated under allow-all", async () =
 
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /still stays gated under allow-all/i);
-  assert.match(result.error ?? "", /crazy_auto/i);
+  assert.match(result.error ?? "", /\/mode crazy-auto/i);
 });
 
 test("classifyCommand treats || compound commands by the riskiest segment", () => {
