@@ -1,8 +1,32 @@
-import React, { createContext, useContext, useEffect, useState } from "react";
-import { Box, Text, useInput, type Key } from "ink";
-import { AssistantRichText, RichText } from "../assistant-rich-text.js";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  Box,
+  measureElement,
+  renderToString,
+  Text,
+  useInput,
+  type DOMElement,
+  type Key,
+} from "ink";
+import {
+  AssistantRichText,
+  type AssistantInlineSegment,
+  type RichTextTone,
+  parseAssistantRichText,
+  renderMarkdownTableLines,
+  RichText,
+} from "../assistant-rich-text.js";
 import type { ComposerState } from "../composer-state.js";
+import type { ContextIndicatorTone } from "../context-indicator.js";
 import { getDisplayWidth, truncateForTerminal } from "../terminal_format.js";
+import { sliceTranscriptItems } from "../transcript-viewport.js";
 import type {
   RendererAgentTurn,
   RendererContextMeter,
@@ -13,12 +37,14 @@ import type {
   RendererPickerOverlay,
   RendererPrompt,
   RendererShellFrame,
+  RendererTranscriptViewport,
   RendererToolStep,
   RendererTurnCard,
   RendererViewerOverlay,
 } from "../interactive-renderer.js";
 
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const WARNING_COLOR = "#ff8c42";
 const WORKING_SPINNER_FRAMES = [
   "⠋",
   "⠙",
@@ -41,16 +67,21 @@ const GLOBAL_SPINNER_INTERVAL_MS = 80;
 const SpinnerTickContext = createContext<number>(0);
 
 function SpinnerTickProvider(props: {
+  active: boolean;
   children: React.ReactNode;
 }): React.JSX.Element {
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
+    if (!props.active) {
+      return;
+    }
+
     const timer = setInterval(() => {
       setTick((t) => t + 1);
     }, GLOBAL_SPINNER_INTERVAL_MS);
     return () => { clearInterval(timer); };
-  }, []);
+  }, [props.active]);
 
   return (
     <SpinnerTickContext.Provider value={tick}>
@@ -78,33 +109,71 @@ export type InteractiveShellProps = {
   turns: RendererTurnCard[];
   prompt: RendererPrompt;
   divider: string;
+  shellHeight: number;
   inputEnabled?: boolean;
   inputMode: "inactive" | "prompt" | "overlay" | "inline";
   overlay: RendererOverlay | null;
   statusText: string;
   commandViewportHeight: number;
+  transcriptViewport: RendererTranscriptViewport;
+  transcriptViewportFallbackHeight: number;
   onInput: (input: string, key: Key) => void;
+  onTranscriptViewportChange: (metrics: Pick<
+    RendererTranscriptViewport,
+    | "totalLines"
+    | "viewportHeight"
+    | "maxScrollOffsetLines"
+    | "hiddenAboveLines"
+    | "hiddenBelowLines"
+    | "scrollOffsetLines"
+  >) => void;
+};
+
+export type InteractiveShellDocument = {
+  output: string;
+  transcriptViewport: Pick<
+    RendererTranscriptViewport,
+    | "totalLines"
+    | "viewportHeight"
+    | "maxScrollOffsetLines"
+    | "hiddenAboveLines"
+    | "hiddenBelowLines"
+    | "scrollOffsetLines"
+  >;
 };
 
 export function InteractiveShell(props: InteractiveShellProps): React.JSX.Element {
   const contentWidth = props.divider.length;
+  const hasActiveSpinner = props.turns.some((turn) =>
+    turn.kind === "agent" && (
+      turn.status === "running_tools" ||
+      turn.status === "streaming_answer" ||
+      turn.steps.some((step) => step.kind === "command" && step.status === "running")
+    )
+  );
 
   useInput(
     (input, key) => {
       props.onInput(input, key);
     },
-    { isActive: (props.inputEnabled ?? true) && props.inputMode !== "inactive" },
+    { isActive: props.inputEnabled ?? true },
   );
 
   return (
-    <SpinnerTickProvider>
-    <Box flexDirection="column">
+    <SpinnerTickProvider active={hasActiveSpinner}>
+    <Box flexDirection="column" height={props.shellHeight} overflow="hidden">
       <StructuredHeaderCard frame={props.shellFrame} />
       <ContextMeterBar meter={props.shellFrame.contextMeter} width={contentWidth} />
-      <TurnList
+      {props.shellFrame.noticeLines.length > 0 ? (
+        <ShellNoticeBlock lines={props.shellFrame.noticeLines} />
+      ) : null}
+      <TranscriptViewport
         turns={props.turns}
         commandViewportHeight={props.commandViewportHeight}
         contentWidth={contentWidth}
+        viewport={props.transcriptViewport}
+        fallbackHeight={props.transcriptViewportFallbackHeight}
+        onViewportChange={props.onTranscriptViewportChange}
       />
       {props.overlay
         ? props.overlay.kind === "picker"
@@ -121,6 +190,131 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
     </Box>
     </SpinnerTickProvider>
   );
+}
+
+export function renderInteractiveShellDocument(
+  props: InteractiveShellProps & {
+    spinnerTick?: number;
+  },
+): InteractiveShellDocument {
+  const contentWidth = props.divider.length;
+  const spinnerTick = props.spinnerTick ?? 0;
+  const hasRunningCommand = props.turns.some((turn) =>
+    turn.kind === "agent" &&
+    turn.steps.some((step) => step.kind === "command" && step.status === "running")
+  );
+  const hasLockedPrompt = props.turns.some((turn) =>
+    turn.kind === "agent" &&
+    (turn.status === "running_tools" || turn.status === "streaming_answer")
+  );
+  const commandSpinnerFrame = pickSpinnerFrame(spinnerTick, {
+    enabled: hasRunningCommand,
+  });
+  const workingSpinnerFrame = pickSpinnerFrame(spinnerTick, {
+    enabled: hasLockedPrompt,
+    frames: WORKING_SPINNER_FRAMES,
+  });
+  const headerLines = renderSectionToLines(
+    (
+      <StructuredHeaderCard frame={props.shellFrame} />
+    ),
+    contentWidth,
+  );
+  const contextMeterLines = renderSectionToLines(
+    (
+      <ContextMeterBar meter={props.shellFrame.contextMeter} width={contentWidth} />
+    ),
+    contentWidth,
+  );
+  const noticeLines = props.shellFrame.noticeLines.length > 0
+    ? renderSectionToLines(
+        (
+          <ShellNoticeBlock lines={props.shellFrame.noticeLines} />
+        ),
+        contentWidth,
+      )
+    : [];
+  const overlayLines = props.overlay
+    ? renderSectionToLines(
+        props.overlay.kind === "picker"
+          ? <OverlayPicker overlay={props.overlay} />
+          : <OverlayViewer overlay={props.overlay} />,
+        contentWidth,
+      )
+    : [];
+  const composerLines = renderSectionToLines(
+    (
+      <Composer
+        prompt={props.prompt}
+        divider={props.divider}
+        inputMode={props.inputMode}
+        contextMeter={props.shellFrame.contextMeter}
+      />
+    ),
+    contentWidth,
+  );
+  const statusLines = renderSectionToLines(
+    <StatusBar text={props.statusText} width={contentWidth} />,
+    contentWidth,
+  );
+  const reservedLines =
+    headerLines.length +
+    contextMeterLines.length +
+    noticeLines.length +
+    overlayLines.length +
+    composerLines.length +
+    statusLines.length;
+  const transcriptViewportHeight = Math.max(1, props.shellHeight - reservedLines);
+
+  // Keep the shell layout pure and offscreen-renderable. The live renderer now
+  // owns terminal diffing itself because Ink clears fullscreen output whenever
+  // the render height reaches the terminal height, which caused the full-screen
+  // flash on every prompt edit, spinner tick, and transcript scroll.
+  const transcriptLines = buildTranscriptRenderableLines(props.turns, {
+    commandViewportHeight: props.commandViewportHeight,
+    contentWidth,
+    commandSpinnerFrame,
+    workingSpinnerFrame,
+  });
+  const visibleTranscript = sliceTranscriptItems(
+    transcriptLines,
+    transcriptViewportHeight,
+    props.transcriptViewport.scrollOffsetLines,
+    props.transcriptViewport.followLatest,
+  );
+  const renderableViewportLines = buildRenderableViewportLines(
+    visibleTranscript,
+    transcriptViewportHeight,
+  );
+  const renderedTranscriptLines = renderSectionToLines(
+    <TranscriptViewportBody lines={renderableViewportLines} />,
+    contentWidth,
+  );
+  const shellLines = [
+    ...headerLines,
+    ...contextMeterLines,
+    ...noticeLines,
+    ...renderedTranscriptLines,
+    ...overlayLines,
+    ...composerLines,
+    ...statusLines,
+  ];
+
+  while (shellLines.length < props.shellHeight) {
+    shellLines.push(" ");
+  }
+
+  return {
+    output: shellLines.slice(0, props.shellHeight).join("\n"),
+    transcriptViewport: {
+      totalLines: visibleTranscript.totalLines,
+      viewportHeight: visibleTranscript.viewportHeight,
+      maxScrollOffsetLines: visibleTranscript.maxScrollOffsetLines,
+      hiddenAboveLines: visibleTranscript.hiddenAboveLines,
+      hiddenBelowLines: visibleTranscript.hiddenBelowLines,
+      scrollOffsetLines: visibleTranscript.scrollOffsetLines,
+    },
+  };
 }
 
 function StructuredHeaderCard(props: { frame: RendererShellFrame }): React.JSX.Element {
@@ -164,7 +358,7 @@ function StructuredHeaderCard(props: { frame: RendererShellFrame }): React.JSX.E
       )}
       {props.frame.footerLines.length > 0 ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color="yellow">-</Text>
+          <Text color="yellow">─</Text>
           <LineBlock lines={props.frame.footerLines} />
         </Box>
       ) : null}
@@ -176,26 +370,55 @@ function ContextMeterBar(props: {
   meter: RendererContextMeter | null;
   width: number;
 }): React.JSX.Element {
-  const width = Math.max(10, props.width - 2);
   const meter = props.meter;
-  if (!meter || meter.limitTokens === null || meter.limitTokens <= 0) {
-    return <Text dimColor>{`[${" ".repeat(width - 2)}]`}</Text>;
+  const width = Math.max(10, props.width);
+  if (!meter) {
+    return <Text dimColor color="gray">{fitSingleLine("ctx --/-- (--%)", width)}</Text>;
   }
 
-  const ratio = Math.max(0, Math.min((meter.usedTokens ?? 0) / meter.limitTokens, 1));
-  const filledWidth = Math.max(0, Math.min(width - 2, Math.round((width - 2) * ratio)));
-  const color = ratio >= 0.95
-    ? "redBright"
-    : ratio >= 0.85
-      ? "#ff8c42"
-      : "cyan";
+  const toneProps = getContextToneTextProps(meter.display.tone);
+  const summaryText = `ctx ${meter.display.usageText} (${meter.display.percentText})`;
+  const suffix = ` ${meter.display.usageText} (${meter.display.percentText})`;
+  const suffixWidth = getDisplayWidth(suffix);
+  const prefixWidth = getDisplayWidth("ctx ");
+  const minimumBarWidth = 8;
+  const availableBarWidth = width - prefixWidth - suffixWidth;
+  const barText = availableBarWidth >= minimumBarWidth
+    ? buildContextBarCells(availableBarWidth, meter.display.ratio)
+    : null;
+
+  if (!barText) {
+    return (
+      <Box marginBottom={1}>
+        <Text {...toneProps}>{fitSingleLine(summaryText, width)}</Text>
+      </Box>
+    );
+  }
 
   return (
     <Box marginBottom={1}>
-      <Text>[</Text>
-      <Text color={color}>{"=".repeat(filledWidth)}</Text>
-      <Text dimColor>{"-".repeat(Math.max(0, width - 2 - filledWidth))}</Text>
-      <Text>]</Text>
+      <Text {...toneProps}>ctx </Text>
+      <Text {...toneProps}>{barText.filled}</Text>
+      <Text dimColor color="gray">{barText.empty}</Text>
+      <Text {...toneProps}>{suffix}</Text>
+    </Box>
+  );
+}
+
+function ShellNoticeBlock(props: { lines: RendererLine[] }): React.JSX.Element {
+  const borderColor = props.lines.some((line) => line.kind === "warning" || line.color === "redBright")
+    ? "yellow"
+    : "cyan";
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={borderColor}
+      marginBottom={1}
+      paddingX={1}
+    >
+      <LineBlock lines={props.lines} />
     </Box>
   );
 }
@@ -209,11 +432,19 @@ function TurnList(props: {
     <Box flexDirection="column">
       {props.turns.map((turn, index) => (
         turn.kind === "system"
-          ? <SystemTurn key={turn.id} turn={turn} isLatest={index === props.turns.length - 1} />
+          ? (
+              <SystemTurn
+                key={turn.id}
+                turn={turn}
+                isLatest={index === props.turns.length - 1}
+                isFirst={index === 0}
+              />
+            )
           : (
               <AgentTurn
                 key={turn.id}
                 turn={turn}
+                isFirst={index === 0}
                 isLatest={index === props.turns.length - 1}
                 commandViewportHeight={props.commandViewportHeight}
                 contentWidth={props.contentWidth}
@@ -221,6 +452,1223 @@ function TurnList(props: {
             )
       ))}
     </Box>
+  );
+}
+
+function TranscriptViewport(props: {
+  turns: RendererTurnCard[];
+  commandViewportHeight: number;
+  contentWidth: number;
+  viewport: RendererTranscriptViewport;
+  fallbackHeight: number;
+  onViewportChange: InteractiveShellProps["onTranscriptViewportChange"];
+}): React.JSX.Element {
+  const containerRef = useRef<DOMElement | null>(null);
+  const [measuredHeight, setMeasuredHeight] = useState(Math.max(1, props.fallbackHeight));
+  const hasRunningCommand = props.turns.some((turn) =>
+    turn.kind === "agent" &&
+    turn.steps.some((step) => step.kind === "command" && step.status === "running")
+  );
+  const hasLockedPrompt = props.turns.some((turn) =>
+    turn.kind === "agent" &&
+    (turn.status === "running_tools" || turn.status === "streaming_answer")
+  );
+  const commandSpinnerFrame = useSpinnerFrame({ enabled: hasRunningCommand });
+  const workingSpinnerFrame = useSpinnerFrame({
+    enabled: hasLockedPrompt,
+    frames: WORKING_SPINNER_FRAMES,
+  });
+  const latestMetricsRef = useRef(sliceTranscriptItems<TranscriptRenderableLine>(
+    [],
+    Math.max(1, props.fallbackHeight),
+    0,
+    true,
+  ));
+  const reportedMetricsRef = useRef("");
+  const viewportHeight = Math.max(1, measuredHeight);
+  const transcriptLines = buildTranscriptRenderableLines(props.turns, {
+    commandViewportHeight: props.commandViewportHeight,
+    contentWidth: props.contentWidth,
+    commandSpinnerFrame,
+    workingSpinnerFrame,
+  });
+  const visibleTranscript = sliceTranscriptItems(
+    transcriptLines,
+    viewportHeight,
+    props.viewport.scrollOffsetLines,
+    props.viewport.followLatest,
+  );
+  latestMetricsRef.current = visibleTranscript;
+  const renderableViewportLines = buildRenderableViewportLines(
+    visibleTranscript,
+    viewportHeight,
+  );
+
+  useLayoutEffect(() => {
+    if (!containerRef.current) {
+      return;
+    }
+
+    // Measure the real flexed height of the transcript box and keep the live
+    // transcript clipped to that exact window. This is the shell's hard stop
+    // against full-screen reflow when streamed output grows.
+    const nextHeight = Math.max(1, measureElement(containerRef.current).height);
+    if (nextHeight !== measuredHeight) {
+      setMeasuredHeight(nextHeight);
+    }
+  });
+
+  useLayoutEffect(() => {
+    const nextMetrics = latestMetricsRef.current;
+    const nextSignature = [
+      nextMetrics.totalLines,
+      nextMetrics.viewportHeight,
+      nextMetrics.maxScrollOffsetLines,
+      nextMetrics.hiddenAboveLines,
+      nextMetrics.hiddenBelowLines,
+      nextMetrics.scrollOffsetLines,
+    ].join(":");
+
+    if (reportedMetricsRef.current === nextSignature) {
+      return;
+    }
+
+    reportedMetricsRef.current = nextSignature;
+    props.onViewportChange({
+      totalLines: nextMetrics.totalLines,
+      viewportHeight: nextMetrics.viewportHeight,
+      maxScrollOffsetLines: nextMetrics.maxScrollOffsetLines,
+      hiddenAboveLines: nextMetrics.hiddenAboveLines,
+      hiddenBelowLines: nextMetrics.hiddenBelowLines,
+      scrollOffsetLines: nextMetrics.scrollOffsetLines,
+    });
+  });
+
+  return (
+    <Box
+      ref={containerRef}
+      flexDirection="column"
+      flexGrow={1}
+      flexShrink={1}
+      minHeight={1}
+      overflow="hidden"
+    >
+      <TranscriptViewportBody lines={renderableViewportLines} />
+    </Box>
+  );
+}
+
+function TranscriptViewportBody(props: {
+  lines: TranscriptRenderableLine[];
+}): React.JSX.Element {
+  return (
+    <Box flexDirection="column">
+      {props.lines.map((line, index) => (
+        <TranscriptViewportLineRow
+          key={`${line.id}-${index}`}
+          line={line}
+        />
+      ))}
+    </Box>
+  );
+}
+
+type TranscriptRenderOptions = {
+  commandViewportHeight: number;
+  contentWidth: number;
+  commandSpinnerFrame: string;
+  workingSpinnerFrame: string;
+};
+
+type TranscriptRenderableChunk = {
+  text: string;
+  color?: string;
+  dimColor?: boolean;
+  bold?: boolean;
+  inverse?: boolean;
+};
+
+type TranscriptRenderableLine = {
+  id: string;
+  indent?: number;
+  chunks: TranscriptRenderableChunk[];
+};
+
+function buildRenderableViewportLines(
+  slice: ReturnType<typeof sliceTranscriptItems<TranscriptRenderableLine>>,
+  viewportHeight: number,
+): TranscriptRenderableLine[] {
+  const lines = [...slice.items];
+
+  while (lines.length < viewportHeight) {
+    lines.push(buildTranscriptBlankLine(`pad_${lines.length}`));
+  }
+
+  if (slice.hiddenAboveLines > 0 && lines.length > 0) {
+    lines[0] = buildTranscriptHintLine(
+      `hint_above_${slice.hiddenAboveLines}`,
+      `^ ${slice.hiddenAboveLines} earlier line${slice.hiddenAboveLines === 1 ? "" : "s"}`,
+    );
+  }
+
+  if (slice.hiddenBelowLines > 0 && lines.length > 0) {
+    lines[lines.length - 1] = buildTranscriptHintLine(
+      `hint_below_${slice.hiddenBelowLines}`,
+      `v ${slice.hiddenBelowLines} newer line${slice.hiddenBelowLines === 1 ? "" : "s"}`,
+    );
+  }
+
+  return lines;
+}
+
+function TranscriptViewportLineRow(props: {
+  line: TranscriptRenderableLine;
+}): React.JSX.Element {
+  const content = (
+    <Box flexDirection="row">
+      {props.line.chunks.map((chunk, index) => (
+        <Text
+          key={`${props.line.id}-${index}`}
+          {...(chunk.color ? { color: chunk.color } : {})}
+          dimColor={chunk.dimColor ?? false}
+          bold={chunk.bold ?? false}
+          inverse={chunk.inverse ?? false}
+          wrap="truncate-end"
+        >
+          {chunk.text.length > 0 ? chunk.text : " "}
+        </Text>
+      ))}
+    </Box>
+  );
+
+  if (!props.line.indent || props.line.indent <= 0) {
+    return content;
+  }
+
+  return <Box marginLeft={props.line.indent}>{content}</Box>;
+}
+
+function renderSectionToLines(
+  node: React.ReactNode,
+  columns: number,
+): string[] {
+  const output = renderToString(node, { columns: Math.max(1, columns) });
+  if (!output) {
+    return [];
+  }
+
+  return output.replace(/\r\n/g, "\n").split("\n");
+}
+
+function pickSpinnerFrame(
+  tick: number,
+  options?: {
+    enabled?: boolean;
+    frames?: string[];
+  },
+): string {
+  const enabled = options?.enabled ?? false;
+  const frames = options?.frames ?? SPINNER_FRAMES;
+  if (!enabled || frames.length <= 1) {
+    return frames[0] ?? "|";
+  }
+
+  return frames[tick % frames.length] ?? frames[0] ?? "|";
+}
+
+function buildTranscriptRenderableLines(
+  turns: RendererTurnCard[],
+  options: TranscriptRenderOptions,
+): TranscriptRenderableLine[] {
+  const lines: TranscriptRenderableLine[] = [];
+  let nextId = 0;
+  const makeId = (label: string) => `${label}_${nextId += 1}`;
+
+  turns.forEach((turn, index) => {
+    if (index > 0) {
+      lines.push(buildTranscriptBlankLine(makeId("gap")));
+    }
+
+    const turnLines = turn.kind === "system"
+      ? buildSystemTurnRenderableLines(turn, options.contentWidth, index === turns.length - 1, makeId)
+      : buildAgentTurnRenderableLines(turn, options, index === turns.length - 1, makeId);
+    lines.push(...turnLines);
+  });
+
+  return lines;
+}
+
+function buildSystemTurnRenderableLines(
+  turn: Extract<RendererTurnCard, { kind: "system" }>,
+  contentWidth: number,
+  isLatest: boolean,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const indent = isLatest ? 0 : 2;
+  return turn.lines.flatMap((line) =>
+    renderRendererLineToRenderableLines(line, contentWidth, indent, makeId)
+  );
+}
+
+function buildAgentTurnRenderableLines(
+  turn: RendererAgentTurn,
+  options: TranscriptRenderOptions,
+  isLatest: boolean,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const lines: TranscriptRenderableLine[] = [];
+  const activeCommandStep = [...turn.steps].reverse().find((step) =>
+    step.kind === "command" && step.status === "running"
+  ) ?? null;
+  const isFocused = isLatest || turn.status !== "completed";
+  const showLockedPromptStyle =
+    turn.status === "running_tools" || turn.status === "streaming_answer";
+  const showStepDetails = isFocused;
+  const showAnswer = isFocused || turn.answerText.length > 0;
+  const indent = isFocused ? 0 : 2;
+
+  lines.push(...buildWrappedTranscriptLines({
+    idPrefix: makeId("prompt"),
+    width: options.contentWidth,
+    indent,
+    prefix: [
+      ...(showLockedPromptStyle ? [{ text: `${options.workingSpinnerFrame} `, color: "gray" }] : []),
+      {
+        text: "> ",
+        color: showLockedPromptStyle ? "gray" : isFocused ? "cyan" : "white",
+        bold: true,
+        dimColor: !showLockedPromptStyle && !isFocused,
+      },
+    ],
+    body: [
+      {
+        text: turn.promptText,
+        ...(showLockedPromptStyle ? { color: "white" } : {}),
+        dimColor: !showLockedPromptStyle && !isFocused,
+      },
+    ],
+  }));
+
+  if (turn.steps.length > 0 && showStepDetails) {
+    for (const step of turn.steps) {
+      const marker = activeCommandStep?.id === step.id
+        ? {
+            text: `${options.commandSpinnerFrame} `,
+            color: getStepColor(step),
+            dimColor: !isFocused,
+          }
+        : {
+            text: step.kind === "notice" ? "! " : "- ",
+            color: getStepColor(step),
+            dimColor: !isFocused,
+          };
+      lines.push(...buildWrappedTranscriptLines({
+        idPrefix: makeId("step"),
+        width: options.contentWidth,
+        indent,
+        prefix: [marker],
+        body: [{
+          text: `${step.title}  ${step.summary}`,
+          color: getStepColor(step),
+          dimColor: !isFocused,
+        }],
+      }));
+    }
+  } else if (turn.steps.length > 0) {
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("history"),
+      width: options.contentWidth,
+      indent,
+      body: [{
+        text: `${turn.steps.length} step${turn.steps.length === 1 ? "" : "s"}  completed ${turn.steps.filter((step) => step.status === "completed").length}  failed ${turn.steps.filter((step) => step.status === "failed" || step.status === "timed_out").length}`,
+        dimColor: true,
+      }],
+    }));
+  }
+
+  if (activeCommandStep) {
+    lines.push(buildTranscriptBlankLine(makeId("gap")));
+    lines.push(...buildCommandPanelRenderableLines(
+      activeCommandStep,
+      options.commandViewportHeight,
+      options.contentWidth,
+      indent,
+      options.commandSpinnerFrame,
+      makeId,
+    ));
+  }
+
+  if (turn.inlineBlock) {
+    lines.push(buildTranscriptBlankLine(makeId("gap")));
+    lines.push(...(
+      turn.inlineBlock.kind === "approval"
+        ? buildApprovalRenderableLines(turn.inlineBlock, options.contentWidth, indent, makeId)
+        : buildDiffRenderableLines(turn.inlineBlock, options.contentWidth, indent, makeId)
+    ));
+  }
+
+  if (turn.answerText && showAnswer) {
+    lines.push(buildTranscriptBlankLine(makeId("gap")));
+    lines.push(...renderRichTextToRenderableLines(
+      turn.answerText,
+      "assistant",
+      options.contentWidth,
+      indent,
+      makeId,
+    ));
+  }
+
+  return lines;
+}
+
+function buildCommandPanelRenderableLines(
+  step: RendererToolStep,
+  viewportHeight: number,
+  contentWidth: number,
+  indent: number,
+  spinnerFrame: string,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const visibleLines = step.outputLines.slice(-viewportHeight);
+  const renderedLines = visibleLines.length === 0
+    ? ["(waiting for output)"]
+    : visibleLines;
+  const lines = [
+    ...buildWrappedTranscriptLines({
+      idPrefix: makeId("command"),
+      width: contentWidth,
+      indent,
+      prefix: [{ text: `${spinnerFrame} `, color: "cyan" }],
+      body: [{ text: step.command ?? "command", color: "cyan" }],
+    }),
+    ...buildWrappedTranscriptLines({
+      idPrefix: makeId("command-meta"),
+      width: contentWidth,
+      indent,
+      body: [{
+        text: `cwd: ${step.cwd ?? "."}  category: ${step.category ?? "unknown"}  status: ${formatStepStatus(step)}`,
+        dimColor: true,
+      }],
+    }),
+  ];
+
+  renderedLines.forEach((line) => {
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("command-output"),
+      width: contentWidth,
+      indent,
+      body: [{
+        text: line,
+        ...(line.startsWith("stderr |") ? { color: "redBright" } : {}),
+        dimColor: line === "(waiting for output)" || line.startsWith("stdout |"),
+      }],
+    }));
+  });
+
+  if (step.outputTruncated) {
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("command-truncated"),
+      width: contentWidth,
+      indent,
+      body: [{ text: "Output truncated to the latest 200 lines.", color: "yellowBright" }],
+    }));
+  }
+
+  return lines;
+}
+
+function buildApprovalRenderableLines(
+  block: Extract<RendererAgentTurn["inlineBlock"], { kind: "approval" }>,
+  contentWidth: number,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const lines = [
+    ...renderRichTextToRenderableLines(block.title, "default", contentWidth, indent, makeId),
+  ];
+
+  if (block.subtitle) {
+    lines.push(...renderRichTextToRenderableLines(block.subtitle, "info", contentWidth, indent, makeId));
+  }
+
+  block.options.forEach((option, index) => {
+    const selected = index === block.selectedIndex;
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("approval"),
+      width: contentWidth,
+      indent,
+      prefix: [{
+        text: selected ? "> " : "  ",
+        color: getOverlayToneColor(option.tone),
+        inverse: selected,
+      }],
+      body: [{
+        text: option.label,
+        color: getOverlayToneColor(option.tone),
+        inverse: selected,
+      }],
+    }));
+    lines.push(...renderRichTextToRenderableLines(option.description, "info", contentWidth, indent + 2, makeId));
+  });
+
+  return lines;
+}
+
+function buildDiffRenderableLines(
+  block: Extract<RendererAgentTurn["inlineBlock"], { kind: "diff" }>,
+  contentWidth: number,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const visibleLines = block.lines.slice(
+    block.scrollOffset,
+    block.scrollOffset + block.viewportHeight,
+  );
+  const scrollEnd = Math.min(
+    block.lines.length,
+    block.scrollOffset + block.viewportHeight,
+  );
+  const lines = [
+    ...renderRichTextToRenderableLines(block.title, "default", contentWidth, indent, makeId),
+  ];
+
+  if (block.subtitle) {
+    lines.push(...renderRichTextToRenderableLines(block.subtitle, "info", contentWidth, indent, makeId));
+  }
+
+  lines.push(...renderRichTextToRenderableLines(block.summary, "default", contentWidth, indent, makeId));
+  lines.push(...buildWrappedTranscriptLines({
+    idPrefix: makeId("diff-summary"),
+    width: contentWidth,
+    indent,
+    body: [{
+      text: `Changed ${block.changeSummary.changedLines}  Added ${block.changeSummary.addedLines}  Removed ${block.changeSummary.removedLines}`,
+      color: "yellowBright",
+    }],
+  }));
+
+  if (block.truncated) {
+    lines.push(...renderRichTextToRenderableLines("Preview truncated to the first diff lines.", "warning", contentWidth, indent, makeId));
+  }
+
+  lines.push(...renderRichTextToRenderableLines(
+    `Showing lines ${block.scrollOffset + 1}-${scrollEnd} of ${block.lines.length}`,
+    "info",
+    contentWidth,
+    indent,
+    makeId,
+  ));
+
+  visibleLines.forEach((line) => {
+    const marker = line.kind === "add"
+      ? "+"
+      : line.kind === "remove"
+        ? "-"
+        : " ";
+    const color = line.kind === "add"
+      ? "green"
+      : line.kind === "remove"
+        ? "redBright"
+        : undefined;
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("diff-line"),
+      width: contentWidth,
+      indent,
+      body: [{
+        text: `${marker} ${formatDiffLineNumber(line.oldLineNumber)} ${formatDiffLineNumber(line.newLineNumber)} ${line.text}`,
+        ...(color ? { color } : {}),
+        dimColor: line.kind === "context",
+      }],
+    }));
+  });
+
+  return lines;
+}
+
+function renderRendererLineToRenderableLines(
+  line: RendererLine,
+  contentWidth: number,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  if (line.color || line.dimColor !== undefined) {
+    return buildWrappedTranscriptLines({
+      idPrefix: makeId("system"),
+      width: contentWidth,
+      indent,
+      body: [{
+        text: line.text,
+        ...(line.color ? { color: line.color } : {}),
+        ...(line.dimColor !== undefined ? { dimColor: line.dimColor } : {}),
+      }],
+    });
+  }
+
+  switch (line.kind) {
+    case "section":
+      return buildWrappedTranscriptLines({
+        idPrefix: makeId("system-section"),
+        width: contentWidth,
+        indent,
+        body: [{ text: line.text, bold: true }],
+      });
+    case "error":
+      return [
+        ...buildWrappedTranscriptLines({
+          idPrefix: makeId("system-error"),
+          width: contentWidth,
+          indent,
+          prefix: [{ text: "error: ", color: "redBright", bold: true }],
+          body: [{ text: line.text, color: "redBright" }],
+        }),
+      ];
+    case "warning":
+      return renderRichTextToRenderableLines(line.text, "warning", contentWidth, indent, makeId);
+    case "body":
+      return renderRichTextToRenderableLines(line.text, "default", contentWidth, indent, makeId);
+    case "info":
+    default:
+      return renderRichTextToRenderableLines(line.text, "info", contentWidth, indent, makeId);
+  }
+}
+
+function renderRichTextToRenderableLines(
+  text: string,
+  tone: RichTextTone,
+  contentWidth: number,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const lines: TranscriptRenderableLine[] = [];
+
+  for (const block of parseAssistantRichText(text)) {
+    switch (block.kind) {
+      case "blank":
+        lines.push(buildTranscriptBlankLine(makeId("rich-blank"), indent));
+        break;
+      case "heading":
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("rich-heading"),
+          width: contentWidth,
+          indent,
+          body: mapAssistantSegmentsToChunks(block.segments, {
+            color: getTranscriptHeadingColor(block.level, tone),
+            dimColor: tone === "info",
+            bold: true,
+          }),
+        }));
+        break;
+      case "quote":
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("rich-quote"),
+          width: contentWidth,
+          indent,
+          prefix: [{ text: "> ", color: "magentaBright" }],
+          body: mapAssistantSegmentsToChunks(block.segments, {
+            color: getTranscriptBaseColor(tone),
+            dimColor: tone === "info",
+          }),
+        }));
+        break;
+      case "list_item":
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("rich-list"),
+          width: contentWidth,
+          indent,
+          prefix: [{ text: `${block.marker} `, color: "cyan" }],
+          body: mapAssistantSegmentsToChunks(block.segments, {
+            color: getTranscriptBaseColor(tone),
+            dimColor: tone === "info",
+          }),
+        }));
+        break;
+      case "code_block":
+        lines.push(buildTranscriptLine(makeId("rich-code-fence"), [{ text: `\`\`\`${block.language ?? ""}`, color: "magentaBright" }], indent));
+        for (const codeLine of block.code.split("\n")) {
+          lines.push(buildTranscriptLine(makeId("rich-code-line"), [
+            { text: "| ", color: "magentaBright" },
+            { text: codeLine.length > 0 ? codeLine : " ", color: getTranscriptBaseColor(tone), dimColor: tone === "info" },
+          ], indent));
+        }
+        lines.push(buildTranscriptLine(makeId("rich-code-close"), [{ text: "```", color: "magentaBright" }], indent));
+        break;
+      case "table": {
+        const tableLines = renderMarkdownTableLines({
+          headers: block.headers,
+          rows: block.rows,
+          alignments: block.alignments,
+        }, Math.max(1, contentWidth - indent));
+        tableLines.forEach((tableLine, tableIndex) => {
+          const isBorder = tableIndex === 0 || tableIndex === 2 || tableIndex === tableLines.length - 1;
+          const isHeader = tableIndex === 1;
+          lines.push(buildTranscriptLine(makeId("rich-table"), [{
+            text: tableLine,
+            color: isBorder ? "cyan" : getTranscriptBaseColor(tone),
+            dimColor: tone === "info" && !isBorder,
+            bold: isHeader,
+          }], indent));
+        });
+        break;
+      }
+      case "paragraph":
+      default:
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("rich-paragraph"),
+          width: contentWidth,
+          indent,
+          body: mapAssistantSegmentsToChunks(block.segments, {
+            color: getTranscriptBaseColor(tone),
+            dimColor: tone === "info",
+          }),
+        }));
+        break;
+    }
+  }
+
+  return lines.length > 0 ? lines : [buildTranscriptBlankLine(makeId("rich-empty"), indent)];
+}
+
+function mapAssistantSegmentsToChunks(
+  segments: AssistantInlineSegment[],
+  defaults: Omit<TranscriptRenderableChunk, "text">,
+): TranscriptRenderableChunk[] {
+  return segments.map((segment) => {
+    switch (segment.kind) {
+      case "bold":
+        return {
+          text: segment.text,
+          ...defaults,
+          bold: true,
+        };
+      case "code":
+        return {
+          text: segment.text,
+          color: "magentaBright",
+          dimColor: false,
+          bold: false,
+        };
+      case "text":
+      default:
+        return {
+          text: segment.text,
+          ...defaults,
+        };
+    }
+  });
+}
+
+function buildWrappedTranscriptLines(options: {
+  idPrefix: string;
+  width: number;
+  indent?: number;
+  prefix?: TranscriptRenderableChunk[];
+  body: TranscriptRenderableChunk[];
+}): TranscriptRenderableLine[] {
+  const indent = options.indent ?? 0;
+  const prefix = options.prefix ?? [];
+  const prefixWidth = getTranscriptChunkWidth(prefix);
+  const bodyWidth = Math.max(1, options.width - indent - prefixWidth);
+  const wrappedBodyLines = wrapTranscriptChunks(options.body, bodyWidth);
+  const continuationPrefix = prefixWidth > 0 ? [{ text: " ".repeat(prefixWidth) }] : [];
+
+  return wrappedBodyLines.map((chunks, index) => buildTranscriptLine(
+    `${options.idPrefix}_${index}`,
+    [...(index === 0 ? prefix : continuationPrefix), ...chunks],
+    indent,
+  ));
+}
+
+function wrapTranscriptChunks(
+  chunks: TranscriptRenderableChunk[],
+  width: number,
+): TranscriptRenderableChunk[][] {
+  const safeWidth = Math.max(1, width);
+  const lines: TranscriptRenderableChunk[][] = [[]];
+  let currentWidth = 0;
+
+  for (const chunk of chunks) {
+    for (const character of chunk.text) {
+      const characterWidth = Math.max(1, getDisplayWidth(character));
+      if (currentWidth > 0 && currentWidth + characterWidth > safeWidth) {
+        lines.push([]);
+        currentWidth = 0;
+      }
+
+      appendTranscriptChunk(lines[lines.length - 1] ?? (lines[0] = []), {
+        ...chunk,
+        text: character,
+      });
+      currentWidth += characterWidth;
+    }
+  }
+
+  return lines.map((line) => line.length > 0 ? line : [{ text: " " }]);
+}
+
+function appendTranscriptChunk(
+  line: TranscriptRenderableChunk[],
+  chunk: TranscriptRenderableChunk,
+): void {
+  const previous = line[line.length - 1];
+  if (previous && transcriptChunkStyleEquals(previous, chunk)) {
+    previous.text += chunk.text;
+    return;
+  }
+
+  line.push({ ...chunk });
+}
+
+function transcriptChunkStyleEquals(
+  left: TranscriptRenderableChunk,
+  right: TranscriptRenderableChunk,
+): boolean {
+  return (
+    left.color === right.color &&
+    left.dimColor === right.dimColor &&
+    left.bold === right.bold &&
+    left.inverse === right.inverse
+  );
+}
+
+function getTranscriptChunkWidth(chunks: TranscriptRenderableChunk[]): number {
+  return chunks.reduce((sum, chunk) => sum + getDisplayWidth(chunk.text), 0);
+}
+
+function buildTranscriptLine(
+  id: string,
+  chunks: TranscriptRenderableChunk[],
+  indent = 0,
+): TranscriptRenderableLine {
+  return {
+    id,
+    indent,
+    chunks: chunks.length > 0 ? chunks : [{ text: " " }],
+  };
+}
+
+function buildTranscriptBlankLine(
+  id: string,
+  indent = 0,
+): TranscriptRenderableLine {
+  return buildTranscriptLine(id, [{ text: " " }], indent);
+}
+
+function buildTranscriptHintLine(
+  id: string,
+  text: string,
+): TranscriptRenderableLine {
+  return buildTranscriptLine(id, [{ text, color: "yellow", dimColor: true }]);
+}
+
+function getTranscriptBaseColor(tone: RichTextTone): string {
+  switch (tone) {
+    case "warning":
+      return WARNING_COLOR;
+    case "error":
+      return "redBright";
+    case "assistant":
+    case "info":
+    case "default":
+    default:
+      return "white";
+  }
+}
+
+function getTranscriptHeadingColor(
+  level: number,
+  tone: RichTextTone,
+): string {
+  if (tone === "warning") {
+    return WARNING_COLOR;
+  }
+
+  if (tone === "error") {
+    return "redBright";
+  }
+
+  return level <= 2 ? "cyanBright" : "white";
+}
+
+function buildTranscriptOutput(
+  turns: RendererTurnCard[],
+  options: TranscriptRenderOptions,
+): string {
+  const lines: string[] = [];
+
+  turns.forEach((turn, index) => {
+    if (index > 0) {
+      lines.push("");
+    }
+
+    const turnLines = turn.kind === "system"
+      ? buildSystemTurnTranscriptLines(turn, {
+          isFirst: index === 0,
+          isLatest: index === turns.length - 1,
+          contentWidth: options.contentWidth,
+        })
+      : buildAgentTurnTranscriptLines(turn, {
+          isFirst: index === 0,
+          isLatest: index === turns.length - 1,
+          ...options,
+        });
+
+    lines.push(...turnLines);
+  });
+
+  return lines.join("\n");
+}
+
+function buildSystemTurnTranscriptLines(
+  turn: Extract<RendererTurnCard, { kind: "system" }>,
+  options: {
+    isFirst: boolean;
+    isLatest: boolean;
+    contentWidth: number;
+  },
+): string[] {
+  const indent = options.isLatest ? "" : "  ";
+  return turn.lines.flatMap((line) => renderRendererLineToTranscriptLines(line, options.contentWidth, indent));
+}
+
+function buildAgentTurnTranscriptLines(
+  turn: RendererAgentTurn,
+  options: TranscriptRenderOptions & {
+    isFirst: boolean;
+    isLatest: boolean;
+  },
+): string[] {
+  const lines: string[] = [];
+  const activeCommandStep = [...turn.steps].reverse().find((step) =>
+    step.kind === "command" && step.status === "running"
+  ) ?? null;
+  const isFocused = options.isLatest || turn.status !== "completed";
+  const showLockedPromptStyle =
+    turn.status === "running_tools" || turn.status === "streaming_answer";
+  const showStepDetails = isFocused;
+  const showAnswer = isFocused || turn.answerText.length > 0;
+  const indent = isFocused ? "" : "  ";
+  const promptPrefix = `${showLockedPromptStyle ? `${options.workingSpinnerFrame} ` : ""}> `;
+
+  lines.push(...wrapPrefixedTranscriptLine(promptPrefix, turn.promptText, options.contentWidth, indent));
+
+  if (turn.steps.length > 0 && showStepDetails) {
+    for (const step of turn.steps) {
+      const marker = activeCommandStep?.id === step.id
+        ? `${options.commandSpinnerFrame} `
+        : step.kind === "notice"
+          ? "! "
+          : "- ";
+      lines.push(...wrapPrefixedTranscriptLine(
+        marker,
+        `${step.title}  ${step.summary}`,
+        options.contentWidth,
+        indent,
+      ));
+    }
+  } else if (turn.steps.length > 0) {
+    lines.push(...wrapTranscriptText(
+      `${turn.steps.length} step${turn.steps.length === 1 ? "" : "s"}  completed ${turn.steps.filter((step) => step.status === "completed").length}  failed ${turn.steps.filter((step) => step.status === "failed" || step.status === "timed_out").length}`,
+      options.contentWidth,
+      indent,
+    ));
+  }
+
+  if (activeCommandStep) {
+    lines.push("");
+    lines.push(...buildCommandPanelTranscriptLines(
+      activeCommandStep,
+      options.commandViewportHeight,
+      options.contentWidth,
+      indent,
+      options.commandSpinnerFrame,
+    ));
+  }
+
+  if (turn.inlineBlock) {
+    lines.push("");
+    lines.push(...(
+      turn.inlineBlock.kind === "approval"
+        ? buildApprovalTranscriptLines(turn.inlineBlock, options.contentWidth, indent)
+        : buildDiffTranscriptLines(turn.inlineBlock, options.contentWidth, indent)
+    ));
+  }
+
+  if (turn.answerText && showAnswer) {
+    lines.push("");
+    lines.push(...renderRichTextToTranscriptLines(turn.answerText, options.contentWidth, indent));
+  }
+
+  return lines;
+}
+
+function buildCommandPanelTranscriptLines(
+  step: RendererToolStep,
+  viewportHeight: number,
+  contentWidth: number,
+  indent: string,
+  spinnerFrame: string,
+): string[] {
+  const visibleLines = step.outputLines.slice(-viewportHeight);
+  const renderedLines = visibleLines.length === 0
+    ? ["(waiting for output)"]
+    : visibleLines;
+  const lines = [
+    ...wrapPrefixedTranscriptLine(`${spinnerFrame} `, step.command ?? "command", contentWidth, indent),
+    ...wrapTranscriptText(
+      `cwd: ${step.cwd ?? "."}  category: ${step.category ?? "unknown"}  status: ${formatStepStatus(step)}`,
+      contentWidth,
+      indent,
+    ),
+  ];
+
+  for (const outputLine of renderedLines) {
+    lines.push(...wrapTranscriptText(outputLine, contentWidth, indent));
+  }
+
+  if (step.outputTruncated) {
+    lines.push(...wrapTranscriptText("Output truncated to the latest 200 lines.", contentWidth, indent));
+  }
+
+  return lines;
+}
+
+function buildApprovalTranscriptLines(
+  block: Extract<RendererAgentTurn["inlineBlock"], { kind: "approval" }>,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  const lines = [
+    ...renderRichTextToTranscriptLines(block.title, contentWidth, indent),
+  ];
+
+  if (block.subtitle) {
+    lines.push(...renderRichTextToTranscriptLines(block.subtitle, contentWidth, indent));
+  }
+
+  block.options.forEach((option, index) => {
+    lines.push(...wrapPrefixedTranscriptLine(
+      index === block.selectedIndex ? "> " : "  ",
+      option.label,
+      contentWidth,
+      indent,
+    ));
+    lines.push(...wrapTranscriptText(option.description, contentWidth, `${indent}  `));
+  });
+
+  return lines;
+}
+
+function buildDiffTranscriptLines(
+  block: Extract<RendererAgentTurn["inlineBlock"], { kind: "diff" }>,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  const visibleLines = block.lines.slice(
+    block.scrollOffset,
+    block.scrollOffset + block.viewportHeight,
+  );
+  const scrollEnd = Math.min(
+    block.lines.length,
+    block.scrollOffset + block.viewportHeight,
+  );
+  const lines = [
+    ...renderRichTextToTranscriptLines(block.title, contentWidth, indent),
+  ];
+
+  if (block.subtitle) {
+    lines.push(...renderRichTextToTranscriptLines(block.subtitle, contentWidth, indent));
+  }
+
+  lines.push(...renderRichTextToTranscriptLines(block.summary, contentWidth, indent));
+  lines.push(...wrapTranscriptText(
+    `Changed ${block.changeSummary.changedLines}  Added ${block.changeSummary.addedLines}  Removed ${block.changeSummary.removedLines}`,
+    contentWidth,
+    indent,
+  ));
+
+  if (block.truncated) {
+    lines.push(...wrapTranscriptText("Preview truncated to the first diff lines.", contentWidth, indent));
+  }
+
+  lines.push(...wrapTranscriptText(
+    `Showing lines ${block.scrollOffset + 1}-${scrollEnd} of ${block.lines.length}`,
+    contentWidth,
+    indent,
+  ));
+
+  for (const line of visibleLines) {
+    const marker = line.kind === "add"
+      ? "+"
+      : line.kind === "remove"
+        ? "-"
+        : " ";
+    lines.push(...wrapTranscriptText(
+      `${marker} ${formatDiffLineNumber(line.oldLineNumber)} ${formatDiffLineNumber(line.newLineNumber)} ${line.text}`,
+      contentWidth,
+      indent,
+    ));
+  }
+
+  return lines;
+}
+
+function renderRendererLineToTranscriptLines(
+  line: RendererLine,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  switch (line.kind) {
+    case "section":
+      return wrapTranscriptText(line.text, contentWidth, indent);
+    case "error":
+      return wrapPrefixedTranscriptLine("error: ", line.text, contentWidth, indent);
+    case "warning":
+    case "body":
+    case "info":
+    default:
+      return renderRichTextToTranscriptLines(line.text, contentWidth, indent);
+  }
+}
+
+function renderRichTextToTranscriptLines(
+  text: string,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  const lines: string[] = [];
+  const availableWidth = Math.max(1, contentWidth - getDisplayWidth(indent));
+  const blocks = parseAssistantRichText(text);
+
+  for (const block of blocks) {
+    switch (block.kind) {
+      case "blank":
+        lines.push(indent);
+        break;
+      case "heading":
+        lines.push(...wrapTranscriptText(
+          `${"#".repeat(block.level)} ${inlineSegmentsToPlainText(block.segments)}`,
+          contentWidth,
+          indent,
+        ));
+        break;
+      case "quote":
+        lines.push(...wrapPrefixedTranscriptLine("> ", inlineSegmentsToPlainText(block.segments), contentWidth, indent));
+        break;
+      case "list_item":
+        lines.push(...wrapPrefixedTranscriptLine(`${block.marker} `, inlineSegmentsToPlainText(block.segments), contentWidth, indent));
+        break;
+      case "code_block":
+        lines.push(...wrapTranscriptText(`\`\`\`${block.language ?? ""}`, contentWidth, indent));
+        for (const codeLine of block.code.split("\n")) {
+          lines.push(...wrapPrefixedTranscriptLine("| ", codeLine, contentWidth, indent));
+        }
+        lines.push(...wrapTranscriptText("```", contentWidth, indent));
+        break;
+      case "table":
+        for (const tableLine of renderMarkdownTableLines({
+          headers: block.headers,
+          rows: block.rows,
+          alignments: block.alignments,
+        }, availableWidth)) {
+          lines.push(...wrapTranscriptText(tableLine, contentWidth, indent));
+        }
+        break;
+      case "paragraph":
+      default:
+        lines.push(...wrapTranscriptText(
+          inlineSegmentsToPlainText(block.segments),
+          contentWidth,
+          indent,
+        ));
+        break;
+    }
+  }
+
+  return lines.length === 0 ? [indent] : lines;
+}
+
+function inlineSegmentsToPlainText(
+  segments: Array<{ text: string }>,
+): string {
+  return segments.map((segment) => segment.text).join("");
+}
+
+function wrapPrefixedTranscriptLine(
+  prefix: string,
+  text: string,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  const indentWidth = getDisplayWidth(indent);
+  const prefixWidth = getDisplayWidth(prefix);
+  const availableWidth = Math.max(1, contentWidth - indentWidth - prefixWidth);
+  const wrapped = wrapTerminalText(text, availableWidth);
+
+  return wrapped.map((line, index) => `${indent}${index === 0 ? prefix : " ".repeat(prefix.length)}${line}`);
+}
+
+function wrapTranscriptText(
+  text: string,
+  contentWidth: number,
+  indent: string,
+): string[] {
+  const availableWidth = Math.max(1, contentWidth - getDisplayWidth(indent));
+  return wrapTerminalText(text, availableWidth).map((line) => `${indent}${line}`);
+}
+
+function wrapTerminalText(text: string, width: number): string[] {
+  if (!text) {
+    return [""];
+  }
+
+  const lines: string[] = [];
+  let currentLine = "";
+
+  for (const character of text) {
+    const nextLine = `${currentLine}${character}`;
+    if (getDisplayWidth(nextLine) > width && currentLine.length > 0) {
+      lines.push(currentLine);
+      currentLine = character;
+      continue;
+    }
+
+    currentLine = nextLine;
+  }
+
+  if (currentLine.length > 0) {
+    lines.push(currentLine);
+  }
+
+  return lines.length > 0 ? lines : [""];
+}
+
+function getTranscriptLineColor(line: string): string | undefined {
+  if (line.startsWith("stderr |") || line.startsWith("- ")) {
+    return "redBright";
+  }
+
+  if (line.startsWith("+ ")) {
+    return "green";
+  }
+
+  if (line.startsWith("> ")) {
+    return "cyan";
+  }
+
+  if (line.startsWith("^ ") || line.startsWith("v ")) {
+    return "yellow";
+  }
+
+  return undefined;
+}
+
+function isTranscriptLineDim(line: string): boolean {
+  return (
+    line.startsWith("stdout |") ||
+    line.startsWith("cwd: ") ||
+    line.startsWith("^ ") ||
+    line.startsWith("v ") ||
+    line === "(waiting for output)"
   );
 }
 
@@ -273,13 +1721,14 @@ function HeaderCard(props: { lines: RendererLine[] }): React.JSX.Element {
 function SystemTurn(props: {
   turn: Extract<RendererTurnCard, { kind: "system" }>;
   isLatest: boolean;
+  isFirst: boolean;
 }): React.JSX.Element {
   return (
     <Box
       flexDirection="column"
       borderStyle={props.isLatest ? "round" : undefined}
       borderColor={props.isLatest ? "white" : undefined}
-      marginTop={1}
+      marginTop={props.isFirst ? 0 : 1}
       paddingX={1}
       marginLeft={props.isLatest ? 0 : 2}
     >
@@ -291,6 +1740,7 @@ function SystemTurn(props: {
 function AgentTurn(props: {
   turn: RendererAgentTurn;
   isLatest: boolean;
+  isFirst: boolean;
   commandViewportHeight: number;
   contentWidth: number;
 }): React.JSX.Element {
@@ -312,7 +1762,7 @@ function AgentTurn(props: {
       flexDirection="column"
       borderStyle={isFocused ? "round" : undefined}
       borderColor={isFocused ? getTurnBorderColor(props.turn.status) : undefined}
-      marginTop={1}
+      marginTop={props.isFirst ? 0 : 1}
       paddingX={1}
       marginLeft={isFocused ? 0 : 2}
     >
@@ -569,45 +2019,29 @@ function buildContextDivider(
   meter: RendererContextMeter | null,
   width: number,
 ): React.JSX.Element {
-  if (!meter || meter.limitTokens === null || meter.limitTokens <= 0) {
-    return <Text dimColor>{"-".repeat(width)}</Text>;
+  if (!meter) {
+    return <Text dimColor>{"─".repeat(width)}</Text>;
   }
 
-  const used = meter.usedTokens ?? 0;
-  const limit = meter.limitTokens;
-  const ratio = Math.max(0, Math.min(used / limit, 1));
-  const pct = (ratio * 100).toFixed(ratio >= 0.1 ? 0 : 1);
-  const usedStr = formatCompactTokenCount(used);
-  const limitStr = formatCompactTokenCount(limit);
-  const label = ` context ${usedStr}/${limitStr} (${pct}%) `;
+  const toneProps = getContextToneTextProps(meter.display.tone);
+  const fullLabel = meter.modelLabel
+    ? `${meter.modelLabel} · ctx ${meter.display.usageText} (${meter.display.percentText})`
+    : `ctx ${meter.display.usageText} (${meter.display.percentText})`;
+  const compactLabel = `ctx ${meter.display.usageText} (${meter.display.percentText})`;
+  const fallbackLabel = `ctx ${meter.display.usageText}`;
+  const label = ` ${pickContextDividerLabel(Math.max(1, width - 2), [fullLabel, compactLabel, fallbackLabel])} `;
   const labelWidth = getDisplayWidth(label);
   const remainingDashes = Math.max(0, width - labelWidth);
   const leftDashes = Math.floor(remainingDashes / 2);
   const rightDashes = remainingDashes - leftDashes;
 
-  const color = ratio >= 0.95
-    ? "redBright"
-    : ratio >= 0.85
-      ? "#ff8c42"
-      : "cyan";
-
   return (
     <Text dimColor>
-      {"-".repeat(leftDashes)}
-      <Text color={color} dimColor={false}>{label}</Text>
-      {"-".repeat(rightDashes)}
+      {"─".repeat(leftDashes)}
+      <Text {...toneProps} dimColor={false}>{label}</Text>
+      {"─".repeat(rightDashes)}
     </Text>
   );
-}
-
-function formatCompactTokenCount(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}m`;
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(value % 1_000 === 0 ? 0 : 1)}k`;
-  }
-  return value.toString();
 }
 
 function Composer(props: {
@@ -627,7 +2061,7 @@ function Composer(props: {
       <Box flexDirection="column">
         {contextDivider}
         <Text dimColor color="gray">{fitSingleLine("  ...", availableWidth)}</Text>
-        <Text dimColor>{props.divider}</Text>
+        <Text dimColor>{"─".repeat(availableWidth)}</Text>
       </Box>
     );
   }
@@ -668,7 +2102,7 @@ function Composer(props: {
       {Array.from({ length: paddingCount }, (_, index) => (
         <Text key={`suggestion-pad-${index}`}>{" "}</Text>
       ))}
-      <Text dimColor>{props.divider}</Text>
+      <Text dimColor>{"─".repeat(availableWidth)}</Text>
     </Box>
   );
 }
@@ -829,6 +2263,17 @@ function buildHeaderLayout(lines: RendererLine[]): {
 
 function StyledLine(props: { line: RendererLine }): React.JSX.Element {
   const text = props.line.text;
+  if (props.line.color || props.line.dimColor !== undefined) {
+    return (
+      <Text
+        {...(props.line.color ? { color: props.line.color } : {})}
+        dimColor={props.line.dimColor ?? false}
+      >
+        {text}
+      </Text>
+    );
+  }
+
   switch (props.line.kind) {
     case "section":
       return <Text bold>{text}</Text>;
@@ -848,6 +2293,58 @@ function StyledLine(props: { line: RendererLine }): React.JSX.Element {
     case "info":
     default:
       return <RichText text={text} tone="info" />;
+  }
+}
+
+function pickContextDividerLabel(width: number, labels: string[]): string {
+  for (const label of labels) {
+    if (getDisplayWidth(label) <= width) {
+      return label;
+    }
+  }
+
+  return truncateForTerminal(labels[labels.length - 1] ?? "", Math.max(1, width));
+}
+
+function buildContextBarCells(
+  width: number,
+  ratio: number | null,
+): {
+  filled: string;
+  empty: string;
+} {
+  const clampedWidth = Math.max(0, width);
+  if (clampedWidth === 0) {
+    return { filled: "", empty: "" };
+  }
+
+  const safeRatio = ratio === null ? 0 : Math.max(0, Math.min(ratio, 1));
+  const filledWidth = safeRatio <= 0
+    ? 0
+    : Math.min(clampedWidth, Math.max(1, Math.ceil(clampedWidth * safeRatio)));
+
+  return {
+    filled: "▰".repeat(filledWidth),
+    empty: "▱".repeat(Math.max(0, clampedWidth - filledWidth)),
+  };
+}
+
+function getContextToneTextProps(
+  tone: ContextIndicatorTone,
+): {
+  color?: string;
+  dimColor?: boolean;
+} {
+  switch (tone) {
+    case "notice":
+      return { color: "yellow" };
+    case "warning":
+      return { color: "red" };
+    case "critical":
+      return { color: "redBright" };
+    case "muted":
+    default:
+      return { color: "gray", dimColor: true };
   }
 }
 

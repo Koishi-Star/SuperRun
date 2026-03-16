@@ -49,9 +49,20 @@ function createShellFrame(title: string, lineText: string) {
     title,
     workspaceLines: [{ kind: "info" as const, text: lineText }],
     statusLines: [],
+    noticeLines: [],
     footerLines: [],
     contextMeter: null,
   };
+}
+
+function waitForRender(ms = 30): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function flushWrites(writes: string[]): string {
+  const output = writes.join("");
+  writes.length = 0;
+  return output;
 }
 
 test("interactive renderer groups system output and agent activity into turn cards", {
@@ -536,6 +547,248 @@ test("interactive renderer keeps fast command panels visible for the configured 
       throw new Error("Expected agent turn.");
     }
     assert.equal(snapshot.turns[0].steps[0]?.status, "completed");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer stays visually idle when no spinner is active", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput();
+  const writes: string[] = [];
+  output.on("data", (chunk) => {
+    writes.push(chunk.toString());
+  });
+  const renderer = createInteractiveRenderer({
+    input,
+    output: output as unknown as NodeJS.WriteStream,
+    enableInput: false,
+  });
+
+  try {
+    renderer.setShellFrame(createShellFrame("SuperRun", "Idle shell"));
+    await waitForRender(120);
+    const writeCountAfterSettle = writes.length;
+    await waitForRender(160);
+    assert.equal(writes.length, writeCountAfterSettle);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer updates the prompt without replaying the fullscreen shell", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput();
+  const writes: string[] = [];
+  output.on("data", (chunk) => {
+    writes.push(chunk.toString());
+  });
+  const renderer = createInteractiveRenderer({
+    input,
+    output: output as unknown as NodeJS.WriteStream,
+    enableInput: false,
+  });
+
+  try {
+    renderer.setShellFrame(createShellFrame("SuperRun", "Stable header"));
+    const promptPromise = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: [],
+    });
+    await waitForRender();
+    flushWrites(writes);
+
+    renderer.dispatchInput("a", createKey());
+    await waitForRender();
+
+    const promptUpdate = flushWrites(writes);
+    assert.doesNotMatch(promptUpdate, /\u001B\[2J/);
+    assert.doesNotMatch(promptUpdate, /Stable header/);
+
+    renderer.dispatchInput("c", createKey({ ctrl: true }));
+    assert.equal(await promptPromise, "/exit");
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer animates spinner frames without clearing the terminal", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput();
+  const writes: string[] = [];
+  output.on("data", (chunk) => {
+    writes.push(chunk.toString());
+  });
+  const renderer = createInteractiveRenderer({
+    input,
+    output: output as unknown as NodeJS.WriteStream,
+    enableInput: false,
+  });
+
+  try {
+    renderer.setShellFrame(createShellFrame("SuperRun", "Stable header"));
+    renderer.beginAgentTurn("run tests");
+    renderer.applyToolEvent({
+      kind: "command_execution",
+      phase: "started",
+      command: "npm test",
+      cwd: ".",
+      category: "read",
+      summary: "Running tests",
+    });
+    await waitForRender();
+    flushWrites(writes);
+
+    await waitForRender(120);
+
+    const spinnerUpdate = flushWrites(writes);
+    assert.notEqual(spinnerUpdate.length, 0);
+    assert.doesNotMatch(spinnerUpdate, /\u001B\[2J/);
+    assert.doesNotMatch(spinnerUpdate, /Stable header/);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer scrolls transcript pages without clearing the terminal", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput();
+  const writes: string[] = [];
+  output.on("data", (chunk) => {
+    writes.push(chunk.toString());
+  });
+  const renderer = createInteractiveRenderer({
+    input,
+    output: output as unknown as NodeJS.WriteStream,
+    enableInput: false,
+  });
+
+  try {
+    renderer.setShellFrame(createShellFrame("SuperRun", "Stable header"));
+    renderer.beginAgentTurn("stream a long answer");
+    renderer.appendAssistantChunk(
+      Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"),
+    );
+    await waitForRender();
+    flushWrites(writes);
+
+    renderer.dispatchInput("", createKey({ pageUp: true }));
+    await waitForRender();
+
+    const pageUpdate = flushWrites(writes);
+    assert.doesNotMatch(pageUpdate, /\u001B\[2J/);
+    assert.doesNotMatch(pageUpdate, /Stable header/);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer keeps transcript viewport metrics stable across long streamed answers", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    renderer.beginAgentTurn("summarize the viewport");
+    renderer.appendAssistantChunk(
+      Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"),
+    );
+    renderer.completeActiveTurn();
+
+    await waitForRender();
+
+    const snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, true);
+    assert.ok(snapshot.transcriptViewport.totalLines > snapshot.transcriptViewport.viewportHeight);
+    assert.ok(snapshot.transcriptViewport.hiddenAboveLines > 0);
+    assert.equal(snapshot.transcriptViewport.hiddenBelowLines, 0);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer keeps manual transcript browsing stable while new output arrives", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    renderer.beginAgentTurn("stream a long answer");
+    renderer.appendAssistantChunk(
+      Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+    );
+
+    await waitForRender();
+
+    renderer.dispatchInput("", createKey({ pageUp: true }));
+    let snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, false);
+
+    renderer.appendAssistantChunk("\nline 31\nline 32");
+    await waitForRender();
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, false);
+    assert.ok(snapshot.transcriptViewport.pendingBelowLines >= 2);
+
+    renderer.dispatchInput("", createKey({ end: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, true);
+    assert.equal(snapshot.transcriptViewport.pendingBelowLines, 0);
+
+    renderer.dispatchInput("", createKey({ pageUp: true }));
+    renderer.dispatchInput("", createKey({ escape: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.transcriptViewport.followLatest, true);
+  } finally {
+    renderer.dispose();
+  }
+});
+
+test("interactive renderer keeps slash suggestions ahead of transcript up down scrolling", {
+  concurrency: false,
+}, async () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+
+  try {
+    renderer.beginAgentTurn("generate lots of output");
+    renderer.appendAssistantChunk(
+      Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n"),
+    );
+    await waitForRender();
+
+    const promptPromise = renderer.readPrompt({
+      promptLabel: renderer.promptLabel,
+      workspaceFiles: [],
+    });
+
+    renderer.dispatchInput("", createKey({ pageUp: true }));
+    let snapshot = renderer.getSnapshot();
+    const scrollOffsetBeforeSuggestion = snapshot.transcriptViewport.scrollOffsetLines;
+    assert.equal(snapshot.transcriptViewport.followLatest, false);
+
+    renderer.dispatchInput("/", createKey());
+    renderer.dispatchInput("", createKey({ downArrow: true }));
+    snapshot = renderer.getSnapshot();
+    assert.equal(snapshot.prompt.state.selectedSuggestionIndex, 1);
+    assert.equal(snapshot.transcriptViewport.scrollOffsetLines, scrollOffsetBeforeSuggestion);
+
+    renderer.dispatchInput("c", createKey({ ctrl: true }));
+    assert.equal(await promptPromise, "/exit");
   } finally {
     renderer.dispose();
   }

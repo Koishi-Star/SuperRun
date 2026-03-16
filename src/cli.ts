@@ -106,6 +106,7 @@ import {
   type RendererLine,
   type RendererViewerLine,
 } from "./ui/interactive-renderer.js";
+import { buildContextIndicatorDisplay } from "./ui/context-indicator.js";
 import { buildModePickerChoices } from "./ui/mode-picker.js";
 import { buildKimiBaseURLPickerChoices } from "./ui/kimi-base-url-picker.js";
 import { buildProviderContextPickerChoices } from "./ui/provider-context-picker.js";
@@ -1293,6 +1294,7 @@ function buildInteractiveShellFrame(
   title: string;
   workspaceLines: Array<Omit<RendererLine, "id">>;
   statusLines: Array<Omit<RendererLine, "id">>;
+  noticeLines: Array<Omit<RendererLine, "id">>;
   footerLines: Array<Omit<RendererLine, "id">>;
   contextMeter: RendererContextMeter | null;
 } {
@@ -1302,6 +1304,11 @@ function buildInteractiveShellFrame(
     provider.contextLimitTokens ??
     provider.modelContextTokens ??
     stats.effectiveContextLimitTokens;
+  const contextDisplay = buildContextIndicatorDisplay(
+    stats.currentContextTokens,
+    effectiveContextLimitTokens,
+  );
+  const contextLineColor = getContextIndicatorLineColor(contextDisplay.tone);
   const sessionLabel = state.currentSessionId
     ? formatSessionLabel(state.currentSessionTitle, state.currentSessionId)
     : state.sessionStore.sessions.length === 0
@@ -1324,7 +1331,17 @@ function buildInteractiveShellFrame(
   const statusLines: Array<Omit<RendererLine, "id">> = [
     {
       kind: "info",
-      text: `context ${formatContextUsage(stats.currentContextTokens, effectiveContextLimitTokens)}  saved ${state.sessionStore.sessions.length}  duration ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s`,
+      text: `context  ${contextDisplay.usedText} / ${contextDisplay.limitText}  (${contextDisplay.percentText})`,
+      ...(contextLineColor ? { color: contextLineColor } : {}),
+      dimColor: contextDisplay.tone === "muted",
+    },
+    {
+      kind: "info",
+      text: `saved    ${state.sessionStore.sessions.length}`,
+    },
+    {
+      kind: "info",
+      text: `duration ${formatCommandPanelDurationSeconds(state.minCommandPanelDurationMs)}s`,
     },
     {
       kind: "info",
@@ -1332,11 +1349,11 @@ function buildInteractiveShellFrame(
     },
   ];
 
-  const deleteAreaBanner = getDeleteAreaBannerText(state.deleteAreaStatus);
-  if (deleteAreaBanner) {
+  if (contextDisplay.isNearFull) {
     statusLines.push({
-      kind: "warning",
-      text: deleteAreaBanner,
+      kind: "info",
+      text: 'Context nearly full. Consider "/new" to start fresh.',
+      color: "redBright",
     });
   }
 
@@ -1351,13 +1368,14 @@ function buildInteractiveShellFrame(
     title: "SuperRun",
     workspaceLines,
     statusLines,
+    noticeLines: buildDeleteAreaBannerLines(state),
     footerLines: [
       {
         kind: "body",
         text: "commands /help /provider /model /sessions /new [title] /mode /approvals /duration /system /clear /exit",
       },
     ],
-    contextMeter: buildContextMeter(stats, effectiveContextLimitTokens),
+    contextMeter: buildContextMeter(stats, effectiveContextLimitTokens, provider.model),
   };
 }
 
@@ -3326,6 +3344,7 @@ function formatContextUsage(
 function buildContextMeter(
   stats: ReturnType<typeof getAgentSessionStats>,
   effectiveContextLimitTokens = stats.effectiveContextLimitTokens,
+  modelLabel: string | null = null,
 ): RendererContextMeter | null {
   if (stats.currentContextTokens === null && effectiveContextLimitTokens === null) {
     return null;
@@ -3335,7 +3354,28 @@ function buildContextMeter(
     usedTokens: stats.currentContextTokens,
     limitTokens: effectiveContextLimitTokens,
     source: stats.contextUsageSource,
+    display: buildContextIndicatorDisplay(
+      stats.currentContextTokens,
+      effectiveContextLimitTokens,
+    ),
+    modelLabel,
   };
+}
+
+function getContextIndicatorLineColor(
+  tone: ReturnType<typeof buildContextIndicatorDisplay>["tone"],
+): string | undefined {
+  switch (tone) {
+    case "notice":
+      return "yellow";
+    case "warning":
+      return "red";
+    case "critical":
+      return "redBright";
+    case "muted":
+    default:
+      return "gray";
+  }
 }
 
 function formatTokenCount(value: number | null | undefined): string {

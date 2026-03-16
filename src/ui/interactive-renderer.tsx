@@ -1,6 +1,6 @@
+import { emitKeypressEvents, type Key as ReadlineKey } from "node:readline";
 import type { Writable } from "node:stream";
-import { render, type Instance } from "ink";
-import React from "react";
+import type { Key } from "ink";
 import type {
   CommandApprovalDecision,
   CommandCategory,
@@ -8,6 +8,7 @@ import type {
   WorkspaceEditChangeSummary,
   WorkspaceEditDiffPreviewLine,
 } from "../tools/types.js";
+import type { ContextIndicatorDisplay } from "./context-indicator.js";
 import {
   applySelectedComposerSuggestion,
   backspaceComposerText,
@@ -21,25 +22,31 @@ import {
   syncComposerState,
   type ComposerState,
 } from "./composer-state.js";
-import { InteractiveShell } from "./ink/interactive-shell.js";
+import { renderInteractiveShellDocument } from "./ink/interactive-shell.js";
 import { normalizeInkInput } from "./input-events.js";
+import { createTerminalScreen } from "./terminal-screen.js";
 
 export type RendererLine = {
   id: string;
   kind: "info" | "error" | "warning" | "section" | "body";
   text: string;
+  color?: string;
+  dimColor?: boolean;
 };
 
 export type RendererContextMeter = {
   usedTokens: number | null;
   limitTokens: number | null;
   source: "response" | "estimate" | null;
+  display: ContextIndicatorDisplay;
+  modelLabel: string | null;
 };
 
 export type RendererShellFrame = {
   title: string;
   workspaceLines: RendererLine[];
   statusLines: RendererLine[];
+  noticeLines: RendererLine[];
   footerLines: RendererLine[];
   contextMeter: RendererContextMeter | null;
 };
@@ -204,6 +211,17 @@ export type RendererSystemTurn = {
 
 export type RendererTurnCard = RendererAgentTurn | RendererSystemTurn;
 
+export type RendererTranscriptViewport = {
+  followLatest: boolean;
+  scrollOffsetLines: number;
+  pendingBelowLines: number;
+  totalLines: number;
+  viewportHeight: number;
+  maxScrollOffsetLines: number;
+  hiddenAboveLines: number;
+  hiddenBelowLines: number;
+};
+
 export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
@@ -212,6 +230,7 @@ export type InteractiveRenderer = {
     title: string;
     workspaceLines: Array<Omit<RendererLine, "id">>;
     statusLines: Array<Omit<RendererLine, "id">>;
+    noticeLines: Array<Omit<RendererLine, "id">>;
     footerLines: Array<Omit<RendererLine, "id">>;
     contextMeter?: RendererContextMeter | null;
   }) => void;
@@ -254,6 +273,7 @@ type RendererState = {
   prompt: RendererPrompt;
   inputMode: RendererInputMode;
   overlay: RendererOverlay | null;
+  transcriptViewport: RendererTranscriptViewport;
 };
 
 export type InteractiveRendererSnapshot = {
@@ -263,6 +283,7 @@ export type InteractiveRendererSnapshot = {
   inputMode: RendererInputMode;
   inputActive: boolean;
   overlay: RendererOverlay | null;
+  transcriptViewport: RendererTranscriptViewport;
   statusText: string;
 };
 
@@ -299,13 +320,23 @@ export function createInteractiveRenderer(options: {
   const pendingCommandCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let pendingToolOutputEvents: ToolTurnEvent[] = [];
   let toolOutputFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  let instance: Instance | null = null;
+  // The shell now renders offscreen into a fixed-height document and writes it
+  // through our own line-diff surface. This avoids Ink's fullscreen path,
+  // which clears the terminal whenever output height reaches the TTY height.
+  const screen = createTerminalScreen(options.output);
+  const inputEnabled = options.enableInput ?? true;
   const shouldAnimateAssistantText = options.enableInput ?? true;
+  let spinnerTick = 0;
+  let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+  let mounted = false;
+  let inputAttached = false;
+  let keypressEventsInitialized = false;
   let state: RendererState = {
     shellFrame: {
       title: "SuperRun",
       workspaceLines: [],
       statusLines: [],
+      noticeLines: [],
       footerLines: [],
       contextMeter: null,
     },
@@ -319,47 +350,73 @@ export function createInteractiveRenderer(options: {
     },
     inputMode: "inactive",
     overlay: null,
+    transcriptViewport: createInitialTranscriptViewport(
+      getTranscriptViewportFallbackHeight(options.output),
+    ),
   };
 
   const mount = () => {
-    const node = renderApp();
-    if (instance) {
-      instance.rerender(node);
+    if (mounted) {
+      rerender();
       return;
     }
 
-    instance = render(node, {
-      stdin: options.input,
-      stdout: options.output,
-      stderr: process.stderr,
-      exitOnCtrlC: false,
-      patchConsole: false,
-      maxFps: 30,
-    });
+    mounted = true;
+    attachInput();
+    options.output.on?.("resize", handleResize);
+    rerender();
   };
 
   const rerender = () => {
-    if (!instance) {
+    if (!mounted) {
       return;
     }
 
-    instance.rerender(renderApp());
+    syncSpinnerTimer();
+    const document = renderApp();
+    screen.render(document.output, getShellHeight(options.output));
   };
 
-  const renderApp = () => (
-    <InteractiveShell
-      shellFrame={state.shellFrame}
-      turns={state.turns}
-      prompt={state.prompt}
-      divider={buildDivider(options.output)}
-      inputEnabled={options.enableInput ?? true}
-      inputMode={state.inputMode}
-      overlay={state.overlay}
-      statusText={buildStatusText(state)}
-      commandViewportHeight={getCommandViewportHeight(options.output)}
-      onInput={handleInput}
-    />
-  );
+  const renderApp = () => {
+    const baseProps = {
+      shellFrame: state.shellFrame,
+      turns: state.turns,
+      prompt: state.prompt,
+      divider: buildDivider(options.output),
+      shellHeight: getShellHeight(options.output),
+      inputEnabled,
+      inputMode: state.inputMode,
+      overlay: state.overlay,
+      statusText: buildStatusText(state),
+      commandViewportHeight: getCommandViewportHeight(options.output),
+      transcriptViewport: state.transcriptViewport,
+      transcriptViewportFallbackHeight: getTranscriptViewportFallbackHeight(options.output),
+      onInput: handleInput,
+      onTranscriptViewportChange: () => {},
+    };
+    let document = renderInteractiveShellDocument({
+      ...baseProps,
+      spinnerTick,
+    });
+    const nextViewport = reconcileTranscriptViewport(
+      state.transcriptViewport,
+      document.transcriptViewport,
+    );
+
+    if (!rendererTranscriptViewportEquals(state.transcriptViewport, nextViewport)) {
+      state = {
+        ...state,
+        transcriptViewport: nextViewport,
+      };
+      document = renderInteractiveShellDocument({
+        ...baseProps,
+        transcriptViewport: nextViewport,
+        spinnerTick,
+      });
+    }
+
+    return document;
+  };
 
   const ensureSystemTurn = (): RendererSystemTurn => {
     const lastTurn = state.turns[state.turns.length - 1];
@@ -688,6 +745,10 @@ export function createInteractiveRenderer(options: {
             ...line,
             id: `header_${nextLineId += 1}`,
           })),
+          noticeLines: frame.noticeLines.map((line) => ({
+            ...line,
+            id: `header_${nextLineId += 1}`,
+          })),
           footerLines: frame.footerLines.map((line) => ({
             ...line,
             id: `header_${nextLineId += 1}`,
@@ -813,8 +874,11 @@ export function createInteractiveRenderer(options: {
       state = {
         ...state,
         turns: [],
+        transcriptViewport: createInitialTranscriptViewport(
+          state.transcriptViewport.viewportHeight,
+        ),
       };
-      instance?.clear();
+      screen.clear();
       rerender();
     },
     readPrompt: async ({ promptLabel: nextLabel, workspaceFiles }) => {
@@ -1011,21 +1075,24 @@ export function createInteractiveRenderer(options: {
       inputMode: state.inputMode,
       inputActive: state.inputMode !== "inactive",
       overlay: cloneRendererOverlay(state.overlay),
+      transcriptViewport: cloneRendererTranscriptViewport(state.transcriptViewport),
       statusText: buildStatusText(state),
     }),
     dispatchInput: (inputValue, key) => {
       handleInput(inputValue, key);
     },
     suspend: () => {
-      if (!instance) {
+      if (!mounted) {
         return;
       }
 
-      instance.clear();
-      instance.unmount();
-      instance = null;
+      mounted = false;
+      detachInput();
+      options.output.off?.("resize", handleResize);
+      screen.suspend();
     },
     resume: () => {
+      screen.resume();
       mount();
     },
     dispose: () => {
@@ -1037,14 +1104,93 @@ export function createInteractiveRenderer(options: {
         clearTimeout(assistantAnimationTimer);
         assistantAnimationTimer = null;
       }
-      if (!instance) {
-        return;
+      if (toolOutputFlushTimer) {
+        clearTimeout(toolOutputFlushTimer);
+        toolOutputFlushTimer = null;
       }
-
-      instance.clear();
-      instance.unmount();
-      instance = null;
+      if (spinnerTimer) {
+        clearInterval(spinnerTimer);
+        spinnerTimer = null;
+      }
+      detachInput();
+      options.output.off?.("resize", handleResize);
+      mounted = false;
+      screen.dispose();
     },
+  };
+
+  const handleResize = () => {
+    screen.clear();
+    rerender();
+  };
+
+  const handleTerminalKeypress = (inputValue: string, key: ReadlineKey | undefined) => {
+    handleInput(inputValue, mapReadlineKeyToInkKey(key));
+  };
+
+  const attachInput = () => {
+    if (!inputEnabled || inputAttached) {
+      return;
+    }
+
+    if (!keypressEventsInitialized) {
+      emitKeypressEvents(options.input);
+      keypressEventsInitialized = true;
+    }
+
+    const keypressInput = options.input as NodeJS.ReadStream & {
+      on: (event: "keypress", listener: typeof handleTerminalKeypress) => void;
+      off: (event: "keypress", listener: typeof handleTerminalKeypress) => void;
+    };
+    keypressInput.on("keypress", handleTerminalKeypress);
+    if (options.input.isTTY) {
+      options.input.setRawMode?.(true);
+    }
+    inputAttached = true;
+  };
+
+  const detachInput = () => {
+    if (!inputAttached) {
+      return;
+    }
+
+    const keypressInput = options.input as NodeJS.ReadStream & {
+      on: (event: "keypress", listener: typeof handleTerminalKeypress) => void;
+      off: (event: "keypress", listener: typeof handleTerminalKeypress) => void;
+    };
+    keypressInput.off("keypress", handleTerminalKeypress);
+    if (options.input.isTTY) {
+      options.input.setRawMode?.(false);
+    }
+    inputAttached = false;
+  };
+
+  const syncSpinnerTimer = () => {
+    const hasActiveSpinner = state.turns.some((turn) =>
+      turn.kind === "agent" && (
+        turn.status === "running_tools" ||
+        turn.status === "streaming_answer" ||
+        turn.steps.some((step) => step.kind === "command" && step.status === "running")
+      )
+    );
+
+    if (!hasActiveSpinner) {
+      if (spinnerTimer) {
+        clearInterval(spinnerTimer);
+        spinnerTimer = null;
+      }
+      spinnerTick = 0;
+      return;
+    }
+
+    if (spinnerTimer) {
+      return;
+    }
+
+    spinnerTimer = setInterval(() => {
+      spinnerTick += 1;
+      rerender();
+    }, 80);
   };
 
   const handleInput = (inputValue: string, key: Parameters<typeof normalizeInkInput>[1]) => {
@@ -1064,6 +1210,11 @@ export function createInteractiveRenderer(options: {
 
     if (state.inputMode === "inline") {
       handleInlineInput(event);
+      return;
+    }
+
+    if (state.inputMode === "inactive") {
+      handleTranscriptInput(event);
       return;
     }
 
@@ -1331,6 +1482,16 @@ export function createInteractiveRenderer(options: {
       return;
     }
 
+    if (event.type === "move_page_up") {
+      moveTranscriptViewport(-state.transcriptViewport.viewportHeight);
+      return;
+    }
+
+    if (event.type === "move_page_down") {
+      moveTranscriptViewport(state.transcriptViewport.viewportHeight);
+      return;
+    }
+
     switch (event.type) {
       case "backspace":
         nextComposerState = backspaceComposerText(nextComposerState, promptWorkspaceFiles);
@@ -1353,9 +1514,13 @@ export function createInteractiveRenderer(options: {
         );
         break;
       case "move_home":
-        nextComposerState = moveComposerCursor(nextComposerState, 0, promptWorkspaceFiles);
-        break;
+        jumpTranscriptViewportToTop();
+        return;
       case "move_end":
+        if (!state.transcriptViewport.followLatest) {
+          followTranscriptViewportLatest();
+          return;
+        }
         nextComposerState = moveComposerCursor(
           nextComposerState,
           nextComposerState.buffer.length,
@@ -1366,6 +1531,7 @@ export function createInteractiveRenderer(options: {
         if (nextComposerState.suggestions.length > 0) {
           nextComposerState = moveComposerSuggestionSelection(nextComposerState, "up", promptWorkspaceFiles);
         } else {
+          moveTranscriptViewport(-1);
           return;
         }
         break;
@@ -1373,12 +1539,20 @@ export function createInteractiveRenderer(options: {
         if (nextComposerState.suggestions.length > 0) {
           nextComposerState = moveComposerSuggestionSelection(nextComposerState, "down", promptWorkspaceFiles);
         } else {
+          moveTranscriptViewport(1);
           return;
         }
         break;
       case "cancel":
-        nextComposerState = clearComposerError(nextComposerState, promptWorkspaceFiles);
-        break;
+        if (nextComposerState.errorMessage) {
+          nextComposerState = clearComposerError(nextComposerState, promptWorkspaceFiles);
+          break;
+        }
+
+        if (!state.transcriptViewport.followLatest) {
+          followTranscriptViewportLatest();
+        }
+        return;
       case "apply_suggestion":
         nextComposerState = applySelectedComposerSuggestion(nextComposerState, promptWorkspaceFiles);
         break;
@@ -1401,6 +1575,107 @@ export function createInteractiveRenderer(options: {
 
   mount();
   return renderer;
+
+  function handleTranscriptInput(event: ReturnType<typeof normalizeInkInput>) {
+    if (!event) {
+      return;
+    }
+
+    switch (event.type) {
+      case "move_up":
+        moveTranscriptViewport(-1);
+        return;
+      case "move_down":
+        moveTranscriptViewport(1);
+        return;
+      case "move_page_up":
+        moveTranscriptViewport(-state.transcriptViewport.viewportHeight);
+        return;
+      case "move_page_down":
+        moveTranscriptViewport(state.transcriptViewport.viewportHeight);
+        return;
+      case "move_home":
+        jumpTranscriptViewportToTop();
+        return;
+      case "move_end":
+      case "cancel":
+        followTranscriptViewportLatest();
+        return;
+      default:
+        return;
+    }
+  }
+
+  function moveTranscriptViewport(delta: number) {
+    const current = state.transcriptViewport;
+    const currentOffset = current.followLatest
+      ? current.maxScrollOffsetLines
+      : current.scrollOffsetLines;
+    const nextOffset = clamp(currentOffset + delta, 0, current.maxScrollOffsetLines);
+
+    if (current.followLatest && nextOffset === current.maxScrollOffsetLines) {
+      return;
+    }
+
+    const nextViewport: RendererTranscriptViewport = {
+      ...current,
+      followLatest: false,
+      scrollOffsetLines: nextOffset,
+      pendingBelowLines: delta > 0
+        ? Math.max(0, current.pendingBelowLines - (nextOffset - currentOffset))
+        : current.pendingBelowLines,
+    };
+
+    if (rendererTranscriptViewportEquals(current, nextViewport)) {
+      return;
+    }
+
+    state = {
+      ...state,
+      transcriptViewport: nextViewport,
+    };
+    rerender();
+  }
+
+  function jumpTranscriptViewportToTop() {
+    const current = state.transcriptViewport;
+    const nextViewport: RendererTranscriptViewport = {
+      ...current,
+      followLatest: false,
+      scrollOffsetLines: 0,
+    };
+
+    if (rendererTranscriptViewportEquals(current, nextViewport)) {
+      return;
+    }
+
+    state = {
+      ...state,
+      transcriptViewport: nextViewport,
+    };
+    rerender();
+  }
+
+  function followTranscriptViewportLatest() {
+    const current = state.transcriptViewport;
+    const nextViewport: RendererTranscriptViewport = {
+      ...current,
+      followLatest: true,
+      scrollOffsetLines: current.maxScrollOffsetLines,
+      pendingBelowLines: 0,
+      hiddenBelowLines: 0,
+    };
+
+    if (rendererTranscriptViewportEquals(current, nextViewport)) {
+      return;
+    }
+
+    state = {
+      ...state,
+      transcriptViewport: nextViewport,
+    };
+    rerender();
+  }
 }
 
 function applyToolEventToTurn(
@@ -1660,6 +1935,7 @@ function cloneRendererShellFrame(frame: RendererShellFrame): RendererShellFrame 
     title: frame.title,
     workspaceLines: frame.workspaceLines.map(cloneRendererLine),
     statusLines: frame.statusLines.map(cloneRendererLine),
+    noticeLines: frame.noticeLines.map(cloneRendererLine),
     footerLines: frame.footerLines.map(cloneRendererLine),
     contextMeter: frame.contextMeter ? { ...frame.contextMeter } : null,
   };
@@ -1711,6 +1987,12 @@ function cloneRendererOverlay(
     ...overlay,
     lines: [...overlay.lines],
   };
+}
+
+function cloneRendererTranscriptViewport(
+  viewport: RendererTranscriptViewport,
+): RendererTranscriptViewport {
+  return { ...viewport };
 }
 
 function moveOverlaySelection(
@@ -1810,6 +2092,13 @@ function buildStatusText(state: RendererState): string {
     return "Enter accept command  Tab accept  Up/Down choose  Esc clear";
   }
 
+  if (!state.transcriptViewport.followLatest) {
+    const pendingText = state.transcriptViewport.pendingBelowLines > 0
+      ? `  ${state.transcriptViewport.pendingBelowLines} new below`
+      : "";
+    return `Browsing transcript  ${state.transcriptViewport.hiddenBelowLines} lines from latest  PgUp/PgDn scroll  End/Esc follow latest${pendingText}`;
+  }
+
   if (state.inputMode === "prompt") {
     return "Enter submit  Ctrl+C exit";
   }
@@ -1823,7 +2112,7 @@ function buildDivider(output: Writable): string {
       ? output.columns
       : 80;
   const width = Math.min(Math.max(columns, 40), 120);
-  return "-".repeat(width);
+  return "─".repeat(width);
 }
 
 function getDiffViewportHeight(output: Writable): number {
@@ -1855,4 +2144,107 @@ function getCommandViewportHeight(output: Writable): number {
 
 function formatChangeSummary(summary: WorkspaceEditChangeSummary): string {
   return `changed ${summary.changedLines}, added ${summary.addedLines}, removed ${summary.removedLines}`;
+}
+
+function getShellHeight(output: Writable): number {
+  const rows =
+    "rows" in output && typeof output.rows === "number"
+      ? output.rows
+      : 24;
+
+  return Math.max(12, rows);
+}
+
+function getTranscriptViewportFallbackHeight(output: Writable): number {
+  return Math.max(4, getShellHeight(output) - 10);
+}
+
+function createInitialTranscriptViewport(
+  viewportHeight: number,
+): RendererTranscriptViewport {
+  return {
+    followLatest: true,
+    scrollOffsetLines: 0,
+    pendingBelowLines: 0,
+    totalLines: 0,
+    viewportHeight: Math.max(1, viewportHeight),
+    maxScrollOffsetLines: 0,
+    hiddenAboveLines: 0,
+    hiddenBelowLines: 0,
+  };
+}
+
+function rendererTranscriptViewportEquals(
+  left: RendererTranscriptViewport,
+  right: RendererTranscriptViewport,
+): boolean {
+  return (
+    left.followLatest === right.followLatest &&
+    left.scrollOffsetLines === right.scrollOffsetLines &&
+    left.pendingBelowLines === right.pendingBelowLines &&
+    left.totalLines === right.totalLines &&
+    left.viewportHeight === right.viewportHeight &&
+    left.maxScrollOffsetLines === right.maxScrollOffsetLines &&
+    left.hiddenAboveLines === right.hiddenAboveLines &&
+    left.hiddenBelowLines === right.hiddenBelowLines
+  );
+}
+
+function reconcileTranscriptViewport(
+  current: RendererTranscriptViewport,
+  metrics: Pick<
+    RendererTranscriptViewport,
+    | "totalLines"
+    | "viewportHeight"
+    | "maxScrollOffsetLines"
+    | "hiddenAboveLines"
+    | "hiddenBelowLines"
+    | "scrollOffsetLines"
+  >,
+): RendererTranscriptViewport {
+  const lineDelta = Math.max(0, metrics.totalLines - current.totalLines);
+
+  return {
+    ...current,
+    totalLines: metrics.totalLines,
+    viewportHeight: metrics.viewportHeight,
+    maxScrollOffsetLines: metrics.maxScrollOffsetLines,
+    hiddenAboveLines: metrics.hiddenAboveLines,
+    hiddenBelowLines: metrics.hiddenBelowLines,
+    scrollOffsetLines: current.followLatest
+      ? metrics.maxScrollOffsetLines
+      : clamp(current.scrollOffsetLines, 0, metrics.maxScrollOffsetLines),
+    pendingBelowLines: current.followLatest
+      ? 0
+      : Math.min(current.pendingBelowLines + lineDelta, metrics.hiddenBelowLines),
+  };
+}
+
+function mapReadlineKeyToInkKey(key: ReadlineKey | undefined): Key {
+  return {
+    upArrow: key?.name === "up",
+    downArrow: key?.name === "down",
+    leftArrow: key?.name === "left",
+    rightArrow: key?.name === "right",
+    pageDown: key?.name === "pagedown",
+    pageUp: key?.name === "pageup",
+    home: key?.name === "home",
+    end: key?.name === "end",
+    return: key?.name === "return" || key?.name === "enter",
+    escape: key?.name === "escape",
+    ctrl: key?.ctrl ?? false,
+    shift: key?.shift ?? false,
+    tab: key?.name === "tab",
+    backspace: key?.name === "backspace",
+    delete: key?.name === "delete",
+    meta: key?.meta ?? false,
+    super: false,
+    hyper: false,
+    capsLock: false,
+    numLock: false,
+  };
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), maximum);
 }
