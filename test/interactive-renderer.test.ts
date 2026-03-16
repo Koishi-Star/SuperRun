@@ -793,3 +793,30 @@ test("interactive renderer keeps slash suggestions ahead of transcript up down s
     renderer.dispose();
   }
 });
+
+test("interactive renderer exposes Esc cancellation while an AI request is active", {
+  concurrency: false,
+}, () => {
+  const input = new FakeTTYInput() as unknown as NodeJS.ReadStream;
+  const output = new FakeTTYOutput() as unknown as NodeJS.WriteStream;
+  const renderer = createInteractiveRenderer({ input, output, enableInput: false });
+  let cancelCount = 0;
+
+  try {
+    renderer.beginAgentTurn("stream response");
+    renderer.setActiveRequestCancel(() => {
+      cancelCount += 1;
+    });
+
+    let snapshot = renderer.getSnapshot();
+    assert.match(snapshot.statusText, /Esc cancel request/);
+
+    renderer.dispatchInput("", createKey({ escape: true }));
+
+    snapshot = renderer.getSnapshot();
+    assert.equal(cancelCount, 1);
+    assert.doesNotMatch(snapshot.statusText, /Esc cancel request/);
+  } finally {
+    renderer.dispose();
+  }
+});

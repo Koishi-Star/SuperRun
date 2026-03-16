@@ -19,6 +19,7 @@ import type { ToolExecutionContext } from "../tools/types.js";
 
 export type AgentTurnOptions = ChatOptions & {
   toolContext?: ToolExecutionContext;
+  onModelRequestStateChange?: (active: boolean) => void;
 };
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
 // Coding-oriented models often need several inspect/edit/verify rounds before
@@ -111,6 +112,7 @@ export async function runAgentTurn(
   if (!trimmedPrompt) {
     throw new Error("User prompt must not be empty.");
   }
+  throwIfAborted(options?.abortSignal);
 
   const providerConfig = options?.providerConfig ??
     resolveProviderRuntimeConfig(resolveProviderSettings());
@@ -201,7 +203,9 @@ async function resolveAgentReply(
   let lastUsage: ProviderUsage | undefined;
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+    throwIfAborted(options?.abortSignal);
     const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
+    options?.onModelRequestStateChange?.(true);
     const response = await chatOnce(
       buildRoundMessages(messages, round, isFinalAnswerAttempt),
       {
@@ -212,11 +216,17 @@ async function resolveAgentReply(
         ...(options?.providerConfig
           ? { providerConfig: options.providerConfig }
           : {}),
+        ...(options?.abortSignal
+          ? { abortSignal: options.abortSignal }
+          : {}),
         // The last pass disables tools so the model has to summarize or explain
         // the limit instead of looping forever through more reads or commands.
         ...(isFinalAnswerAttempt ? {} : { tools }),
       },
-    );
+    ).finally(() => {
+      options?.onModelRequestStateChange?.(false);
+    });
+    throwIfAborted(options?.abortSignal);
     if (response.usage) {
       lastUsage = response.usage;
     }
@@ -257,6 +267,7 @@ async function resolveAgentReply(
     });
 
     for (const toolCall of response.toolCalls) {
+      throwIfAborted(options?.abortSignal);
       const toolResult = await executeAgentTool(
         toolCall,
         mode,
@@ -417,4 +428,21 @@ function trimOldestConversationTurn(
     history: history.slice(sliceStart),
     trimmedTurns: 1,
   };
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) {
+    return;
+  }
+
+  const reason = signal.reason;
+  if (reason instanceof Error) {
+    throw reason;
+  }
+
+  throw new Error(
+    typeof reason === "string" && reason.trim()
+      ? reason
+      : "Cancelled the active AI request.",
+  );
 }

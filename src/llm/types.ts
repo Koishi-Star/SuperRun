@@ -59,6 +59,7 @@ export type ChatOptions = {
   onChunk?: (chunk: string) => void;
   tools?: ToolDefinition[];
   providerConfig?: ProviderRuntimeConfig;
+  abortSignal?: AbortSignal;
 };
 
 export interface LLMClient {

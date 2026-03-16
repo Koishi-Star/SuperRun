@@ -24,6 +24,7 @@ export type MockChatResponse = {
   content?: string;
   toolCalls?: MockToolCall[];
   reasoningContent?: string;
+  delayMs?: number;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;
@@ -68,6 +69,10 @@ export async function startMockOpenAIServer(responses: MockResponse[]) {
         ? { content: payload }
         : payload;
     callIndex += 1;
+
+    if ((resolvedResponse.delayMs ?? 0) > 0) {
+      await new Promise((resolve) => setTimeout(resolve, resolvedResponse.delayMs));
+    }
 
     if (request.stream) {
       res.writeHead(200, {

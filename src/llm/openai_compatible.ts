@@ -107,10 +107,14 @@ export class OpenAICompatibleClient implements LLMClient {
     }
 
     if (shouldStream) {
-      return this.streamChat(requestBody, onChunk);
+      return this.streamChat(requestBody, onChunk, options?.abortSignal);
     }
 
-    const response = await this.request("chat/completions", requestBody);
+    const response = await this.request(
+      "chat/completions",
+      requestBody,
+      options?.abortSignal,
+    );
 
     let data: OpenAICompatibleResponse;
 
@@ -151,8 +155,9 @@ export class OpenAICompatibleClient implements LLMClient {
   private async streamChat(
     payload: Record<string, unknown>,
     onChunk: (chunk: string) => void,
+    signal?: AbortSignal,
   ): Promise<ChatResponse> {
-    const response = await this.requestStream("chat/completions", payload);
+    const response = await this.requestStream("chat/completions", payload, signal);
     try {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         const body = await response.response.text();
@@ -227,6 +232,13 @@ export class OpenAICompatibleClient implements LLMClient {
             onChunk(delta);
           }
         }
+      } catch (error) {
+        const abortError = getAbortError(response.signal, error);
+        if (abortError) {
+          throw abortError;
+        }
+
+        throw error;
       } finally {
         reader.releaseLock();
       }
@@ -247,11 +259,13 @@ export class OpenAICompatibleClient implements LLMClient {
   private async request(
     pathname: string,
     payload: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{ statusCode: number; body: string }> {
     const url = new URL(pathname.replace(/^\/+/, ""), `${this.baseURL}/`);
     const body = JSON.stringify(payload);
 
     const controller = new AbortController();
+    const requestSignal = composeAbortSignal(controller.signal, signal);
     const timer = setTimeout(() => {
       controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms.`));
     }, this.timeoutMs);
@@ -265,11 +279,16 @@ export class OpenAICompatibleClient implements LLMClient {
           Authorization: `Bearer ${this.apiKey}`,
         },
         body,
-        signal: controller.signal,
+        signal: requestSignal,
         // @ts-expect-error — undici dispatcher is not in the standard fetch types
         dispatcher: buildProviderDispatcher(),
       });
     } catch (err) {
+      const abortError = getAbortError(requestSignal, err);
+      if (abortError) {
+        throw abortError;
+      }
+
       const cause = err instanceof Error && "cause" in err ? (err as NodeJS.ErrnoException & { cause?: unknown }).cause : undefined;
       const causeMsg = cause instanceof Error ? ` (cause: ${cause.message})` : cause ? ` (cause: ${String(cause)})` : "";
       const msg = err instanceof Error ? err.message : String(err);
@@ -278,22 +297,36 @@ export class OpenAICompatibleClient implements LLMClient {
       clearTimeout(timer);
     }
 
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      const abortError = getAbortError(requestSignal, error);
+      if (abortError) {
+        throw abortError;
+      }
+
+      throw error;
+    }
+
     return { statusCode: response.status, body: text };
   }
 
   private async requestStream(
     pathname: string,
     payload: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<{
     statusCode: number;
     response: Response;
     timer: ReturnType<typeof setTimeout>;
+    signal: AbortSignal;
   }> {
     const url = new URL(pathname.replace(/^\/+/, ""), `${this.baseURL}/`);
     const body = JSON.stringify(payload);
 
     const controller = new AbortController();
+    const requestSignal = composeAbortSignal(controller.signal, signal);
     const timer = setTimeout(() => {
       controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms.`));
     }, this.timeoutMs);
@@ -306,14 +339,19 @@ export class OpenAICompatibleClient implements LLMClient {
           Authorization: `Bearer ${this.apiKey}`,
         },
         body,
-        signal: controller.signal,
+        signal: requestSignal,
         // @ts-expect-error undici dispatcher is not in the standard fetch types
         dispatcher: buildProviderDispatcher(),
       });
 
-      return { statusCode: response.status, response, timer };
+      return { statusCode: response.status, response, timer, signal: requestSignal };
     } catch (err) {
       clearTimeout(timer);
+      const abortError = getAbortError(requestSignal, err);
+      if (abortError) {
+        throw abortError;
+      }
+
       const cause =
         err instanceof Error && "cause" in err
           ? (err as NodeJS.ErrnoException & { cause?: unknown }).cause
@@ -494,4 +532,39 @@ function getErrorMessage(body: string, statusCode: number): string {
 
 function normalizeUsageTokenValue(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : null;
+}
+
+function composeAbortSignal(
+  timeoutSignal: AbortSignal,
+  externalSignal: AbortSignal | undefined,
+): AbortSignal {
+  if (!externalSignal) {
+    return timeoutSignal;
+  }
+
+  return AbortSignal.any([timeoutSignal, externalSignal]);
+}
+
+function getAbortError(
+  signal: AbortSignal,
+  error: unknown,
+): Error | null {
+  if (!signal.aborted) {
+    return null;
+  }
+
+  const reason = signal.reason;
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  if (typeof reason === "string" && reason.trim()) {
+    return new Error(reason);
+  }
+
+  if (error instanceof Error && error.name === "AbortError") {
+    return new Error("Cancelled the active AI request.");
+  }
+
+  return new Error("Cancelled the active AI request.");
 }

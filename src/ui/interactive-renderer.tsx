@@ -225,6 +225,7 @@ export type RendererTranscriptViewport = {
 export type InteractiveRenderer = {
   promptLabel: string;
   editorPromptLabel: string;
+  setActiveRequestCancel: (cancel: (() => void) | null) => void;
   setMinimumCommandPanelDurationMs: (durationMs: number) => void;
   setShellFrame: (frame: {
     title: string;
@@ -274,6 +275,7 @@ type RendererState = {
   inputMode: RendererInputMode;
   overlay: RendererOverlay | null;
   transcriptViewport: RendererTranscriptViewport;
+  canCancelActiveRequest: boolean;
 };
 
 export type InteractiveRendererSnapshot = {
@@ -310,6 +312,7 @@ export function createInteractiveRenderer(options: {
   let inlineApprovalResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffResolver: ((value: CommandApprovalDecision) => void) | null = null;
   let diffReviewResolver: (() => void) | null = null;
+  let activeRequestCancel: (() => void) | null = null;
   let assistantAnimationTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingAssistantChunks: string[] = [];
   let pendingTurnStatus: RendererAgentTurn["status"] | null = null;
@@ -353,6 +356,7 @@ export function createInteractiveRenderer(options: {
     transcriptViewport: createInitialTranscriptViewport(
       getTranscriptViewportFallbackHeight(options.output),
     ),
+    canCancelActiveRequest: false,
   };
 
   const mount = () => {
@@ -689,6 +693,29 @@ export function createInteractiveRenderer(options: {
     resolver?.(value);
   };
 
+  const setActiveRequestCancel = (cancel: (() => void) | null) => {
+    activeRequestCancel = cancel;
+    if (state.canCancelActiveRequest === Boolean(cancel)) {
+      return;
+    }
+
+    state = {
+      ...state,
+      canCancelActiveRequest: Boolean(cancel),
+    };
+    rerender();
+  };
+
+  const cancelActiveRequest = () => {
+    const cancel = activeRequestCancel;
+    if (!cancel) {
+      return;
+    }
+
+    setActiveRequestCancel(null);
+    cancel();
+  };
+
   const resolveInlineApproval = (value: CommandApprovalDecision) => {
     const resolver = inlineApprovalResolver;
     inlineApprovalResolver = null;
@@ -729,6 +756,7 @@ export function createInteractiveRenderer(options: {
   const renderer: InteractiveRenderer = {
     promptLabel,
     editorPromptLabel,
+    setActiveRequestCancel,
     setMinimumCommandPanelDurationMs: (durationMs) => {
       minCommandPanelDurationMs = normalizeMinimumCommandPanelDurationMs(durationMs);
     },
@@ -1200,6 +1228,15 @@ export function createInteractiveRenderer(options: {
       promptCursorIndex: state.prompt.state.cursorIndex,
     });
     if (!event) {
+      return;
+    }
+
+    if (
+      state.inputMode === "inactive" &&
+      event.type === "cancel" &&
+      state.canCancelActiveRequest
+    ) {
+      cancelActiveRequest();
       return;
     }
 
@@ -2096,14 +2133,15 @@ function buildStatusText(state: RendererState): string {
     const pendingText = state.transcriptViewport.pendingBelowLines > 0
       ? `  ${state.transcriptViewport.pendingBelowLines} new below`
       : "";
-    return `Browsing transcript  ${state.transcriptViewport.hiddenBelowLines} lines from latest  PgUp/PgDn scroll  End/Esc follow latest${pendingText}`;
+    const cancelText = state.canCancelActiveRequest ? "  Esc cancel request" : "";
+    return `Browsing transcript  ${state.transcriptViewport.hiddenBelowLines} lines from latest  PgUp/PgDn scroll  End/Esc follow latest${pendingText}${cancelText}`;
   }
 
   if (state.inputMode === "prompt") {
     return "Enter submit  Ctrl+C exit";
   }
 
-  return "Agent is working";
+  return state.canCancelActiveRequest ? "Agent is working  Esc cancel request" : "Agent is working";
 }
 
 function buildDivider(output: Writable): string {

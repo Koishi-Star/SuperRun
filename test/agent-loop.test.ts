@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -168,6 +171,65 @@ test("runAgentTurn prefers official usage when the provider returns token counts
   } finally {
     restoreEnv(previousEnv);
     await server.close();
+  }
+});
+
+test("runAgentTurn aborts cleanly without mutating session history", async () => {
+  const server = createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404).end();
+      return;
+    }
+
+    for await (const _chunk of req) {
+      // Fully consume the request body before delaying the response.
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      Connection: "keep-alive",
+      "Cache-Control": "no-cache",
+    });
+    res.write('data: {"choices":[{"delta":{"content":"late answer"}}]}\n\n');
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as AddressInfo;
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = `http://${address.address}:${address.port}`;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const controller = new AbortController();
+    setTimeout(() => {
+      controller.abort(new Error("Cancelled the active AI request."));
+    }, 50);
+
+    await assert.rejects(
+      () => runAgentTurn(session, "Hello", {
+        abortSignal: controller.signal,
+        onChunk: () => {},
+      }),
+      /Cancelled the active AI request\./,
+    );
+    assert.deepEqual(session.history, []);
+  } finally {
+    restoreEnv(previousEnv);
+    server.close();
+    await once(server, "close");
   }
 });
 

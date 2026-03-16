@@ -1075,10 +1075,21 @@ async function handleInteractivePrompt(
   const turnEvents: ToolTurnEvent[] = [];
 
   let reply = "";
+  const requestAbortController = ui ? new AbortController() : null;
   try {
     const result = await runAgentTurn(session, prompt, {
       providerConfig: getActiveProviderConfig(state),
       toolContext: createToolExecutionContext(session, state, ui, turnEvents),
+      ...(requestAbortController
+        ? { abortSignal: requestAbortController.signal }
+        : {}),
+      onModelRequestStateChange: (active) => {
+        ui?.setActiveRequestCancel(active
+          ? () => {
+              requestAbortController?.abort(new Error("Cancelled the active AI request."));
+            }
+          : null);
+      },
       onChunk: (chunk) => {
         if (ui) {
           ui.appendAssistantChunk(chunk);
@@ -1103,6 +1114,8 @@ async function handleInteractivePrompt(
     }
 
     throw new Error(message);
+  } finally {
+    ui?.setActiveRequestCancel(null);
   }
 
   applyTurnEventsToSession(state, turnEvents);
