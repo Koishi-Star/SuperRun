@@ -13,6 +13,10 @@ import { requestUserInputTool } from "./request_user_input.js";
 import { restoreDeletedFileTool } from "./restore_deleted_file.js";
 import { runCommandTool } from "./run_command.js";
 import { searchWorkspaceTool } from "./search_workspace.js";
+import { getSymbolsTool } from "./get_symbols.js";
+import { getSymbolSourceTool } from "./get_symbol_source.js";
+import { replaceSymbolBodyTool } from "./replace_symbol_body.js";
+import { runValidationTool } from "./run_validation.js";
 import type { ToolExecutionContext } from "./types.js";
 import { updatePlanTool } from "./update_plan.js";
 import { writeFileTool } from "./write_file.js";
@@ -23,6 +27,10 @@ const defaultModeBaseTools = [
   searchWorkspaceTool,
   runCommandTool,
   readFileTool,
+  getSymbolsTool,
+  getSymbolSourceTool,
+  replaceSymbolBodyTool,
+  runValidationTool,
   writeFileTool,
   replaceLinesTool,
   insertLinesTool,
@@ -37,6 +45,8 @@ const strictModeTools = [
   listFilesTool,
   searchWorkspaceTool,
   readFileTool,
+  getSymbolsTool,
+  getSymbolSourceTool,
   listDeletedFilesTool,
 ] as const;
 const planModeBaseTools = [listFilesTool, searchWorkspaceTool, readFileTool] as const;

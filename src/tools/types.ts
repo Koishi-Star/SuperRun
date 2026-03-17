@@ -42,6 +42,7 @@ export type WorkspaceEditAssessment = {
     | "write_file"
     | "replace_lines"
     | "insert_lines"
+    | "replace_symbol_body"
     | "delete_file"
     | "restore_deleted_file"
     | "purge_deleted_file"
