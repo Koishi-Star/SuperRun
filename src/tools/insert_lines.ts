@@ -18,7 +18,7 @@ export const insertLinesTool = {
   definition: {
     name: "insert_lines",
     description:
-      "Insert lines before a 1-based line number in an existing UTF-8 text file. Use before_line = total_lines + 1 to append.",
+      "Insert lines before a 1-based line number in an existing UTF-8 text file. Use before_line = total_lines + 1 to append. WARNING: Do NOT use this on TypeScript or JavaScript files — use insert_before_symbol or insert_after_symbol instead. This tool is only for non-TS/JS files (JSON, markdown, config, plain text) or when no named symbol anchor exists.",
     parameters: {
       type: "object",
       properties: {

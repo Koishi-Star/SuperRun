@@ -16,6 +16,7 @@ import { searchWorkspaceTool } from "./search_workspace.js";
 import { getSymbolsTool } from "./get_symbols.js";
 import { getSymbolSourceTool } from "./get_symbol_source.js";
 import { replaceSymbolBodyTool } from "./replace_symbol_body.js";
+import { insertBeforeSymbolTool, insertAfterSymbolTool } from "./insert_near_symbol.js";
 import { runValidationTool } from "./run_validation.js";
 import type { ToolExecutionContext } from "./types.js";
 import { updatePlanTool } from "./update_plan.js";
@@ -30,6 +31,8 @@ const defaultModeBaseTools = [
   getSymbolsTool,
   getSymbolSourceTool,
   replaceSymbolBodyTool,
+  insertBeforeSymbolTool,
+  insertAfterSymbolTool,
   runValidationTool,
   writeFileTool,
   replaceLinesTool,

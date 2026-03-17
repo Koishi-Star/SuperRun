@@ -19,7 +19,7 @@ export const replaceLinesTool = {
   definition: {
     name: "replace_lines",
     description:
-      "Replace an inclusive 1-based line range in an existing UTF-8 text file. Prefer this over full-file writes when only a small section needs to change.",
+      "Replace an inclusive 1-based line range in an existing UTF-8 text file. WARNING: Do NOT use this on TypeScript or JavaScript files — use replace_symbol_body, insert_before_symbol, or insert_after_symbol instead. This tool is only for non-TS/JS files (JSON, markdown, config, plain text) or when no named symbol anchor exists.",
     parameters: {
       type: "object",
       properties: {
