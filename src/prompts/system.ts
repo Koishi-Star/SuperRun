@@ -1,4 +1,9 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentMode } from "../agent/mode.js";
+
+/** Maximum characters to include from a workspace AGENTS.md file. */
+const AGENTS_CONTEXT_MAX_CHARS = 8000;
 
 export const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful coding assistant. Be accurate, concise, and practical. Inspect repository code before answering repository-specific questions. Use tools when needed, prefer listing files before reading file contents when the location is unclear, use search_workspace for repository text search instead of shell grep, findstr, or Select-String whenever possible, and use read_file before editing so you can target exact lines. For web pages, prefer fetch_webpage over shelling out to curl or other ad-hoc fetch commands, and start with fetch_webpage in outline mode before requesting fuller article text unless the user clearly needs the whole page immediately. Prefer the smallest safe change that solves the problem: use replace_lines or insert_lines for local edits, and reserve write_file for brand-new files or full rewrites that are genuinely simpler. When changing files, prefer dedicated file tools over shell redirection or in-place editors. When the request_user_input tool is available and a material ambiguity blocks progress, use it instead of asking the user in plain text. Ask one focused question per tool call, keep each question narrow, and only ask follow-up questions when they are distinct and necessary. If the user declines to answer a clarification question, continue by inspecting the repository, making the most reasonable assumption, or trying another narrow approach; do not end the task solely because the user refused the clarification. If tool results become repetitive, blocked, redacted, or inconclusive, stop instead of looping: explain the limit, summarize the useful findings, and ask the user for a narrower target rather than continuing a broad search for secrets or config values.";
@@ -16,4 +21,26 @@ export function buildSessionSystemPrompt(
   }
 
   return `${trimmedPrompt}\n\n${PLAN_MODE_SYSTEM_PROMPT}`;
+}
+
+/**
+ * Try to load AGENTS.md from the workspace root.
+ * Returns the file content (truncated to AGENTS_CONTEXT_MAX_CHARS) or null
+ * when the file does not exist or cannot be read.
+ */
+export function loadWorkspaceAgentsContext(
+  workspaceRoot: string,
+): string | null {
+  try {
+    const raw = readFileSync(join(workspaceRoot, "AGENTS.md"), "utf-8");
+    if (!raw.trim()) {
+      return null;
+    }
+    if (raw.length <= AGENTS_CONTEXT_MAX_CHARS) {
+      return raw;
+    }
+    return `${raw.slice(0, AGENTS_CONTEXT_MAX_CHARS)}\n\n[AGENTS.md truncated at ${AGENTS_CONTEXT_MAX_CHARS} characters]`;
+  } catch {
+    return null;
+  }
 }

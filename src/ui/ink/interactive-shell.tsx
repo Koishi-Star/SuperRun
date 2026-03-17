@@ -38,6 +38,7 @@ import type {
   RendererPrompt,
   RendererShellFrame,
   RendererTranscriptViewport,
+  RendererTimelineEntry,
   RendererToolStep,
   RendererTurnCard,
   RendererViewerOverlay,
@@ -45,6 +46,8 @@ import type {
 
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const WARNING_COLOR = "#ff8c42";
+/** Maximum command output lines shown inline for a running command. */
+const INLINE_ACTIVE_OUTPUT_MAX_LINES = 20;
 const WORKING_SPINNER_FRAMES = [
   "⠋",
   "⠙",
@@ -793,17 +796,14 @@ function buildAgentTurnRenderableLines(
   isLatest: boolean,
   makeId: (label: string) => string,
 ): TranscriptRenderableLine[] {
-  const lines: TranscriptRenderableLine[] = [];
-  const activeCommandStep = [...turn.steps].reverse().find((step) =>
-    step.kind === "command" && step.status === "running"
-  ) ?? null;
   const isFocused = isLatest || turn.status !== "completed";
   const showLockedPromptStyle =
     turn.status === "running_tools" || turn.status === "streaming_answer";
-  const showStepDetails = isFocused;
-  const showAnswer = isFocused || turn.answerText.length > 0;
   const indent = isFocused ? 0 : 2;
 
+  const lines: TranscriptRenderableLine[] = [];
+
+  // --- Prompt line ---
   lines.push(...buildWrappedTranscriptLines({
     idPrefix: makeId("prompt"),
     width: options.contentWidth,
@@ -826,55 +826,14 @@ function buildAgentTurnRenderableLines(
     ],
   }));
 
-  if (turn.steps.length > 0 && showStepDetails) {
-    for (const step of turn.steps) {
-      const marker = activeCommandStep?.id === step.id
-        ? {
-            text: `${options.commandSpinnerFrame} `,
-            color: getStepColor(step),
-            dimColor: !isFocused,
-          }
-        : {
-            text: step.kind === "notice" ? "! " : "- ",
-            color: getStepColor(step),
-            dimColor: !isFocused,
-          };
-      lines.push(...buildWrappedTranscriptLines({
-        idPrefix: makeId("step"),
-        width: options.contentWidth,
-        indent,
-        prefix: [marker],
-        body: [{
-          text: `${step.title}  ${step.summary}`,
-          color: getStepColor(step),
-          dimColor: !isFocused,
-        }],
-      }));
-    }
-  } else if (turn.steps.length > 0) {
-    lines.push(...buildWrappedTranscriptLines({
-      idPrefix: makeId("history"),
-      width: options.contentWidth,
-      indent,
-      body: [{
-        text: `${turn.steps.length} step${turn.steps.length === 1 ? "" : "s"}  completed ${turn.steps.filter((step) => step.status === "completed").length}  failed ${turn.steps.filter((step) => step.status === "failed" || step.status === "timed_out").length}`,
-        dimColor: true,
-      }],
-    }));
+  // --- Timeline-driven inline narrative ---
+  if (isFocused) {
+    lines.push(...buildFocusedTimelineLines(turn, options, indent, makeId));
+  } else {
+    lines.push(...buildCompactTimelineLines(turn, options, indent, makeId));
   }
 
-  if (activeCommandStep) {
-    lines.push(buildTranscriptBlankLine(makeId("gap")));
-    lines.push(...buildCommandPanelRenderableLines(
-      activeCommandStep,
-      options.commandViewportHeight,
-      options.contentWidth,
-      indent,
-      options.commandSpinnerFrame,
-      makeId,
-    ));
-  }
-
+  // --- Approval / diff block (always at end) ---
   if (turn.inlineBlock) {
     lines.push(buildTranscriptBlankLine(makeId("gap")));
     lines.push(...(
@@ -884,7 +843,179 @@ function buildAgentTurnRenderableLines(
     ));
   }
 
-  if (turn.answerText && showAnswer) {
+  return lines;
+}
+
+/** Render the full inline narrative for the active / focused turn. */
+function buildFocusedTimelineLines(
+  turn: RendererAgentTurn,
+  options: TranscriptRenderOptions,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const lines: TranscriptRenderableLine[] = [];
+  // Accumulate adjacent text chunks so they render as a single rich-text block.
+  let pendingText = "";
+
+  const flushText = () => {
+    if (!pendingText) {
+      return;
+    }
+    lines.push(buildTranscriptBlankLine(makeId("gap")));
+    lines.push(...renderRichTextToRenderableLines(
+      pendingText,
+      "assistant",
+      options.contentWidth,
+      indent,
+      makeId,
+    ));
+    pendingText = "";
+  };
+
+  for (const entry of turn.timeline) {
+    switch (entry.kind) {
+      case "text":
+        pendingText += entry.text;
+        break;
+
+      case "tool_start": {
+        flushText();
+        const step = turn.steps[entry.stepIndex];
+        if (!step) break;
+        const isRunning = step.status === "running";
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("tool-start"),
+          width: options.contentWidth,
+          indent,
+          prefix: [{
+            text: isRunning ? `${options.commandSpinnerFrame} ` : "  ",
+            color: "cyan",
+          }],
+          body: [{
+            text: step.title,
+            color: "cyan",
+          }],
+        }));
+        break;
+      }
+
+      case "tool_output": {
+        const step = turn.steps[entry.stepIndex];
+        if (!step) break;
+        // Only show output for running commands; completed ones get a summary.
+        if (step.status !== "running") break;
+        // Show the latest N lines from the step's full output buffer.
+        const outputSlice = step.outputLines.slice(-INLINE_ACTIVE_OUTPUT_MAX_LINES);
+        for (const outputLine of outputSlice) {
+          lines.push(...buildWrappedTranscriptLines({
+            idPrefix: makeId("cmd-out"),
+            width: options.contentWidth,
+            indent: indent + 2,
+            body: [{
+              text: outputLine,
+              ...(outputLine.startsWith("stderr |") ? { color: "redBright" } : {}),
+              dimColor: !outputLine.startsWith("stderr |"),
+            }],
+          }));
+        }
+        if (step.outputTruncated) {
+          lines.push(...buildWrappedTranscriptLines({
+            idPrefix: makeId("cmd-trunc"),
+            width: options.contentWidth,
+            indent: indent + 2,
+            body: [{ text: "(output truncated)", color: "yellowBright" }],
+          }));
+        }
+        break;
+      }
+
+      case "tool_end": {
+        flushText();
+        const step = turn.steps[entry.stepIndex];
+        if (!step) break;
+        const marker = step.status === "completed" ? "\u2713" : step.status === "timed_out" ? "\u23f1" : "\u2717";
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("tool-end"),
+          width: options.contentWidth,
+          indent,
+          prefix: [{ text: `${marker} `, color: getStepColor(step) }],
+          body: [{
+            text: `${step.title}  ${step.summary}`,
+            color: getStepColor(step),
+          }],
+        }));
+        break;
+      }
+
+      case "edit_summary": {
+        flushText();
+        const step = turn.steps[entry.stepIndex];
+        if (!step) break;
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("edit"),
+          width: options.contentWidth,
+          indent,
+          prefix: [{ text: "\u2713 ", color: "green" }],
+          body: [{
+            text: `${step.title}  ${step.summary}`,
+            color: "green",
+          }],
+        }));
+        break;
+      }
+
+      case "notice": {
+        flushText();
+        const step = turn.steps[entry.stepIndex];
+        if (!step) break;
+        lines.push(...buildWrappedTranscriptLines({
+          idPrefix: makeId("notice"),
+          width: options.contentWidth,
+          indent,
+          prefix: [{ text: "! ", color: getStepColor(step) }],
+          body: [{
+            text: `${step.title}  ${step.summary}`,
+            color: getStepColor(step),
+          }],
+        }));
+        break;
+      }
+    }
+  }
+
+  // Flush any remaining assistant text after the last tool event.
+  flushText();
+
+  // If the turn has steps but an empty timeline (e.g., restored from saved
+  // state), fall back to a step summary so the turn is not blank.
+  if (turn.timeline.length === 0 && turn.steps.length > 0) {
+    for (const step of turn.steps) {
+      const marker = step.status === "running" ? options.commandSpinnerFrame
+        : step.status === "completed" ? "\u2713" : step.status === "timed_out" ? "\u23f1" : "\u2717";
+      lines.push(...buildWrappedTranscriptLines({
+        idPrefix: makeId("step-fb"),
+        width: options.contentWidth,
+        indent,
+        prefix: [{ text: `${marker} `, color: getStepColor(step) }],
+        body: [{
+          text: `${step.title}  ${step.summary}`,
+          color: getStepColor(step),
+        }],
+      }));
+    }
+    if (turn.answerText) {
+      lines.push(buildTranscriptBlankLine(makeId("gap")));
+      lines.push(...renderRichTextToRenderableLines(
+        turn.answerText,
+        "assistant",
+        options.contentWidth,
+        indent,
+        makeId,
+      ));
+    }
+  } else if (turn.timeline.length === 0 && turn.answerText) {
+    // Text-only turn with no tools and no timeline entries (e.g., test or
+    // restored session without tool calls).
     lines.push(buildTranscriptBlankLine(makeId("gap")));
     lines.push(...renderRichTextToRenderableLines(
       turn.answerText,
@@ -893,6 +1024,91 @@ function buildAgentTurnRenderableLines(
       indent,
       makeId,
     ));
+  }
+
+  return lines;
+}
+
+/** Render a compact summary for completed / non-focused turns. */
+function buildCompactTimelineLines(
+  turn: RendererAgentTurn,
+  options: TranscriptRenderOptions,
+  indent: number,
+  makeId: (label: string) => string,
+): TranscriptRenderableLine[] {
+  const lines: TranscriptRenderableLine[] = [];
+
+  // Show one summary line per tool_end / edit / notice, skip tool_start / tool_output.
+  // Merge consecutive text entries into a single truncated preview.
+  let pendingText = "";
+
+  const flushCompactText = () => {
+    const trimmed = pendingText.replace(/\s+/g, " ").trim();
+    if (!trimmed) {
+      pendingText = "";
+      return;
+    }
+    const preview = trimmed.length > 80 ? `${trimmed.slice(0, 77)}...` : trimmed;
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("compact-text"),
+      width: options.contentWidth,
+      indent,
+      body: [{ text: preview, dimColor: true }],
+    }));
+    pendingText = "";
+  };
+
+  for (const entry of turn.timeline) {
+    if (entry.kind === "text") {
+      pendingText += entry.text;
+      continue;
+    }
+    if (entry.kind === "tool_start" || entry.kind === "tool_output") {
+      continue;
+    }
+    // tool_end, edit_summary, notice — show a compact line.
+    flushCompactText();
+    const step = turn.steps[entry.stepIndex];
+    if (!step) continue;
+    const marker = entry.kind === "notice" ? "!"
+      : step.status === "completed" ? "\u2713" : step.status === "timed_out" ? "\u23f1" : "\u2717";
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("compact-step"),
+      width: options.contentWidth,
+      indent,
+      prefix: [{ text: `${marker} `, color: getStepColor(step), dimColor: true }],
+      body: [{
+        text: `${step.title}  ${step.summary}`,
+        color: getStepColor(step),
+        dimColor: true,
+      }],
+    }));
+  }
+  flushCompactText();
+
+  // Fallback for turns with steps but no timeline.
+  if (turn.timeline.length === 0 && turn.steps.length > 0) {
+    lines.push(...buildWrappedTranscriptLines({
+      idPrefix: makeId("history"),
+      width: options.contentWidth,
+      indent,
+      body: [{
+        text: `${turn.steps.length} step${turn.steps.length === 1 ? "" : "s"}  completed ${turn.steps.filter((s) => s.status === "completed").length}  failed ${turn.steps.filter((s) => s.status === "failed" || s.status === "timed_out").length}`,
+        dimColor: true,
+      }],
+    }));
+  }
+  if (turn.timeline.length === 0 && turn.answerText) {
+    const preview = turn.answerText.replace(/\s+/g, " ").trim();
+    const text = preview.length > 80 ? `${preview.slice(0, 77)}...` : preview;
+    if (text) {
+      lines.push(...buildWrappedTranscriptLines({
+        idPrefix: makeId("compact-text"),
+        width: options.contentWidth,
+        indent,
+        body: [{ text, dimColor: true }],
+      }));
+    }
   }
 
   return lines;

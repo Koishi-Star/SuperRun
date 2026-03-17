@@ -44,7 +44,10 @@ test("runAgentTurn appends history and sends prior turns", async () => {
     const secondReply = await runAgentTurn(session, "What did I say?");
     assert.equal(secondReply.reply, "Second answer");
     assert.equal(server.requests[1]?.messages?.[0]?.role, "system");
-    assert.equal(server.requests[1]?.messages?.[0]?.content, "Test system prompt");
+    assert.ok(
+      String(server.requests[1]?.messages?.[0]?.content ?? "").startsWith("Test system prompt"),
+      "system prompt should start with the session-provided value",
+    );
     assert.equal(server.requests[1]?.messages?.[1]?.role, "system");
     assert.match(String(server.requests[1]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
     assert.match(String(server.requests[1]?.messages?.[1]?.content ?? ""), /run_command shell:/);
@@ -104,7 +107,10 @@ test("runAgentTurn trims history to the most recent configured turns", async () 
 
     assert.equal(thirdReply.reply, "Third answer");
     assert.equal(server.requests[2]?.messages?.[0]?.role, "system");
-    assert.equal(server.requests[2]?.messages?.[0]?.content, "Test system prompt");
+    assert.ok(
+      String(server.requests[2]?.messages?.[0]?.content ?? "").startsWith("Test system prompt"),
+      "system prompt should start with the session-provided value",
+    );
     assert.equal(server.requests[2]?.messages?.[1]?.role, "system");
     assert.match(String(server.requests[2]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
     assert.deepEqual(server.requests[2]?.messages?.slice(2), [

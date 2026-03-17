@@ -28,6 +28,7 @@ import {
 import {
   DEFAULT_SYSTEM_PROMPT,
   buildSessionSystemPrompt,
+  loadWorkspaceAgentsContext,
 } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
@@ -1555,7 +1556,13 @@ function trimConversationHistory(
 }
 
 function getEffectiveSystemPrompt(session: AgentSession): string {
-  return buildSessionSystemPrompt(session.systemPrompt, session.mode);
+  const base = buildSessionSystemPrompt(session.systemPrompt, session.mode);
+  // Append workspace AGENTS.md so the model always has project-level guidance.
+  const agentsContext = loadWorkspaceAgentsContext(process.cwd());
+  if (!agentsContext) {
+    return base;
+  }
+  return `${base}\n\n---\n\n# Workspace Agent Guide\n\n${agentsContext}`;
 }
 
 function buildRuntimeEnvironmentMessage(): string {

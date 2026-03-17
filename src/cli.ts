@@ -1414,14 +1414,16 @@ async function handleInteractivePrompt(
     return true;
   }
 
-  await ensureActiveTaskPlan(session, prompt, state, ui);
-  const verificationBaseline = await captureVerificationBaseline(session, prompt);
-
+  // Show the spinner immediately so the user sees a response right away,
+  // then generate or reuse the task plan while the spinner is visible.
   if (ui) {
     ui.beginAgentTurn(prompt);
   } else {
     process.stdout.write("assistant: ");
   }
+
+  await ensureActiveTaskPlan(session, prompt, state, ui);
+  const verificationBaseline = await captureVerificationBaseline(session, prompt);
 
   const turnEvents: ToolTurnEvent[] = [];
 

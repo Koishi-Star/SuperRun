@@ -243,6 +243,15 @@ export type InteractiveRendererTraceEvent =
       event: ToolTurnEvent;
     };
 
+/** A single entry in the chronological event timeline used by inline narrative rendering. */
+export type RendererTimelineEntry =
+  | { kind: "text"; text: string }
+  | { kind: "tool_start"; stepIndex: number }
+  | { kind: "tool_output"; stepIndex: number; lines: string[] }
+  | { kind: "tool_end"; stepIndex: number }
+  | { kind: "edit_summary"; stepIndex: number }
+  | { kind: "notice"; stepIndex: number };
+
 export type RendererAgentTurn = {
   id: string;
   kind: "agent";
@@ -255,6 +264,8 @@ export type RendererAgentTurn = {
     | "failed";
   promptText: string;
   steps: RendererToolStep[];
+  /** Chronological event timeline driving the inline narrative view. */
+  timeline: RendererTimelineEntry[];
   answerText: string;
   inlineBlock: RendererInlineBlock | null;
 };
@@ -581,6 +592,7 @@ export function createInteractiveRenderer(options: {
       return {
         ...turn,
         steps: nextSteps,
+        timeline: [...turn.timeline, { kind: "tool_end" as const, stepIndex: targetIndex }],
       };
     });
 
@@ -718,6 +730,7 @@ export function createInteractiveRenderer(options: {
       ...turn,
       status: "streaming_answer",
       answerText: `${turn.answerText}${merged}`,
+      timeline: [...turn.timeline, { kind: "text" as const, text: merged }],
     }));
     if (updated) {
       rerender();
@@ -745,6 +758,7 @@ export function createInteractiveRenderer(options: {
       ...turn,
       status: "streaming_answer",
       answerText: `${turn.answerText}${chunk}`,
+      timeline: [...turn.timeline, { kind: "text" as const, text: chunk }],
     }));
     if (updated) {
       rerender();
@@ -1027,6 +1041,7 @@ export function createInteractiveRenderer(options: {
             status: "running_tools",
             promptText,
             steps: [],
+            timeline: [],
             answerText: "",
             inlineBlock: null,
           },
@@ -1998,6 +2013,7 @@ function applyToolEventToTurn(
   },
 ): RendererAgentTurn {
   if (event.kind === "notice") {
+    const stepIndex = turn.steps.length;
     return {
       ...turn,
       steps: [
@@ -2021,10 +2037,12 @@ function applyToolEventToTurn(
           startedAtMs: null,
         },
       ],
+      timeline: [...turn.timeline, { kind: "notice", stepIndex }],
     };
   }
 
   if (event.kind === "workspace_edit_review") {
+    const stepIndex = turn.steps.length;
     return {
       ...turn,
       steps: [
@@ -2048,10 +2066,12 @@ function applyToolEventToTurn(
           startedAtMs: null,
         },
       ],
+      timeline: [...turn.timeline, { kind: "edit_summary", stepIndex }],
     };
   }
 
   if (event.phase === "started") {
+    const stepIndex = turn.steps.length;
     return {
       ...turn,
       status: "running_tools",
@@ -2076,6 +2096,7 @@ function applyToolEventToTurn(
           startedAtMs: Date.now(),
         },
       ],
+      timeline: [...turn.timeline, { kind: "tool_start", stepIndex }],
     };
   }
 
@@ -2096,9 +2117,16 @@ function applyToolEventToTurn(
 
   if (event.phase === "output") {
     nextSteps[activeCommandIndex] = appendCommandOutput(targetStep, event.chunk, event.stream);
+    // Extract the new output lines that were just added.
+    const updatedStep = nextSteps[activeCommandIndex]!;
+    const previousLineCount = targetStep.outputLines.length;
+    const newLines = updatedStep.outputLines.slice(previousLineCount);
     return {
       ...turn,
       steps: nextSteps,
+      ...(newLines.length > 0
+        ? { timeline: [...turn.timeline, { kind: "tool_output" as const, stepIndex: activeCommandIndex, lines: newLines }] }
+        : {}),
     };
   }
 
@@ -2117,6 +2145,7 @@ function applyToolEventToTurn(
   return {
     ...turn,
     steps: nextSteps,
+    timeline: [...turn.timeline, { kind: "tool_end", stepIndex: activeCommandIndex }],
   };
 }
 
