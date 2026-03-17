@@ -2923,7 +2923,10 @@ async function ensureActiveTaskPlan(
   });
   await persistCurrentSession(session, state, { allowEmpty: true });
   if (ui) {
-    renderInteractiveShell(ui, session, state);
+    // Only update the shell frame to show the plan box; do not clearScreen()
+    // here because beginAgentTurn has already created the active turn and
+    // clearing would wipe it, leaving the narrative stream empty.
+    ui.setShellFrame(buildInteractiveShellFrame(session, state));
   }
   return nextPlan;
 }
