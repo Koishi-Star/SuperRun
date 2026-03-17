@@ -52,6 +52,34 @@ export type SessionEvent =
       kind: "tool_notice";
       level: "info" | "warning" | "error";
       message: string;
+    }
+  | {
+      timestamp: string;
+      kind: "plan_created";
+      planId: string;
+      title: string;
+      stepCount: number;
+    }
+  | {
+      timestamp: string;
+      kind: "plan_step_updated";
+      planId: string;
+      stepId: string;
+      stepTitle: string;
+      from: "pending" | "in_progress" | "completed" | "blocked";
+      to: "pending" | "in_progress" | "completed" | "blocked";
+    }
+  | {
+      timestamp: string;
+      kind: "plan_completed";
+      planId: string;
+      title: string;
+    }
+  | {
+      timestamp: string;
+      kind: "plan_reset";
+      planId: string;
+      title: string;
     };
 
 export function createSessionEventTimestamp(): string {
@@ -78,6 +106,14 @@ export function formatSessionEvent(event: SessionEvent): string {
       return `${timestamp} Applied ${event.tool} to ${event.path} under ${event.approvalMode}: ${formatWorkspaceEditChangeSummary(event.changeSummary)}${event.autoApproved ? " (auto-approved)." : "."}`;
     case "tool_notice":
       return `${timestamp} ${event.level.toUpperCase()}: ${event.message}`;
+    case "plan_created":
+      return `${timestamp} Plan created: ${event.title} (${event.stepCount} steps).`;
+    case "plan_step_updated":
+      return `${timestamp} Plan step updated: ${event.stepTitle} (${event.from} -> ${event.to}).`;
+    case "plan_completed":
+      return `${timestamp} Plan completed: ${event.title}.`;
+    case "plan_reset":
+      return `${timestamp} Plan cleared: ${event.title}.`;
     default:
       return `${timestamp} Unknown event.`;
   }

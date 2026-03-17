@@ -47,6 +47,7 @@ export type RendererShellFrame = {
   workspaceLines: RendererLine[];
   statusLines: RendererLine[];
   noticeLines: RendererLine[];
+  planLines: RendererLine[];
   footerLines: RendererLine[];
   contextMeter: RendererContextMeter | null;
 };
@@ -235,6 +236,7 @@ export type InteractiveRenderer = {
     workspaceLines: Array<Omit<RendererLine, "id">>;
     statusLines: Array<Omit<RendererLine, "id">>;
     noticeLines: Array<Omit<RendererLine, "id">>;
+    planLines: Array<Omit<RendererLine, "id">>;
     footerLines: Array<Omit<RendererLine, "id">>;
     contextMeter?: RendererContextMeter | null;
   }) => void;
@@ -347,6 +349,7 @@ export function createInteractiveRenderer(options: {
       workspaceLines: [],
       statusLines: [],
       noticeLines: [],
+      planLines: [],
       footerLines: [],
       contextMeter: null,
     },
@@ -843,6 +846,10 @@ export function createInteractiveRenderer(options: {
             ...line,
             id: `header_${nextLineId += 1}`,
           })),
+          planLines: (frame.planLines ?? []).map((line) => ({
+            ...line,
+            id: `header_${nextLineId += 1}`,
+          })),
           footerLines: frame.footerLines.map((line) => ({
             ...line,
             id: `header_${nextLineId += 1}`,
@@ -863,6 +870,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/settings Show the active system prompt and persistence path");
       renderer.writeBodyLine("/session  Show current session status");
       renderer.writeBodyLine("/history  Show the current or selected session transcript and events");
+      renderer.writeBodyLine("/plan     Show the current task plan or clear it with /plan reset");
       renderer.writeBodyLine("/sessions Open the saved-session picker, optionally filtered by text");
       renderer.writeBodyLine("/new [title] Create and switch to a fresh session");
       renderer.writeBodyLine("/switch   Switch to a saved session by id, title, or list index");
@@ -2065,6 +2073,7 @@ function cloneRendererShellFrame(frame: RendererShellFrame): RendererShellFrame 
     workspaceLines: frame.workspaceLines.map(cloneRendererLine),
     statusLines: frame.statusLines.map(cloneRendererLine),
     noticeLines: frame.noticeLines.map(cloneRendererLine),
+    planLines: (frame.planLines ?? []).map(cloneRendererLine),
     footerLines: frame.footerLines.map(cloneRendererLine),
     contextMeter: frame.contextMeter ? { ...frame.contextMeter } : null,
   };

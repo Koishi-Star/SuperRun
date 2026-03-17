@@ -8,6 +8,15 @@ import {
   getAgentSessionStats,
   runAgentTurn,
 } from "./agent/loop.js";
+import {
+  createTaskPlan,
+  formatTaskPlanSummary,
+  getActiveTaskPlanStep,
+  getTaskPlanProgress,
+  renderTaskPlanMarkdown,
+  updateTaskPlanStep,
+  type TaskPlan,
+} from "./agent/plan.js";
 import { createEmptyContextBudgetSnapshot } from "./agent/context-budget.js";
 import {
   getAgentModeSummary,
@@ -98,6 +107,7 @@ import {
   type ProviderCatalogRefreshFeedback,
   type ProviderCatalogState,
 } from "./llm/provider-catalog.js";
+import { chatOnce } from "./llm/router.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
@@ -246,6 +256,7 @@ const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
 const MIN_ALLOWED_COMMAND_PANEL_DURATION_MS = 100;
 const MAX_ALLOWED_COMMAND_PANEL_DURATION_MS = 10_000;
+const TASK_PLAN_HISTORY_CONTEXT_MESSAGES = 6;
 
 async function createInteractiveState(
   settings: SuperRunSettings,
@@ -325,7 +336,10 @@ async function runSingleTurn(
   const assistantWriter = createAnsiRichTextStreamWriter((chunk) => {
     process.stdout.write(chunk);
   }, "assistant");
+  const plan = await ensureActiveTaskPlan(session, prompt, state, null);
   console.log("user:", prompt);
+  console.log("plan:");
+  process.stdout.write(renderTaskPlanMarkdown(plan));
   process.stdout.write("assistant: ");
 
   const result = await runAgentTurn(session, prompt, {
@@ -437,7 +451,7 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|plan|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|plan|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /plan [/reset] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
     }
     return true;
   }
@@ -807,6 +821,36 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  if (prompt === "/plan") {
+    await renderPlan(ui, {
+      label: formatSessionLabel(state.currentSessionTitle, state.currentSessionId),
+      plan: session.activePlan,
+      current: true,
+    });
+    return true;
+  }
+
+  if (prompt === "/plan reset") {
+    if (!session.activePlan) {
+      renderInfo(ui, "No active plan to clear.");
+      return true;
+    }
+
+    recordSessionEvent(state, {
+      timestamp: createSessionEventTimestamp(),
+      kind: "plan_reset",
+      planId: session.activePlan.id,
+      title: session.activePlan.title,
+    });
+    session.activePlan = null;
+    await persistCurrentSession(session, state, { allowEmpty: true });
+    if (ui) {
+      renderInteractiveShell(ui, session, state);
+    }
+    renderInfo(ui, "Cleared the active task plan.");
+    return true;
+  }
+
   if (matchesCommand(prompt, "/sessions")) {
     const filterQuery = parseCommandArgument(prompt, "/sessions");
     const filteredSessions = filterSessionSummaries(
@@ -1093,6 +1137,8 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  await ensureActiveTaskPlan(session, prompt, state, ui);
+
   if (ui) {
     ui.beginAgentTurn(prompt);
   } else {
@@ -1319,6 +1365,7 @@ function resetCurrentSession(
 ): void {
   session.systemPrompt = systemPrompt;
   session.history = [];
+  session.activePlan = null;
   session.contextBudget = createEmptyContextBudgetSnapshot();
 }
 
@@ -1361,6 +1408,7 @@ function buildInteractiveShellFrame(
   workspaceLines: Array<Omit<RendererLine, "id">>;
   statusLines: Array<Omit<RendererLine, "id">>;
   noticeLines: Array<Omit<RendererLine, "id">>;
+  planLines: Array<Omit<RendererLine, "id">>;
   footerLines: Array<Omit<RendererLine, "id">>;
   contextMeter: RendererContextMeter | null;
 } {
@@ -1435,10 +1483,11 @@ function buildInteractiveShellFrame(
     workspaceLines,
     statusLines,
     noticeLines: buildNoticeBannerLines(session, state),
+    planLines: buildPlanCardLines(session.activePlan),
     footerLines: [
       {
         kind: "body",
-        text: "commands /help /provider /model /sessions /new [title] /mode /approvals /duration /system /clear /exit",
+        text: "commands /help /provider /model /plan /sessions /new [title] /mode /approvals /duration /system /clear /exit",
       },
       {
         kind: "body",
@@ -1473,6 +1522,69 @@ function buildNoticeBannerLines(
   }
 
   return lines;
+}
+
+function buildPlanCardLines(
+  plan: TaskPlan | null,
+): Array<Omit<RendererLine, "id">> {
+  if (!plan) {
+    return [];
+  }
+
+  const progress = getTaskPlanProgress(plan);
+  const activeStep = getActiveTaskPlanStep(plan);
+  const lines: Array<Omit<RendererLine, "id">> = [
+    {
+      kind: "section",
+      text: `plan  ${plan.title}`,
+    },
+    {
+      kind: "info",
+      text: `progress  ${formatTaskPlanSummary(plan)}  in progress ${progress.inProgressSteps}  blocked ${progress.blockedSteps}`,
+    },
+  ];
+
+  if (activeStep) {
+    lines.push({
+      kind: "info",
+      text: `current  ${activeStep.title}`,
+    });
+  }
+
+  for (const step of plan.steps.slice(0, 5)) {
+    lines.push({
+      kind: step.status === "completed"
+        ? "info"
+        : step.status === "blocked"
+          ? "warning"
+          : "body",
+      text: `${formatPlanStepBullet(step.status)} ${step.title}`,
+    });
+  }
+
+  if (plan.steps.length > 5) {
+    lines.push({
+      kind: "body",
+      text: `... ${plan.steps.length - 5} more step${plan.steps.length - 5 === 1 ? "" : "s"}  use /plan`,
+    });
+  }
+
+  return lines;
+}
+
+function formatPlanStepBullet(
+  status: TaskPlan["steps"][number]["status"],
+): string {
+  switch (status) {
+    case "completed":
+      return "[x]";
+    case "in_progress":
+      return "[~]";
+    case "blocked":
+      return "[!]";
+    default:
+      return "[ ]";
+  }
 }
 
 export function getDeleteAreaBannerText(status: {
@@ -2246,6 +2358,12 @@ function renderCurrentSessionSummary(
     ui,
     `Context budget: ${formatContextUsage(currentStats.currentContextTokens, effectiveContextLimitTokens)}  source ${currentStats.contextUsageSource ?? "unknown"}.`,
   );
+  renderInfo(
+    ui,
+    session.activePlan
+      ? `Active plan: ${session.activePlan.title} (${formatTaskPlanSummary(session.activePlan)}).`
+      : "Active plan: none.",
+  );
   renderInfo(ui, `Recorded events: ${state.sessionEvents.length}.`);
   renderInfo(ui, `Current behavior: ${summarizePrompt(session.systemPrompt)}`);
   renderInfo(ui, `Session index: ${state.sessionStore.indexFilePath}`);
@@ -2363,6 +2481,219 @@ async function renderHistory(
       writeBodyLine(ui, `${index + 1}. ${formatSessionEvent(event)}`);
     }
   }
+}
+
+async function renderPlan(
+  ui: InteractiveRenderer | null,
+  options: {
+    label: string;
+    plan: TaskPlan | null;
+    current: boolean;
+  },
+): Promise<void> {
+  if (ui) {
+    await ui.viewText({
+      title: "Plan",
+      subtitle: options.label,
+      helpText: "Up/Down scroll  PgUp/PgDn page  q close  Esc close",
+      emptyMessage: "No active plan.",
+      lines: buildPlanViewerLines(options),
+    });
+    return;
+  }
+
+  console.log("Plan");
+  renderInfo(ui, `Session: ${options.label}`);
+  if (options.current) {
+    renderInfo(ui, "Viewing the current plan.");
+  }
+  if (!options.plan) {
+    renderInfo(ui, "No active plan.");
+    return;
+  }
+
+  for (const line of renderTaskPlanMarkdown(options.plan).trimEnd().split(/\r?\n/)) {
+    writeBodyLine(ui, line);
+  }
+}
+
+function buildPlanViewerLines(options: {
+  label: string;
+  plan: TaskPlan | null;
+  current: boolean;
+}): RendererViewerLine[] {
+  const lines: RendererViewerLine[] = [
+    { text: `Session: ${options.label}`, tone: "info" },
+    {
+      text: options.current
+        ? "Viewing the current plan."
+        : "Viewing a saved plan.",
+      tone: "info",
+    },
+  ];
+  if (!options.plan) {
+    return lines;
+  }
+
+  lines.push({ text: "" });
+  for (const line of renderTaskPlanMarkdown(options.plan).trimEnd().split(/\r?\n/)) {
+    lines.push({
+      text: line,
+      format: "rich_text",
+    });
+  }
+  return lines;
+}
+
+async function ensureActiveTaskPlan(
+  session: AgentSession,
+  prompt: string,
+  state: InteractiveState,
+  ui: InteractiveRenderer | null,
+): Promise<TaskPlan> {
+  const nextPlan = await generateTaskPlan(session, prompt, state);
+  if (session.activePlan) {
+    recordSessionEvent(state, {
+      timestamp: createSessionEventTimestamp(),
+      kind: "plan_reset",
+      planId: session.activePlan.id,
+      title: session.activePlan.title,
+    });
+  }
+
+  session.activePlan = nextPlan;
+  recordSessionEvent(state, {
+    timestamp: createSessionEventTimestamp(),
+    kind: "plan_created",
+    planId: nextPlan.id,
+    title: nextPlan.title,
+    stepCount: nextPlan.steps.length,
+  });
+  await persistCurrentSession(session, state, { allowEmpty: true });
+  if (ui) {
+    renderInteractiveShell(ui, session, state);
+  }
+  return nextPlan;
+}
+
+async function generateTaskPlan(
+  session: AgentSession,
+  prompt: string,
+  state: InteractiveState,
+): Promise<TaskPlan> {
+  try {
+    const response = await chatOnce(
+      buildTaskPlanMessages(session, prompt),
+      {
+        providerConfig: getActiveProviderConfig(state),
+        temperature: 0.1,
+      },
+    );
+    const parsed = parseTaskPlanResponse(response.content);
+    return createTaskPlan({
+      title: parsed.title || summarizePromptForPlan(prompt),
+      sourcePrompt: prompt,
+      steps: parsed.steps.map((step) => ({
+        title: step.title,
+        ...(step.details ? { details: step.details } : {}),
+      })),
+    });
+  } catch {
+    return createFallbackTaskPlan(prompt);
+  }
+}
+
+function buildTaskPlanMessages(
+  session: AgentSession,
+  prompt: string,
+): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  return [
+    {
+      role: "system",
+      content: [
+        session.systemPrompt,
+        'Create an execution plan for the user\'s task before implementation begins.',
+        'Return JSON only with this exact shape: {"title":"short title","steps":[{"title":"step title","details":"short detail"}]}.',
+        "Use 3 to 7 minimal executable steps.",
+        "Keep each step concrete and implementation-oriented.",
+        "Do not include markdown, explanations, or extra keys.",
+      ].join("\n\n"),
+    },
+    ...session.history.slice(-TASK_PLAN_HISTORY_CONTEXT_MESSAGES),
+    {
+      role: "user",
+      content: `Task:\n${prompt}`,
+    },
+  ];
+}
+
+function parseTaskPlanResponse(content: string): {
+  title: string;
+  steps: Array<{ title: string; details?: string }>;
+} {
+  const normalized = content.trim();
+  const stripped = normalized.startsWith("```")
+    ? normalized.replace(/^```(?:json)?\s*|\s*```$/g, "").trim()
+    : normalized;
+  const jsonText = extractJsonObject(stripped);
+  const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+  const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+  const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
+  const steps = rawSteps
+    .map((step) => {
+      if (!step || typeof step !== "object") {
+        return null;
+      }
+
+      const candidate = step as Record<string, unknown>;
+      const stepTitle = typeof candidate.title === "string" ? candidate.title.trim() : "";
+      const stepDetails =
+        typeof candidate.details === "string" ? candidate.details.trim() : "";
+      if (!stepTitle) {
+        return null;
+      }
+      return {
+        title: stepTitle,
+        ...(stepDetails ? { details: stepDetails } : {}),
+      };
+    })
+    .filter((step): step is { title: string; details?: string } => step !== null);
+  if (steps.length === 0) {
+    throw new Error("Planning response did not include any valid steps.");
+  }
+
+  return { title, steps };
+}
+
+function extractJsonObject(value: string): string {
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    throw new Error("Planning response did not contain a JSON object.");
+  }
+
+  return value.slice(start, end + 1);
+}
+
+function createFallbackTaskPlan(prompt: string): TaskPlan {
+  return createTaskPlan({
+    title: summarizePromptForPlan(prompt),
+    sourcePrompt: prompt,
+    steps: [
+      { title: "Inspect the relevant code and constraints", details: "Locate the files, flows, and current behavior involved in the task." },
+      { title: "Implement the smallest viable change", details: "Update the targeted code path without broad refactors." },
+      { title: "Verify the result and summarize any follow-up", details: "Run focused checks and confirm the behavior matches the request." },
+    ],
+  });
+}
+
+function summarizePromptForPlan(prompt: string): string {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 48) {
+    return normalized || "Task plan";
+  }
+
+  return `${normalized.slice(0, 45)}...`;
 }
 
 function buildHistoryViewerLines(options: {
@@ -2900,6 +3231,7 @@ function restoreStoredSession(
 ): void {
   session.systemPrompt = storedSession.systemPrompt;
   session.history = [...storedSession.history];
+  session.activePlan = storedSession.activePlan ? { ...storedSession.activePlan } : null;
   session.maxHistoryTurns = storedSession.maxHistoryTurns;
   session.contextBudget = { ...storedSession.contextBudget };
 }
@@ -2921,6 +3253,7 @@ async function persistCurrentSession(
       systemPrompt: session.systemPrompt,
       history: session.history,
       events: state.sessionEvents,
+      activePlan: session.activePlan,
       maxHistoryTurns: session.maxHistoryTurns,
       contextBudget: session.contextBudget,
     });
@@ -2936,6 +3269,7 @@ async function persistCurrentSession(
     systemPrompt: session.systemPrompt,
     history: session.history,
     events: state.sessionEvents,
+    activePlan: session.activePlan,
     maxHistoryTurns: session.maxHistoryTurns,
     contextBudget: session.contextBudget,
   });
@@ -3330,6 +3664,52 @@ function createToolExecutionContext(
             },
           }
         : {}),
+    },
+    plan: {
+      updatePlan: async (request) => {
+        if (!session.activePlan) {
+          throw new Error("No active task plan.");
+        }
+
+        const currentStep = session.activePlan.steps.find((step) => step.id === request.stepId);
+        if (!currentStep) {
+          throw new Error(`Task plan step does not exist: ${request.stepId}`);
+        }
+
+        const nextPlan = updateTaskPlanStep(session.activePlan, request.stepId, {
+          ...(request.status ? { status: request.status } : {}),
+          ...(request.note !== undefined ? { note: request.note } : {}),
+        });
+        const nextStep = nextPlan.steps.find((step) => step.id === request.stepId) ?? currentStep;
+        session.activePlan = nextPlan;
+        recordSessionEvent(state, {
+          timestamp: createSessionEventTimestamp(),
+          kind: "plan_step_updated",
+          planId: nextPlan.id,
+          stepId: nextStep.id,
+          stepTitle: nextStep.title,
+          from: currentStep.status,
+          to: nextStep.status,
+        });
+        const progress = getTaskPlanProgress(nextPlan);
+        if (progress.completedSteps === progress.totalSteps) {
+          recordSessionEvent(state, {
+            timestamp: createSessionEventTimestamp(),
+            kind: "plan_completed",
+            planId: nextPlan.id,
+            title: nextPlan.title,
+          });
+        }
+        await persistCurrentSession(session, state, { allowEmpty: true });
+        if (ui) {
+          ui.setShellFrame(buildInteractiveShellFrame(session, state));
+        }
+        return {
+          planId: nextPlan.id,
+          stepId: nextStep.id,
+          status: nextStep.status,
+        };
+      },
     },
     notices: {
       addNotice: (notice) => {

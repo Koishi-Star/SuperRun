@@ -13,10 +13,12 @@ import { requestUserInputTool } from "./request_user_input.js";
 import { restoreDeletedFileTool } from "./restore_deleted_file.js";
 import { runCommandTool } from "./run_command.js";
 import type { ToolExecutionContext } from "./types.js";
+import { updatePlanTool } from "./update_plan.js";
 import { writeFileTool } from "./write_file.js";
 
 const defaultModeTools = [
   fetchWebpageTool,
+  updatePlanTool,
   runCommandTool,
   readFileTool,
   writeFileTool,

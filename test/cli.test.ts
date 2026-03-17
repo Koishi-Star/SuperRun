@@ -33,7 +33,17 @@ async function spawnCLI(args: string[], env: NodeJS.ProcessEnv) {
 }
 
 test("CLI single-turn mode streams a prompt response without requiring a TTY", async () => {
-  const server = await startMockOpenAIServer(["Hello from prompt mode."]);
+  const server = await startMockOpenAIServer([
+    JSON.stringify({
+      title: "Greet the user",
+      steps: [
+        { title: "Inspect the prompt" },
+        { title: "Produce the response" },
+        { title: "Verify the output format" },
+      ],
+    }),
+    "Hello from prompt mode.",
+  ]);
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
 
   try {
@@ -50,9 +60,11 @@ test("CLI single-turn mode streams a prompt response without requiring a TTY", a
     );
 
     assert.equal(result.exitCode, 0, result.stderr || "CLI exited with a non-zero code.");
-    assert.equal(server.requests.length, 1);
+    assert.equal(server.requests.length, 2);
     assert.match(result.stdout, /Risk notice: this agent may read, run, modify, delete, or create files in the workspace\./);
     assert.match(result.stdout, /user: Hello there\./);
+    assert.match(result.stdout, /plan:/);
+    assert.match(result.stdout, /# Greet the user/);
     assert.match(result.stdout, /assistant: Hello from prompt mode\./);
   } finally {
     await server.close();
@@ -91,6 +103,14 @@ test("CLI rejects non-TTY interactive mode so Ink remains the only supported cha
 
 test("CLI single-turn ask mode no longer falls back to readline approval prompts", async () => {
   const server = await startMockOpenAIServer([
+    JSON.stringify({
+      title: "Install dependencies",
+      steps: [
+        { title: "Inspect the repository state" },
+        { title: "Attempt the install command" },
+        { title: "Summarize the approval requirement" },
+      ],
+    }),
     {
       toolCalls: [
         {
@@ -120,10 +140,10 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     );
 
     assert.equal(result.exitCode, 0, result.stderr || "CLI exited with a non-zero code.");
-    assert.equal(server.requests.length, 2);
+    assert.equal(server.requests.length, 3);
     assert.match(result.stdout, /assistant: Command execution was blocked pending interactive approval\./);
 
-    const toolMessage = server.requests[1]?.messages.at(-1);
+    const toolMessage = server.requests[2]?.messages.at(-1);
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
@@ -163,6 +183,14 @@ test("CLI no longer accepts crazy_auto through the startup approvals flag", asyn
 
 test("CLI single-turn write_file tool calls also require Ink approval in ask mode", async () => {
   const server = await startMockOpenAIServer([
+    JSON.stringify({
+      title: "Create a note",
+      steps: [
+        { title: "Inspect the target file path" },
+        { title: "Attempt the write tool" },
+        { title: "Summarize the approval requirement" },
+      ],
+    }),
     {
       toolCalls: [
         {
@@ -193,10 +221,10 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     );
 
     assert.equal(result.exitCode, 0, result.stderr || "CLI exited with a non-zero code.");
-    assert.equal(server.requests.length, 2);
+    assert.equal(server.requests.length, 3);
     assert.match(result.stdout, /assistant: The write was blocked pending interactive approval\./);
 
-    const toolMessage = server.requests[1]?.messages.at(-1);
+    const toolMessage = server.requests[2]?.messages.at(-1);
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),

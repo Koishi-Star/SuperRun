@@ -5,6 +5,11 @@ import {
   createEmptyContextBudgetSnapshot,
   type ContextBudgetSnapshot,
 } from "../agent/context-budget.js";
+import {
+  parseTaskPlan,
+  renderTaskPlanMarkdown,
+  type TaskPlan,
+} from "../agent/plan.js";
 import { getConfigFilePath } from "../config/paths.js";
 import { isCommandApprovalMode } from "../tools/command_policy.js";
 import type { SessionEvent } from "./events.js";
@@ -15,6 +20,7 @@ type PersistedSessionFile = {
   systemPrompt?: unknown;
   history?: unknown;
   events?: unknown;
+  activePlan?: unknown;
   maxHistoryTurns?: unknown;
   contextBudget?: unknown;
   updatedAt?: unknown;
@@ -39,6 +45,7 @@ export type SessionSnapshot = {
   systemPrompt: string;
   history: ConversationMessage[];
   events?: SessionEvent[];
+  activePlan?: TaskPlan | null;
   maxHistoryTurns: number;
   contextBudget?: ContextBudgetSnapshot;
 };
@@ -59,6 +66,7 @@ export type StoredSession = {
   systemPrompt: string;
   history: ConversationMessage[];
   events: SessionEvent[];
+  activePlan: TaskPlan | null;
   maxHistoryTurns: number;
   contextBudget: ContextBudgetSnapshot;
   updatedAt: string;
@@ -150,6 +158,7 @@ export async function saveSession(
     content: message.content,
   }));
   const events = [...(snapshot.events ?? [])];
+  const activePlan = snapshot.activePlan ? { ...snapshot.activePlan } : null;
   const contextBudget = snapshot.contextBudget
     ? { ...snapshot.contextBudget }
     : createEmptyContextBudgetSnapshot();
@@ -184,6 +193,7 @@ export async function saveSession(
         systemPrompt,
         history,
         events,
+        activePlan,
         maxHistoryTurns: snapshot.maxHistoryTurns,
         contextBudget,
         updatedAt,
@@ -193,6 +203,7 @@ export async function saveSession(
     )}\n`,
     "utf8",
   );
+  await syncSessionPlanMirror(normalizedId, activePlan);
 
   const currentStore = await loadSessionStore();
   const nextSessions = [
@@ -214,6 +225,7 @@ export async function saveSession(
       systemPrompt,
       history,
       events,
+      activePlan,
       maxHistoryTurns: snapshot.maxHistoryTurns,
       contextBudget,
       updatedAt,
@@ -228,9 +240,17 @@ export async function deleteSession(
 ): Promise<SessionStoreState> {
   const normalizedId = normalizeSessionId(sessionId);
   const filePath = getSessionFilePath(normalizedId);
+  const planFilePath = getSessionPlanFilePath(normalizedId);
 
   try {
     await unlink(filePath);
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
+  try {
+    await unlink(planFilePath);
   } catch (error) {
     if (!isMissingFileError(error)) {
       throw error;
@@ -286,7 +306,9 @@ export async function renameSession(
         systemPrompt: storedSession.systemPrompt,
         history: storedSession.history,
         events: storedSession.events,
+        activePlan: storedSession.activePlan,
         maxHistoryTurns: storedSession.maxHistoryTurns,
+        contextBudget: storedSession.contextBudget,
         updatedAt,
       },
       null,
@@ -330,7 +352,9 @@ export async function deleteAllSessions(): Promise<SessionStoreState> {
         continue;
       }
 
-      if (!entry.name.endsWith(".json") || entry.name === indexFileName) {
+      const isSessionJson = entry.name.endsWith(".json") && entry.name !== indexFileName;
+      const isPlanMarkdown = entry.name.endsWith(".plan.md");
+      if (!isSessionJson && !isPlanMarkdown) {
         continue;
       }
 
@@ -454,6 +478,7 @@ function parseStoredSession(
 ): StoredSession {
   const history = parseHistory(parsed.history, filePath);
   const events = parseSessionEvents(parsed.events, filePath);
+  const activePlan = parseTaskPlan(parsed.activePlan);
   const contextBudget = parseContextBudget(parsed.contextBudget);
   const title = deriveSessionTitle(
     typeof parsed.title === "string" ? parsed.title : null,
@@ -487,6 +512,7 @@ function parseStoredSession(
     systemPrompt,
     history,
     events,
+    activePlan,
     maxHistoryTurns,
     contextBudget,
     updatedAt,
@@ -694,6 +720,60 @@ function parseSessionEvent(
         };
       }
       break;
+    case "plan_created":
+      if (
+        typeof candidate.planId === "string" &&
+        typeof candidate.title === "string" &&
+        typeof candidate.stepCount === "number"
+      ) {
+        return {
+          timestamp,
+          kind,
+          planId: candidate.planId,
+          title: candidate.title,
+          stepCount: candidate.stepCount,
+        };
+      }
+      break;
+    case "plan_step_updated":
+      if (
+        typeof candidate.planId === "string" &&
+        typeof candidate.stepId === "string" &&
+        typeof candidate.stepTitle === "string" &&
+        (candidate.from === "pending" ||
+          candidate.from === "in_progress" ||
+          candidate.from === "completed" ||
+          candidate.from === "blocked") &&
+        (candidate.to === "pending" ||
+          candidate.to === "in_progress" ||
+          candidate.to === "completed" ||
+          candidate.to === "blocked")
+      ) {
+        return {
+          timestamp,
+          kind,
+          planId: candidate.planId,
+          stepId: candidate.stepId,
+          stepTitle: candidate.stepTitle,
+          from: candidate.from,
+          to: candidate.to,
+        };
+      }
+      break;
+    case "plan_completed":
+    case "plan_reset":
+      if (
+        typeof candidate.planId === "string" &&
+        typeof candidate.title === "string"
+      ) {
+        return {
+          timestamp,
+          kind,
+          planId: candidate.planId,
+          title: candidate.title,
+        };
+      }
+      break;
     default:
       break;
   }
@@ -780,6 +860,10 @@ function getSessionFilePath(sessionId: string): string {
   return getConfigFilePath(path.join("sessions", `${normalizeSessionId(sessionId)}.json`));
 }
 
+function getSessionPlanFilePath(sessionId: string): string {
+  return getConfigFilePath(path.join("sessions", `${normalizeSessionId(sessionId)}.plan.md`));
+}
+
 function normalizeSessionId(sessionId: string): string {
   const trimmedId = sessionId.trim();
   if (!trimmedId) {
@@ -806,6 +890,25 @@ async function loadExistingSession(sessionId: string): Promise<StoredSession | n
 
     throw error;
   }
+}
+
+async function syncSessionPlanMirror(
+  sessionId: string,
+  activePlan: TaskPlan | null,
+): Promise<void> {
+  const planFilePath = getSessionPlanFilePath(sessionId);
+  if (!activePlan) {
+    try {
+      await unlink(planFilePath);
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+    }
+    return;
+  }
+
+  await writeFile(planFilePath, renderTaskPlanMarkdown(activePlan), "utf8");
 }
 
 function createSessionId(): string {

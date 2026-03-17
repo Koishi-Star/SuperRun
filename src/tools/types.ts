@@ -217,10 +217,25 @@ export type UserInputContext = {
   requestUserInput?: (request: UserInputRequest) => Promise<UserInputResponse>;
 };
 
+export type PlanUpdateRequest = {
+  stepId: string;
+  status?: "pending" | "in_progress" | "completed" | "blocked";
+  note?: string | null;
+};
+
+export type PlanContext = {
+  updatePlan?: (request: PlanUpdateRequest) => Promise<{
+    planId: string;
+    stepId: string;
+    status: "pending" | "in_progress" | "completed" | "blocked";
+  }>;
+};
+
 export type ToolExecutionContext = {
   commandPolicy?: CommandPolicyContext;
   workspaceEditPolicy?: WorkspaceEditPolicyContext;
   notices?: ToolNoticeContext;
   turnEvents?: ToolTurnEventContext;
   userInput?: UserInputContext;
+  plan?: PlanContext;
 };

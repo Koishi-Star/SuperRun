@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readdir, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import test from "node:test";
+import { createTaskPlan } from "../src/agent/plan.js";
 import type { SessionEvent } from "../src/session/events.js";
 import {
   createSession,
@@ -45,6 +46,15 @@ test("createSession persists a session and marks it active", async () => {
   process.env.SUPERRUN_CONFIG_DIR = tempDir;
 
   try {
+    const activePlan = createTaskPlan({
+      title: "Add greeting flow",
+      sourcePrompt: "Add a greeting flow.",
+      steps: [
+        { title: "Inspect the CLI entry point" },
+        { title: "Implement the greeting behavior" },
+        { title: "Verify the output" },
+      ],
+    });
     const created = await createSession({
       systemPrompt: "You are a reviewer.",
       history: [
@@ -52,6 +62,7 @@ test("createSession persists a session and marks it active", async () => {
         { role: "assistant", content: "Hello" },
       ],
       events: sampleEvents,
+      activePlan,
       maxHistoryTurns: 10,
       contextBudget: {
         modelContextTokens: 256_000,
@@ -83,7 +94,14 @@ test("createSession persists a session and marks it active", async () => {
       { role: "assistant", content: "Hello" },
     ]);
     assert.deepEqual(loaded.events, sampleEvents);
+    assert.equal(loaded.activePlan?.title, "Add greeting flow");
     assert.equal(loaded.contextBudget.effectiveContextLimitTokens, 128_000);
+    const planMarkdown = await readFile(
+      path.join(tempDir, "sessions", `${created.session.id}.plan.md`),
+      "utf8",
+    );
+    assert.match(planMarkdown, /# Add greeting flow/);
+    assert.match(planMarkdown, /- \[ \] Inspect the CLI entry point/);
   } finally {
     restoreConfigDir(previousConfigDir);
     await rm(tempDir, { recursive: true, force: true });

@@ -85,6 +85,34 @@ test("parseAssistantRichText extracts markdown tables into table blocks", () => 
   );
 });
 
+test("parseAssistantRichText extracts checklist items with task markers", () => {
+  assert.deepEqual(
+    parseAssistantRichText("- [ ] Inspect\n- [x] Implement\n- [~] Verify\n- [!] Revisit"),
+    [
+      {
+        kind: "checklist_item",
+        marker: " ",
+        segments: [{ kind: "text", text: "Inspect" }],
+      },
+      {
+        kind: "checklist_item",
+        marker: "x",
+        segments: [{ kind: "text", text: "Implement" }],
+      },
+      {
+        kind: "checklist_item",
+        marker: "~",
+        segments: [{ kind: "text", text: "Verify" }],
+      },
+      {
+        kind: "checklist_item",
+        marker: "!",
+        segments: [{ kind: "text", text: "Revisit" }],
+      },
+    ],
+  );
+});
+
 test("highlightAssistantCode preserves code content even when terminal coloring is unavailable", () => {
   const highlighted = highlightAssistantCode("const answer = 42;", "ts");
 

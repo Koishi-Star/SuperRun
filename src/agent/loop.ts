@@ -22,6 +22,7 @@ import {
   buildSessionSystemPrompt,
 } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
+import type { TaskPlan } from "./plan.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 import type { ToolExecutionContext } from "../tools/types.js";
 import {
@@ -58,6 +59,7 @@ export type AgentSession = {
   mode: AgentMode;
   systemPrompt: string;
   history: ConversationMessage[];
+  activePlan: TaskPlan | null;
   maxHistoryTurns: number;
   contextBudget: ContextBudgetSnapshot;
   webpageFetchCache: FetchWebpageSessionCache;
@@ -67,6 +69,7 @@ export type CreateAgentSessionOptions = {
   mode?: AgentMode;
   systemPrompt?: string;
   history?: ConversationMessage[];
+  activePlan?: TaskPlan | null;
   maxHistoryTurns?: number;
   contextBudget?: ContextBudgetSnapshot;
 };
@@ -96,6 +99,7 @@ export function createAgentSession(
     mode: parseAgentMode(options?.mode),
     systemPrompt: options?.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT,
     history: [...(options?.history ?? [])],
+    activePlan: options?.activePlan ? { ...options.activePlan } : null,
     maxHistoryTurns: normalizeMaxHistoryTurns(options?.maxHistoryTurns),
     contextBudget: options?.contextBudget
       ? { ...options.contextBudget }

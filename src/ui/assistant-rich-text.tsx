@@ -49,6 +49,11 @@ export type AssistantRichTextBlock =
       segments: AssistantInlineSegment[];
     }
   | {
+      kind: "checklist_item";
+      marker: " " | "x" | "~" | "!";
+      segments: AssistantInlineSegment[];
+    }
+  | {
       kind: "code_block";
       language: string | null;
       code: string;
@@ -159,6 +164,16 @@ export function parseAssistantRichText(text: string): AssistantRichTextBlock[] {
       blocks.push({
         kind: "quote",
         segments: parseInlineSegments(quoteMatch[1] ?? ""),
+      });
+      continue;
+    }
+
+    const checklistMatch = line.match(/^[-*]\s+\[([ x~!])\]\s+(.*)$/);
+    if (checklistMatch) {
+      blocks.push({
+        kind: "checklist_item",
+        marker: (checklistMatch[1] as " " | "x" | "~" | "!") ?? " ",
+        segments: parseInlineSegments(checklistMatch[2] ?? ""),
       });
       continue;
     }
@@ -483,6 +498,15 @@ function renderRichTextBlock(
           </Text>
         </Box>
       );
+    case "checklist_item":
+      return (
+        <Box key={`assistant-block-${index}`} flexDirection="row">
+          <Text color={getChecklistColor(block.marker)}>{`${formatChecklistMarker(block.marker)} `}</Text>
+          <Text dimColor={tone === "info"} color={getBaseColor(tone)}>
+            {renderInlineSegments(block.segments, tone)}
+          </Text>
+        </Box>
+      );
     case "code_block":
       return (
         <CodeBlock
@@ -755,6 +779,11 @@ function formatBlockToAnsi(
         formatInlineSegmentsToAnsi(block.segments, tone),
         tone,
       )}`;
+    case "checklist_item":
+      return `${chalk.hex(getChecklistColor(block.marker))(formatChecklistMarker(block.marker))} ${applyToneFormatter(
+        formatInlineSegmentsToAnsi(block.segments, tone),
+        tone,
+      )}`;
     case "code_block":
       return [
         chalk.magentaBright(`\`\`\`${block.language ?? ""}`),
@@ -781,6 +810,23 @@ function formatBlockToAnsi(
         formatInlineSegmentsToAnsi(block.segments, tone),
         tone,
       );
+  }
+}
+
+function formatChecklistMarker(marker: " " | "x" | "~" | "!"): string {
+  return `[${marker}]`;
+}
+
+function getChecklistColor(marker: " " | "x" | "~" | "!"): string {
+  switch (marker) {
+    case "x":
+      return "#2f9e44";
+    case "~":
+      return "#e67700";
+    case "!":
+      return "#c92a2a";
+    default:
+      return "#0891b2";
   }
 }
 

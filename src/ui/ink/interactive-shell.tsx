@@ -144,6 +144,7 @@ export type InteractiveShellDocument = {
 
 export function InteractiveShell(props: InteractiveShellProps): React.JSX.Element {
   const contentWidth = props.divider.length;
+  const planLines = props.shellFrame.planLines ?? [];
   const hasActiveSpinner = props.turns.some((turn) =>
     turn.kind === "agent" && (
       turn.status === "running_tools" ||
@@ -166,6 +167,9 @@ export function InteractiveShell(props: InteractiveShellProps): React.JSX.Elemen
       <ContextMeterBar meter={props.shellFrame.contextMeter} width={contentWidth} />
       {props.shellFrame.noticeLines.length > 0 ? (
         <ShellNoticeBlock lines={props.shellFrame.noticeLines} />
+      ) : null}
+      {planLines.length > 0 ? (
+        <PlanSummaryBlock lines={planLines} />
       ) : null}
       <TranscriptViewport
         turns={props.turns}
@@ -198,6 +202,7 @@ export function renderInteractiveShellDocument(
   },
 ): InteractiveShellDocument {
   const contentWidth = props.divider.length;
+  const planCardLines = props.shellFrame.planLines ?? [];
   const spinnerTick = props.spinnerTick ?? 0;
   const hasRunningCommand = props.turns.some((turn) =>
     turn.kind === "agent" &&
@@ -234,6 +239,14 @@ export function renderInteractiveShellDocument(
         contentWidth,
       )
     : [];
+  const planLines = planCardLines.length > 0
+    ? renderSectionToLines(
+        (
+          <PlanSummaryBlock lines={planCardLines} />
+        ),
+        contentWidth,
+      )
+    : [];
   const composerLines = renderSectionToLines(
     (
       <Composer
@@ -253,6 +266,7 @@ export function renderInteractiveShellDocument(
     headerLines.length +
     contextMeterLines.length +
     noticeLines.length +
+    planLines.length +
     composerLines.length +
     statusLines.length;
   const mainViewportHeight = Math.max(1, props.shellHeight - reservedLines);
@@ -295,6 +309,7 @@ export function renderInteractiveShellDocument(
     ...headerLines,
     ...contextMeterLines,
     ...noticeLines,
+    ...planLines,
     ...bodyLines,
     ...composerLines,
     ...statusLines,
@@ -415,6 +430,20 @@ function ShellNoticeBlock(props: { lines: RendererLine[] }): React.JSX.Element {
       flexDirection="column"
       borderStyle="round"
       borderColor={borderColor}
+      marginBottom={1}
+      paddingX={1}
+    >
+      <LineBlock lines={props.lines} />
+    </Box>
+  );
+}
+
+function PlanSummaryBlock(props: { lines: RendererLine[] }): React.JSX.Element {
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="green"
       marginBottom={1}
       paddingX={1}
     >
