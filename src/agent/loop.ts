@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { chatOnce } from "../llm/router.js";
 import type {
   ChatMessage,
@@ -30,7 +31,8 @@ import {
 } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
-import type { ToolExecutionContext } from "../tools/types.js";
+import type { ToolExecutionContext, UserInputResponse } from "../tools/types.js";
+import { getPlatformShellCommand } from "../tools/shell.js";
 import {
   FETCH_WEBPAGE_TOOL_NAME,
   createFetchWebpageSessionCache,
@@ -52,6 +54,7 @@ export const DEFAULT_MAX_HISTORY_TURNS = 10;
 // they can finish naturally, so keep a guardrail without forcing tiny loops.
 const MAX_TOOL_CALL_ROUNDS = 8;
 const TOOL_LOOP_WARNING_AFTER_ROUND = 4;
+const MAX_MODEL_REQUEST_TIMEOUT_RETRIES = 6;
 
 export class AgentToolLoopLimitError extends Error {
   readonly maxRounds: number;
@@ -100,6 +103,16 @@ export type AgentTurnResult = {
   trimmedTurns: number;
 };
 
+type RoundPromptGuidance = {
+  canRequestUserInput: boolean;
+  userInputDismissed: boolean;
+};
+
+type ClarificationReplyKind =
+  | "clarifying_question"
+  | "depends_on_user_input"
+  | "other";
+
 const PLAN_UPDATE_TOOL_NAME = "update_plan";
 const PLAN_EXEMPT_TOOL_NAMES = new Set([PLAN_UPDATE_TOOL_NAME, "request_user_input"]);
 
@@ -128,6 +141,10 @@ export function buildTurnMessages(
       role: "system",
       content: getEffectiveSystemPrompt(session),
     },
+    {
+      role: "system",
+      content: buildRuntimeEnvironmentMessage(),
+    },
     ...session.history,
     {
       role: "user",
@@ -153,7 +170,10 @@ export async function runAgentTurn(
   const trimmedTurns = trimSessionHistory(session, trimmedPrompt);
   const baseMessages = buildTurnMessages(session, trimmedPrompt);
   const estimatedPromptTokens = estimateChatMessageTokens(
-    buildRoundMessages(baseMessages, 0, false, session.activePlan),
+    buildRoundMessages(baseMessages, 0, false, session.activePlan, {
+      canRequestUserInput: Boolean(options?.toolContext?.userInput?.requestUserInput),
+      userInputDismissed: false,
+    }),
   );
   const response = await resolveAgentReply(
     baseMessages,
@@ -245,33 +265,56 @@ async function resolveAgentReply(
   options?: AgentTurnOptions,
 ): Promise<{ content: string; usage?: ProviderUsage }> {
   const messages = [...baseMessages];
-  const tools = getAgentToolDefinitions(session.mode);
+  const canRequestUserInput = Boolean(options?.toolContext?.userInput?.requestUserInput);
+  const tools = getAgentToolDefinitions(session.mode, options?.toolContext);
   let lastUsage: ProviderUsage | undefined;
+  let userInputDismissed = false;
+  let timeoutRetryCount = 0;
 
   for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
     throwIfAborted(options?.abortSignal);
     const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
-    options?.onModelRequestStateChange?.(true);
-    const response = await chatOnce(
-      buildRoundMessages(messages, round, isFinalAnswerAttempt, session.activePlan),
-      {
-        ...(options?.model ? { model: options.model } : {}),
-        ...(options?.temperature !== undefined
-          ? { temperature: options.temperature }
-          : {}),
-        ...(options?.providerConfig
-          ? { providerConfig: options.providerConfig }
-          : {}),
-        ...(options?.abortSignal
-          ? { abortSignal: options.abortSignal }
-          : {}),
-        // The last pass disables tools so the model has to summarize or explain
-        // the limit instead of looping forever through more reads or commands.
-        ...(isFinalAnswerAttempt ? {} : { tools }),
-      },
-    ).finally(() => {
-      options?.onModelRequestStateChange?.(false);
-    });
+    let response;
+    while (true) {
+      options?.onModelRequestStateChange?.(true);
+      try {
+        response = await chatOnce(
+          buildRoundMessages(messages, round, isFinalAnswerAttempt, session.activePlan, {
+            canRequestUserInput,
+            userInputDismissed,
+          }),
+          {
+            ...(options?.model ? { model: options.model } : {}),
+            ...(options?.temperature !== undefined
+              ? { temperature: options.temperature }
+              : {}),
+            ...(options?.providerConfig
+              ? { providerConfig: options.providerConfig }
+              : {}),
+            ...(options?.abortSignal
+              ? { abortSignal: options.abortSignal }
+              : {}),
+            // The last pass disables tools so the model has to summarize or explain
+            // the limit instead of looping forever through more reads or commands.
+            ...(isFinalAnswerAttempt ? {} : { tools }),
+          },
+        );
+        timeoutRetryCount = 0;
+        break;
+      } catch (error) {
+        if (!isProviderRequestTimeout(error) || timeoutRetryCount >= MAX_MODEL_REQUEST_TIMEOUT_RETRIES) {
+          throw error;
+        }
+
+        timeoutRetryCount += 1;
+        messages.push({
+          role: "system",
+          content: buildModelTimeoutRetryMessage(timeoutRetryCount, error),
+        });
+      } finally {
+        options?.onModelRequestStateChange?.(false);
+      }
+    }
     throwIfAborted(options?.abortSignal);
     if (response.usage) {
       lastUsage = response.usage;
@@ -282,8 +325,59 @@ async function resolveAgentReply(
         throw new Error("Model returned empty content.");
       }
 
+      const clarificationReplyKind =
+        session.activePlan && !isTaskPlanResolved(session.activePlan) &&
+          (canRequestUserInput || userInputDismissed)
+          ? await classifyClarificationReply(
+              response.content,
+              {
+                canRequestUserInput,
+                userInputDismissed,
+              },
+              options,
+            )
+          : "other";
+
+      if (session.activePlan && !isTaskPlanResolved(session.activePlan)) {
+        if (canRequestUserInput && clarificationReplyKind === "clarifying_question") {
+          if (isFinalAnswerAttempt) {
+            throw new Error(
+              "Use request_user_input for clarifying questions while the task plan is incomplete.",
+            );
+          }
+
+          messages.push({
+            role: "assistant",
+            content: response.content,
+          });
+          messages.push({
+            role: "system",
+            content: buildClarificationToolReminder(session.activePlan),
+          });
+          continue;
+        }
+
+        if (userInputDismissed && clarificationReplyKind === "depends_on_user_input") {
+          if (isFinalAnswerAttempt) {
+            throw new Error(
+              "The user declined the clarification request. Continue with reasonable assumptions or further inspection instead of ending the turn.",
+            );
+          }
+
+          messages.push({
+            role: "assistant",
+            content: response.content,
+          });
+          messages.push({
+            role: "system",
+            content: buildDismissedUserInputReminder(session.activePlan),
+          });
+          continue;
+        }
+      }
+
       if (session.activePlan && hasTaskPlanProgress(session.activePlan) && !isTaskPlanResolved(session.activePlan)) {
-        if (doesAssistantReportBlockedOutcome(response.content)) {
+        if (doesAssistantReportBlockedOutcomeStrict(response.content)) {
           session.activePlan = markRemainingPlanStepsBlocked(session.activePlan);
         } else {
           if (response.content && options?.onChunk) {
@@ -302,7 +396,10 @@ async function resolveAgentReply(
           });
           messages.push({
             role: "system",
-            content: buildIncompletePlanReminder(session.activePlan),
+            content: buildIncompletePlanReminder(session.activePlan, {
+              canRequestUserInput,
+              userInputDismissed,
+            }),
           });
           continue;
         }
@@ -357,6 +454,11 @@ async function resolveAgentReply(
         toolName: toolCall.name,
         content: toolExecution.toolResult,
       });
+      if (toolExecution.userInputResponseKind === "dismissed") {
+        userInputDismissed = true;
+      } else if (toolExecution.userInputResponseKind) {
+        userInputDismissed = false;
+      }
 
       if (toolExecution.policyMessage) {
         messages.push({
@@ -373,6 +475,7 @@ async function resolveAgentReply(
 type ToolExecutionOutcome = {
   toolResult: string;
   policyMessage?: string;
+  userInputResponseKind?: UserInputResponse["kind"];
 };
 
 async function executeToolCallForAgentRound(
@@ -395,8 +498,13 @@ async function executeToolCallForAgentRound(
   }
 
   if (toolCall.name !== FETCH_WEBPAGE_TOOL_NAME) {
+    const toolResult = await executeAgentTool(toolCall, mode, toolContext);
+    if (toolCall.name === "request_user_input") {
+      return buildUserInputToolOutcome(toolResult);
+    }
+
     return {
-      toolResult: await executeAgentTool(toolCall, mode, toolContext),
+      toolResult,
     };
   }
 
@@ -455,8 +563,9 @@ function buildRoundMessages(
   round: number,
   isFinalAnswerAttempt: boolean,
   activePlan: TaskPlan | null,
+  guidance: RoundPromptGuidance,
 ): ChatMessage[] {
-  const planMessage = buildActivePlanSystemMessage(activePlan);
+  const planMessage = buildActivePlanSystemMessage(activePlan, guidance);
   const warning = buildToolLoopWarning(round, isFinalAnswerAttempt);
   return [
     ...messages,
@@ -492,13 +601,14 @@ function buildToolLoopWarning(
 
 function buildActivePlanSystemMessage(
   activePlan: TaskPlan | null,
+  guidance: RoundPromptGuidance,
 ): string | null {
   if (!activePlan) {
     return null;
   }
 
   const currentStep = getInProgressTaskPlanStep(activePlan);
-  return [
+  const lines = [
     `Active task plan: ${activePlan.title}`,
     "Before using any tool other than update_plan, mark exactly one relevant plan step as in_progress with update_plan.",
     "After finishing a step, mark it completed or blocked with update_plan.",
@@ -508,21 +618,80 @@ function buildActivePlanSystemMessage(
     ...activePlan.steps.map((step) =>
       `- ${step.id} [${step.status}] ${step.title}${step.note ? ` note: ${step.note}` : ""}`,
     ),
-  ].join("\n");
+  ];
+
+  if (guidance.canRequestUserInput) {
+    lines.push(
+      "If a material ambiguity blocks progress, call request_user_input instead of asking the user in plain text.",
+      "Ask one focused clarification question per tool call and only ask follow-up questions when they are distinct and necessary.",
+    );
+  }
+
+  if (guidance.userInputDismissed) {
+    lines.push(
+      "The user already declined a clarification request in this turn. Do not end or mark the task blocked solely because of that refusal.",
+      "Continue with repository inspection, reasonable assumptions, or another narrow approach instead of repeating the same question.",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function buildIncompletePlanReminder(
   activePlan: TaskPlan,
+  guidance: RoundPromptGuidance,
 ): string {
-  const remainingSteps = activePlan.steps
-    .filter((step) => step.status === "pending" || step.status === "in_progress")
-    .map((step) => `${step.id} ${step.title}`);
-  return [
+  const reminderParts = [
     "The task plan is still incomplete, so you may not finish this turn yet.",
     "Call update_plan to keep the plan accurate, then continue the remaining work.",
-    remainingSteps.length > 0
-      ? `Remaining steps: ${remainingSteps.join("; ")}`
+  ];
+
+  if (guidance.canRequestUserInput) {
+    reminderParts.push(
+      "If you need clarification, call request_user_input instead of asking the user in plain text.",
+    );
+  }
+
+  if (guidance.userInputDismissed) {
+    reminderParts.push(
+      "The user already declined a clarification request, so continue with reasonable assumptions or further inspection instead of ending here.",
+    );
+  }
+
+  const remainingSteps = formatRemainingPlanSteps(activePlan);
+  return [
+    ...reminderParts,
+    remainingSteps
+      ? `Remaining steps: ${remainingSteps}`
       : "All remaining steps must be explicitly marked blocked before you finish.",
+  ].join(" ");
+}
+
+function buildClarificationToolReminder(
+  activePlan: TaskPlan,
+): string {
+  const remainingSteps = formatRemainingPlanSteps(activePlan);
+  return [
+    "The task plan is still incomplete.",
+    "If you need clarification, call request_user_input instead of asking the user in plain text.",
+    "Ask one focused question at a time with 2-3 concise options, then continue the work.",
+    remainingSteps
+      ? `Remaining steps: ${remainingSteps}.`
+      : "Update the remaining steps explicitly before finishing.",
+  ].join(" ");
+}
+
+function buildDismissedUserInputReminder(
+  activePlan: TaskPlan,
+): string {
+  const remainingSteps = formatRemainingPlanSteps(activePlan);
+  return [
+    "The user declined that clarification request.",
+    "Do not end or mark the task blocked solely because of that refusal.",
+    "Continue with repository inspection, reasonable assumptions, or another narrow approach instead.",
+    remainingSteps
+      ? `Remaining steps: ${remainingSteps}.`
+      : "Update the remaining steps explicitly before finishing.",
   ].join(" ");
 }
 
@@ -566,9 +735,178 @@ function ensureAssistantChunkSpacing(content: string): string {
     : `${content}\n\n`;
 }
 
-function doesAssistantReportBlockedOutcome(content: string): boolean {
-  return /(?:blocked|pending interactive approval|requires approval|waiting for approval|cannot continue|needs user input|被阻止|需要审批|等待审批|无法继续)/i
+async function classifyClarificationReply(
+  content: string,
+  guidance: RoundPromptGuidance,
+  options?: AgentTurnOptions,
+): Promise<ClarificationReplyKind> {
+  const normalized = content.trim();
+  if (!normalized) {
+    return "other";
+  }
+
+  const fallbackKind = inferClarificationReplyKindFallback(content, guidance);
+  options?.onModelRequestStateChange?.(true);
+  try {
+    const response = await chatOnce(
+      [
+        {
+          role: "system",
+          content: [
+            "You classify a draft assistant reply for an agent runtime.",
+            'Return JSON only with this exact shape: {"kind":"clarifying_question"|"depends_on_user_input"|"other"}.',
+            "Use clarifying_question when the draft directly asks the user to answer, identify, choose, confirm, or locate something and it should have used request_user_input instead of plain text.",
+            "Use depends_on_user_input when the draft says it cannot continue or finish because the user did not answer or because more user input is needed.",
+            "Use other for everything else.",
+            "Do not explain your reasoning.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `request_user_input_available: ${guidance.canRequestUserInput ? "true" : "false"}`,
+            `user_input_dismissed_this_turn: ${guidance.userInputDismissed ? "true" : "false"}`,
+            "draft_reply:",
+            normalized,
+          ].join("\n"),
+        },
+      ],
+      {
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.providerConfig
+          ? { providerConfig: options.providerConfig }
+          : {}),
+        ...(options?.abortSignal
+          ? { abortSignal: options.abortSignal }
+          : {}),
+        temperature: 0,
+      },
+    );
+    return parseClarificationReplyKind(response.content) ?? fallbackKind;
+  } catch {
+    return fallbackKind;
+  } finally {
+    options?.onModelRequestStateChange?.(false);
+  }
+}
+
+function parseClarificationReplyKind(content: string): ClarificationReplyKind | null {
+  try {
+    const normalized = content.trim();
+    const start = normalized.indexOf("{");
+    const end = normalized.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      return null;
+    }
+
+    const parsed = JSON.parse(normalized.slice(start, end + 1)) as { kind?: unknown };
+    return parsed.kind === "clarifying_question" ||
+        parsed.kind === "depends_on_user_input" ||
+        parsed.kind === "other"
+      ? parsed.kind
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function inferClarificationReplyKindFallback(
+  content: string,
+  guidance: RoundPromptGuidance,
+): ClarificationReplyKind {
+  if (guidance.canRequestUserInput && doesAssistantAskClarifyingQuestionStrict(content)) {
+    return "clarifying_question";
+  }
+
+  if (guidance.userInputDismissed && doesAssistantDependOnUserInputStrict(content)) {
+    return "depends_on_user_input";
+  }
+
+  return "other";
+}
+
+function doesAssistantAskClarifyingQuestionStrict(content: string): boolean {
+  const normalized = content.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const hasClarifyingLanguage =
+    /(?:can you|could you|would you|do you want|should i|please tell me|help me find|what is the name|which file|which function|which command|where is|\u80fd\u5426|\u8bf7\u95ee|\u4f60\u80fd|\u60a8\u80fd|\u544a\u8bc9\u6211|\u5e2e\u6211\u786e\u8ba4|\u5e2e\u6211\u627e\u5230|\u4e3b\u51fd\u6570\u540d\u662f\u4ec0\u4e48|\u54ea\u4e2a\u6587\u4ef6|\u54ea\u4e2a\u51fd\u6570|\u54ea\u4e2a\u547d\u4ee4|\u5728\u54ea\u91cc)/i
+      .test(normalized);
+  const hasQuestionSignal =
+    /[?\uFF1F]/.test(normalized) || /\b(?:which|what|where|when|who|why|how)\b/i.test(normalized);
+  return hasClarifyingLanguage && hasQuestionSignal;
+}
+
+function doesAssistantDependOnUserInputStrict(content: string): boolean {
+  return /(?:need(?:s)? (?:more )?(?:user|your) (?:input|answer|reply|response)|cannot continue without (?:user|your) (?:input|answer|reply|response)|can't continue without (?:user|your) (?:input|answer|reply|response)|requires clarification from you|\u9700\u8981(?:\u4f60\u7684)?(?:\u8f93\u5165|\u56de\u7b54|\u56de\u590d|\u786e\u8ba4)|\u6ca1\u6709(?:\u4f60\u7684)?(?:\u8f93\u5165|\u56de\u7b54|\u56de\u590d|\u786e\u8ba4)\u5c31\u65e0\u6cd5\u7ee7\u7eed|\u65e0\u6cd5\u5728\u6ca1\u6709(?:\u4f60\u7684)?(?:\u8f93\u5165|\u56de\u7b54|\u56de\u590d|\u786e\u8ba4)\u7684\u60c5\u51b5\u4e0b\u7ee7\u7eed)/i
     .test(content);
+}
+
+function doesAssistantReportBlockedOutcomeStrict(content: string): boolean {
+  if (doesAssistantDependOnUserInputStrict(content)) {
+    return false;
+  }
+
+  return /(?:pending interactive approval|requires approval|waiting for approval|permission denied|access denied|blocked by policy|command was blocked|workspace edit approval|sandbox denied|read-only environment|missing credentials|authentication required|\u9700\u8981\u5ba1\u6279|\u7b49\u5f85\u5ba1\u6279|\u6743\u9650\u4e0d\u8db3)/i
+    .test(content);
+}
+
+function doesAssistantAskClarifyingQuestion(content: string): boolean {
+  return doesAssistantAskClarifyingQuestionStrict(content);
+}
+
+function doesAssistantDependOnUserInput(content: string): boolean {
+  return doesAssistantDependOnUserInputStrict(content);
+}
+
+function doesAssistantReportBlockedOutcome(content: string): boolean {
+  return doesAssistantReportBlockedOutcomeStrict(content);
+}
+
+function buildUserInputToolOutcome(toolResult: string): ToolExecutionOutcome {
+  const userInputResponseKind = parseUserInputResponseKind(toolResult);
+  if (userInputResponseKind !== "dismissed") {
+    return userInputResponseKind
+      ? { toolResult, userInputResponseKind }
+      : { toolResult };
+  }
+
+  return {
+    toolResult,
+    userInputResponseKind,
+    policyMessage:
+      "The user declined that clarification request. Continue with repository inspection, reasonable assumptions, or another narrow approach instead of ending the task solely because the user refused to answer.",
+  };
+}
+
+function parseUserInputResponseKind(
+  toolResult: string,
+): UserInputResponse["kind"] | undefined {
+  try {
+    const parsed = JSON.parse(toolResult) as {
+      ok?: boolean;
+      response?: { kind?: unknown };
+    };
+    if (!parsed.ok) {
+      return undefined;
+    }
+
+    const kind = parsed.response?.kind;
+    return kind === "option" || kind === "custom" || kind === "dismissed"
+      ? kind
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatRemainingPlanSteps(activePlan: TaskPlan): string {
+  return activePlan.steps
+    .filter((step) => step.status === "pending" || step.status === "in_progress")
+    .map((step) => `${step.id} ${step.title}`)
+    .join("; ");
 }
 
 function markRemainingPlanStepsBlocked(
@@ -671,6 +1009,55 @@ function trimConversationHistory(
 
 function getEffectiveSystemPrompt(session: AgentSession): string {
   return buildSessionSystemPrompt(session.systemPrompt, session.mode);
+}
+
+function buildRuntimeEnvironmentMessage(): string {
+  const shell = getPlatformShellCommand("__superrun_environment_probe__");
+  const shellLabel = process.platform === "win32"
+    ? "PowerShell"
+    : basename(shell.file || "sh");
+  const shellCommand = [shell.file, ...shell.args.slice(0, -1)].join(" ");
+  const platformLabel = describePlatform(process.platform);
+  const syntaxHint = process.platform === "win32"
+    ? "Use Windows and PowerShell command syntax by default. Do not assume bash, grep, ls, find, or head are available unless you explicitly invoke a compatible shell."
+    : "Use POSIX shell syntax by default unless you explicitly invoke a different shell.";
+
+  return [
+    "Runtime environment:",
+    `- platform: ${platformLabel} (${process.platform})`,
+    `- run_command shell: ${shellLabel} via ${shellCommand}`,
+    `- workspace root: ${process.cwd()}`,
+    `- guidance: ${syntaxHint}`,
+  ].join("\n");
+}
+
+function describePlatform(platform: NodeJS.Platform): string {
+  switch (platform) {
+    case "win32":
+      return "Windows";
+    case "darwin":
+      return "macOS";
+    case "linux":
+      return "Linux";
+    default:
+      return platform;
+  }
+}
+
+function isProviderRequestTimeout(error: unknown): error is Error {
+  return error instanceof Error &&
+    /Request timed out after \d+ms\./.test(error.message);
+}
+
+function buildModelTimeoutRetryMessage(
+  retryCount: number,
+  error: Error,
+): string {
+  return [
+    `The previous provider request timed out (${error.message}).`,
+    `Retry ${retryCount} of ${MAX_MODEL_REQUEST_TIMEOUT_RETRIES}: continue from the current conversation state instead of restarting the task.`,
+    "Do not repeat finished work just because the previous request timed out.",
+  ].join(" ");
 }
 
 function countHistoryTurns(history: ConversationMessage[]): number {

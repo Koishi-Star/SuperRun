@@ -21,7 +21,7 @@ export const requestUserInputTool = {
   definition: {
     name: "request_user_input",
     description:
-      "Ask the user one focused clarifying question during plan mode. Offer 2-3 concise options; the UI will also provide a custom-input path.",
+      "Ask the user one focused clarifying question when progress depends on a material ambiguity. Offer 2-3 concise options, ask one question per tool call, and use follow-up questions only when they are distinct and necessary.",
     parameters: {
       type: "object",
       properties: {

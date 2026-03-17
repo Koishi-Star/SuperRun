@@ -16,7 +16,7 @@ import type { ToolExecutionContext } from "./types.js";
 import { updatePlanTool } from "./update_plan.js";
 import { writeFileTool } from "./write_file.js";
 
-const defaultModeTools = [
+const defaultModeBaseTools = [
   fetchWebpageTool,
   updatePlanTool,
   runCommandTool,
@@ -31,10 +31,13 @@ const defaultModeTools = [
   emptyDeleteAreaTool,
 ] as const;
 const strictModeTools = [listFilesTool, readFileTool, listDeletedFilesTool] as const;
-const planModeTools = [listFilesTool, readFileTool, requestUserInputTool] as const;
+const planModeBaseTools = [listFilesTool, readFileTool] as const;
 
-export function getAgentToolDefinitions(mode: AgentMode): ToolDefinition[] {
-  return getAgentTools(mode).map((tool) => tool.definition);
+export function getAgentToolDefinitions(
+  mode: AgentMode,
+  context?: ToolExecutionContext,
+): ToolDefinition[] {
+  return getAgentTools(mode, context).map((tool) => tool.definition);
 }
 
 export async function executeAgentTool(
@@ -42,7 +45,7 @@ export async function executeAgentTool(
   mode: AgentMode,
   context?: ToolExecutionContext,
 ): Promise<string> {
-  const tool = getAgentTools(mode).find(
+  const tool = getAgentTools(mode, context).find(
     (candidate) => candidate.definition.name === toolCall.name,
   );
 
@@ -56,14 +59,20 @@ export async function executeAgentTool(
   return tool.execute(toolCall.arguments, context);
 }
 
-function getAgentTools(mode: AgentMode) {
+function getAgentTools(mode: AgentMode, context?: ToolExecutionContext) {
+  const includeRequestUserInput = Boolean(context?.userInput?.requestUserInput);
+
   if (mode === "strict") {
     return strictModeTools;
   }
 
   if (mode === "plan") {
-    return planModeTools;
+    return includeRequestUserInput
+      ? [...planModeBaseTools, requestUserInputTool]
+      : planModeBaseTools;
   }
 
-  return defaultModeTools;
+  return includeRequestUserInput
+    ? [fetchWebpageTool, updatePlanTool, requestUserInputTool, ...defaultModeBaseTools.slice(2)]
+    : defaultModeBaseTools;
 }

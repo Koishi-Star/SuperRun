@@ -12,6 +12,8 @@ import {
   getAgentSessionStats,
   runAgentTurn,
 } from "../src/agent/loop.js";
+import { createTaskPlan, updateTaskPlanStep } from "../src/agent/plan.js";
+import type { UserInputRequest, UserInputResponse } from "../src/tools/types.js";
 import { startMockOpenAIServer } from "./helpers/mock-openai-server.js";
 
 test("runAgentTurn appends history and sends prior turns", async () => {
@@ -40,8 +42,12 @@ test("runAgentTurn appends history and sends prior turns", async () => {
 
     const secondReply = await runAgentTurn(session, "What did I say?");
     assert.equal(secondReply.reply, "Second answer");
-    assert.deepEqual(server.requests[1]?.messages, [
-      { role: "system", content: "Test system prompt" },
+    assert.equal(server.requests[1]?.messages?.[0]?.role, "system");
+    assert.equal(server.requests[1]?.messages?.[0]?.content, "Test system prompt");
+    assert.equal(server.requests[1]?.messages?.[1]?.role, "system");
+    assert.match(String(server.requests[1]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
+    assert.match(String(server.requests[1]?.messages?.[1]?.content ?? ""), /run_command shell:/);
+    assert.deepEqual(server.requests[1]?.messages?.slice(2), [
       { role: "user", content: "Hello" },
       { role: "assistant", content: "First answer" },
       { role: "user", content: "What did I say?" },
@@ -96,8 +102,11 @@ test("runAgentTurn trims history to the most recent configured turns", async () 
     const thirdReply = await runAgentTurn(session, "Third");
 
     assert.equal(thirdReply.reply, "Third answer");
-    assert.deepEqual(server.requests[2]?.messages, [
-      { role: "system", content: "Test system prompt" },
+    assert.equal(server.requests[2]?.messages?.[0]?.role, "system");
+    assert.equal(server.requests[2]?.messages?.[0]?.content, "Test system prompt");
+    assert.equal(server.requests[2]?.messages?.[1]?.role, "system");
+    assert.match(String(server.requests[2]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
+    assert.deepEqual(server.requests[2]?.messages?.slice(2), [
       { role: "user", content: "Second" },
       { role: "assistant", content: "Second answer" },
       { role: "user", content: "Third" },
@@ -233,6 +242,46 @@ test("runAgentTurn aborts cleanly without mutating session history", async () =>
   }
 });
 
+test("runAgentTurn retries provider request timeouts without consuming the turn", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      content: "slow first reply",
+      delayMs: 80,
+    },
+    "Recovered after retry.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "20";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const reply = await runAgentTurn(session, "Retry if the provider stalls.");
+
+    assert.equal(reply.reply, "Recovered after retry.");
+    assert.equal(server.requests.length, 2);
+    assert.equal(
+      server.requests[1]?.messages?.some((message) =>
+        message.role === "system" &&
+        typeof message.content === "string" &&
+        /previous provider request timed out/i.test(message.content)
+      ),
+      true,
+    );
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
 test("runAgentTurn resolves a list_files tool call before producing the final answer", async () => {
   const server = await startMockOpenAIServer([
     {
@@ -274,8 +323,11 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
     assert.equal(reply.reply, "The workspace includes alpha.ts and beta.txt.");
     assert.equal(server.requests.length, 2);
     assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "list_files");
-    assert.deepEqual(server.requests[1]?.messages, [
-      { role: "system", content: "Test system prompt" },
+    assert.equal(server.requests[1]?.messages?.[0]?.role, "system");
+    assert.equal(server.requests[1]?.messages?.[0]?.content, "Test system prompt");
+    assert.equal(server.requests[1]?.messages?.[1]?.role, "system");
+    assert.match(String(server.requests[1]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
+    assert.deepEqual(server.requests[1]?.messages?.slice(2), [
       { role: "user", content: "What files are here?" },
       {
         role: "assistant",
@@ -371,14 +423,262 @@ test("runAgentTurn uses the plan-mode prompt and plan-only tools", async () => {
 
     assert.equal(reply.reply, "Plan mode can now continue with the clarified constraint.");
     assert.match(String(server.requests[0]?.messages[0]?.content ?? ""), /currently in plan mode/i);
+    assert.match(String(server.requests[0]?.messages[1]?.content ?? ""), /Runtime environment:/);
     assert.deepEqual(
       server.requests[0]?.tools?.map((tool) => tool.function?.name),
       ["list_files", "read_file", "request_user_input"],
     );
-    const toolMessage = server.requests[1]?.messages[3];
+    const toolMessage = server.requests[1]?.messages[4];
     assert.equal(toolMessage?.role, "tool");
     assert.match(String(toolMessage?.content ?? ""), /"kind":"option"/);
     assert.match(String(toolMessage?.content ?? ""), /"value":"keep-renderer"/);
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
+test("runAgentTurn exposes request_user_input in default mode when interactive input is available", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "request_user_input",
+          arguments: JSON.stringify({
+            title: "First target",
+            question: "Which file should I inspect first?",
+            options: [
+              {
+                value: "cli",
+                label: "cli.ts",
+                description: "Inspect the main command entrypoint first.",
+              },
+              {
+                value: "shell",
+                label: "interactive-shell.tsx",
+                description: "Start from the Ink shell renderer instead.",
+              },
+            ],
+          }),
+        },
+      ],
+    },
+    "I will inspect cli.ts first.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({ systemPrompt: "Test system prompt" });
+    const reply = await runAgentTurn(session, "Add the new command.", {
+      toolContext: {
+        userInput: {
+          requestUserInput: async () => ({
+            kind: "option",
+            value: "cli",
+            label: "cli.ts",
+            answer: "cli.ts",
+          }),
+        },
+      },
+    });
+
+    assert.equal(reply.reply, "I will inspect cli.ts first.");
+    assert.equal(
+      server.requests[0]?.tools?.some((tool) => tool.function?.name === "request_user_input"),
+      true,
+    );
+    assert.match(findLastToolMessageContent(server.requests[1]?.messages), /"kind":"option"/);
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
+test("runAgentTurn requires request_user_input when the model asks a plain-text clarifying question during an incomplete plan", async () => {
+  const server = await startMockOpenAIServer([
+    "Can you tell me which file owns slash-command handling?",
+    JSON.stringify({ kind: "clarifying_question" }),
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "request_user_input",
+          arguments: JSON.stringify({
+            title: "Slash-command handler",
+            question: "Which file should I inspect for slash-command handling?",
+            options: [
+              {
+                value: "cli",
+                label: "cli.ts",
+                description: "Inspect the main CLI command router first.",
+              },
+              {
+                value: "shell",
+                label: "interactive-shell.tsx",
+                description: "Start from the Ink shell instead.",
+              },
+            ],
+          }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_2",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "completed",
+          }),
+        },
+      ],
+    },
+    "I found the handler and can continue.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({
+      systemPrompt: "Test system prompt",
+      activePlan: createClarificationPlan(),
+    });
+    const chunks: string[] = [];
+    const reply = await runAgentTurn(session, "Add the /ciallo command.", {
+      toolContext: createPlanAwareInteractiveToolContext(session, async () => ({
+        kind: "option",
+        value: "cli",
+        label: "cli.ts",
+        answer: "cli.ts",
+      })),
+      onChunk: (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+
+    assert.equal(reply.reply, "I found the handler and can continue.");
+    assert.equal(server.requests.length, 5);
+    assert.equal(
+      server.requests[2]?.messages?.some((message) =>
+        message.role === "system" &&
+        typeof message.content === "string" &&
+        /call request_user_input instead of asking the user in plain text/i.test(message.content)
+      ),
+      true,
+    );
+    assert.equal(
+      chunks.some((chunk) => /which file owns slash-command handling/i.test(chunk)),
+      false,
+    );
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
+test("runAgentTurn continues after the user dismisses a clarification request", async () => {
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "request_user_input",
+          arguments: JSON.stringify({
+            title: "Target handler",
+            question: "Which command handler should I inspect first?",
+            options: [
+              {
+                value: "cli",
+                label: "cli.ts",
+                description: "Use the main CLI entrypoint as the default target.",
+              },
+              {
+                value: "shell",
+                label: "interactive-shell.tsx",
+                description: "Use the Ink shell as the default target.",
+              },
+            ],
+          }),
+        },
+      ],
+    },
+    "I cannot continue without your answer.",
+    JSON.stringify({ kind: "depends_on_user_input" }),
+    {
+      toolCalls: [
+        {
+          id: "call_2",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "completed",
+            note: "Assumed the existing CLI command handler was the right target.",
+          }),
+        },
+      ],
+    },
+    "I assumed the existing CLI command handler was the right target and kept going.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({
+      systemPrompt: "Test system prompt",
+      activePlan: createClarificationPlan(),
+    });
+    const reply = await runAgentTurn(session, "Add the /ciallo command.", {
+      toolContext: createPlanAwareInteractiveToolContext(session, async () => ({
+        kind: "dismissed",
+        value: null,
+        label: null,
+        answer: "",
+      })),
+    });
+
+    assert.equal(
+      reply.reply,
+      "I assumed the existing CLI command handler was the right target and kept going.",
+    );
+    assert.equal(server.requests.length, 5);
+    assert.equal(
+      server.requests[3]?.messages?.some((message) =>
+        message.role === "system" &&
+        typeof message.content === "string" &&
+        /user already declined a clarification request/i.test(message.content)
+      ),
+      true,
+    );
   } finally {
     restoreEnv(previousEnv);
     await server.close();
@@ -425,9 +725,9 @@ test("runAgentTurn preserves provider reasoning_content across tool calls", asyn
 
     assert.equal(reply.reply, "There is one file here.");
     assert.equal(
-      server.requests[1]?.messages[2] &&
-        "reasoning_content" in server.requests[1].messages[2]
-        ? (server.requests[1].messages[2] as Record<string, unknown>).reasoning_content
+      server.requests[1]?.messages[3] &&
+        "reasoning_content" in server.requests[1].messages[3]
+        ? (server.requests[1].messages[3] as Record<string, unknown>).reasoning_content
         : undefined,
       "Need to inspect the workspace before answering.",
     );
@@ -480,7 +780,9 @@ test("runAgentTurn resolves a run_command tool call in default mode", async () =
       true,
     );
 
-    const toolMessage = server.requests[1]?.messages[3];
+    assert.match(String(server.requests[0]?.messages?.[1]?.content ?? ""), /Runtime environment:/);
+
+    const toolMessage = server.requests[1]?.messages[4];
     assert.equal(toolMessage?.role, "tool");
     assert.equal(toolMessage?.name, "run_command");
     assert.equal(
@@ -856,6 +1158,61 @@ function restoreEnv(previousEnv: Record<string, string | undefined>): void {
 
     process.env[key] = value;
   }
+}
+
+function createClarificationPlan() {
+  return updateTaskPlanStep(
+    createTaskPlan({
+      title: "Clarify the command target",
+      sourcePrompt: "Add the /ciallo command.",
+      steps: [
+        {
+          title: "Clarify the target command path",
+          details: "Confirm where slash-command handling should be updated first.",
+        },
+      ],
+    }),
+    "step_1",
+    { status: "in_progress" },
+  );
+}
+
+function createPlanAwareInteractiveToolContext(
+  session: ReturnType<typeof createAgentSession>,
+  requestUserInput: (request: UserInputRequest) => Promise<UserInputResponse>,
+) {
+  return {
+    userInput: {
+      requestUserInput,
+    },
+    plan: {
+      updatePlan: async (request: {
+        stepId: string;
+        status?: "pending" | "in_progress" | "completed" | "blocked";
+        note?: string | null;
+      }) => {
+        if (!session.activePlan) {
+          throw new Error("Expected an active plan in the test context.");
+        }
+
+        const nextPlan = updateTaskPlanStep(session.activePlan, request.stepId, {
+          ...(request.status ? { status: request.status } : {}),
+          ...(request.note !== undefined ? { note: request.note } : {}),
+        });
+        session.activePlan = nextPlan;
+        const nextStep = nextPlan.steps.find((step) => step.id === request.stepId);
+        if (!nextStep) {
+          throw new Error(`Unknown test plan step: ${request.stepId}`);
+        }
+
+        return {
+          planId: nextPlan.id,
+          stepId: nextStep.id,
+          status: nextStep.status,
+        };
+      },
+    },
+  };
 }
 
 function findLastToolMessageContent(messages: Array<Record<string, unknown>> | undefined): string {
