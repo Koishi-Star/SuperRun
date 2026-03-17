@@ -4,6 +4,7 @@ import { Command, Option } from "commander";
 import {
   AgentToolLoopLimitError,
   type AgentSession,
+  buildTurnMessages,
   commitAgentTurnHistory,
   createAgentSession,
   getAgentSessionStats,
@@ -18,7 +19,11 @@ import {
   updateTaskPlanStep,
   type TaskPlan,
 } from "./agent/plan.js";
-import { createEmptyContextBudgetSnapshot } from "./agent/context-budget.js";
+import {
+  buildContextBudgetSnapshot,
+  createEmptyContextBudgetSnapshot,
+  estimateChatMessageTokens,
+} from "./agent/context-budget.js";
 import {
   getAgentModeSummary,
   parseAgentMode,
@@ -113,6 +118,7 @@ import {
 } from "./llm/provider-catalog.js";
 import { chatOnce } from "./llm/router.js";
 import { loadWorkspaceFilePaths } from "./ui/file-reference.js";
+import { createInteractiveTraceEventSinkFromEnv } from "./testing/interactive-trace.js";
 import { editSystemPromptExternally } from "./ui/external-editor.js";
 import {
   createInteractiveRenderer,
@@ -272,11 +278,20 @@ type TurnVerificationResult = {
   failureReason: string | null;
 };
 
+type TaskPlanGenerationResult = {
+  plan: TaskPlan;
+  source: "model" | "fallback";
+  attempts: number;
+  lastFailureMessage: string | null;
+};
+
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
 const MIN_ALLOWED_COMMAND_PANEL_DURATION_MS = 100;
 const MAX_ALLOWED_COMMAND_PANEL_DURATION_MS = 10_000;
 const TASK_PLAN_HISTORY_CONTEXT_MESSAGES = 6;
+const TASK_PLAN_GENERATION_ATTEMPTS = 3;
+const TASK_PLAN_TIMEOUT_RETRIES = 3;
 const VERIFICATION_BUILD_COMMAND = "npm run build";
 const VERIFICATION_STATUS_TIMEOUT_MS = 10_000;
 const VERIFICATION_BUILD_TIMEOUT_MS = 120_000;
@@ -596,6 +611,7 @@ async function runInteractiveSession(
   session: AgentSession,
   state: InteractiveState,
 ): Promise<void> {
+  const traceEvent = createInteractiveTraceEventSinkFromEnv();
   const ui = createInteractiveRenderer({
     input,
     output,
@@ -607,6 +623,7 @@ async function runInteractiveSession(
 
       togglePlanMode(session, state, ui);
     },
+    ...(traceEvent ? { traceEvent } : {}),
   });
   await initializeProviderCatalogForStartup(session, state, ui);
 
@@ -1382,9 +1399,14 @@ async function handleInteractivePrompt(
   const turnEvents: ToolTurnEvent[] = [];
 
   let reply = "";
+  let finalReply = "";
+  let verification: TurnVerificationResult | null = null;
+  let turnFailureMessage: string | null = null;
+  let shouldCommitHistory = false;
+  let shouldCompleteTurn = false;
   const requestAbortController = ui ? new AbortController() : null;
   let exitRequestedDuringTurn = false;
-  let contextBudgetSnapshot = session.contextBudget;
+  let contextBudgetSnapshot = buildEstimatedTurnContextBudgetSnapshot(session, prompt, state);
   try {
     const result = await runAgentTurn(session, prompt, {
       providerConfig: getActiveProviderConfig(state),
@@ -1424,42 +1446,40 @@ async function handleInteractivePrompt(
         `Context budget trimmed ${result.trimmedTurns} older turn${result.trimmedTurns === 1 ? "" : "s"} before this request.`,
       );
     }
+    verification = await runTurnVerification(
+      session,
+      prompt,
+      verificationBaseline,
+      [...turnEvents],
+      reply,
+      ui,
+      turnEvents,
+    );
+    finalReply = verification?.failureReason
+      ? buildVerificationFailureReply(reply, verification)
+      : reply;
+    shouldCommitHistory = true;
+    shouldCompleteTurn = !verification?.failureReason;
   } catch (error) {
-    if (exitRequestedDuringTurn) {
-      return false;
-    }
-
-    const message = formatAgentTurnFailureMessage(error);
-    if (ui) {
-      ui.failActiveTurn(message);
-      return true;
-    }
-
-    throw new Error(message);
+    turnFailureMessage = formatAgentTurnFailureMessage(error);
   } finally {
     ui?.setActiveRequestCancel(null);
     ui?.setActiveRequestInterrupt(null);
   }
 
-  const verification = await runTurnVerification(
-    session,
-    prompt,
-    verificationBaseline,
-    [...turnEvents],
-    reply,
-    ui,
-    turnEvents,
-  );
-  const finalReply = verification?.failureReason
-    ? buildVerificationFailureReply(reply, verification)
-    : reply;
   session.contextBudget = contextBudgetSnapshot;
-  commitAgentTurnHistory(session, prompt, finalReply || "(empty response)");
+  if (shouldCommitHistory) {
+    commitAgentTurnHistory(session, prompt, finalReply || "(empty response)");
+  }
   applyTurnEventsToSession(state, turnEvents);
-  await persistCurrentSession(session, state);
+  await persistCurrentSession(session, state, { allowEmpty: true });
   await refreshDeleteAreaBanner(session, state, ui);
 
-  if (verification?.failureReason) {
+  if (turnFailureMessage) {
+    if (ui) {
+      ui.failActiveTurn(turnFailureMessage);
+    }
+  } else if (verification?.failureReason) {
     if (ui) {
       ui.failActiveTurn(finalReply);
     } else {
@@ -1477,17 +1497,35 @@ async function handleInteractivePrompt(
     process.stdout.write(finalReply);
   }
 
-  if (ui && verification?.failureReason) {
-    // Keep the transcript card visibly failed when verification rejects the turn.
-  } else if (ui) {
+  if (ui && shouldCompleteTurn) {
     ui.completeActiveTurn();
   }
 
-  if (!ui) {
+  if (!ui && !turnFailureMessage) {
     process.stdout.write("\n");
   }
   await renderTurnEvents(ui, turnEvents);
-  return true;
+  if (turnFailureMessage && !ui) {
+    throw new Error(turnFailureMessage);
+  }
+
+  return !exitRequestedDuringTurn;
+}
+
+function buildEstimatedTurnContextBudgetSnapshot(
+  session: AgentSession,
+  prompt: string,
+  state: InteractiveState,
+) {
+  const providerConfig = getActiveProviderConfig(state);
+  const estimatedPromptTokens = estimateChatMessageTokens(
+    buildTurnMessages(session, prompt.trim()),
+  );
+  return buildContextBudgetSnapshot({
+    modelContextTokens: providerConfig.modelContextTokens,
+    configuredContextLimitTokens: providerConfig.contextLimitTokens,
+    estimatedPromptTokens,
+  });
 }
 
 async function handleDeleteAllConfirmationLine(
@@ -2815,7 +2853,8 @@ async function ensureActiveTaskPlan(
   state: InteractiveState,
   ui: InteractiveRenderer | null,
 ): Promise<TaskPlan> {
-  const nextPlan = await generateTaskPlan(session, prompt, state);
+  const nextPlanResult = await generateTaskPlan(session, prompt, state);
+  const nextPlan = nextPlanResult.plan;
   if (session.activePlan) {
     recordSessionEvent(state, {
       timestamp: createSessionEventTimestamp(),
@@ -2826,6 +2865,15 @@ async function ensureActiveTaskPlan(
   }
 
   session.activePlan = nextPlan;
+  if (nextPlanResult.source === "fallback" && nextPlanResult.lastFailureMessage) {
+    recordSessionEvent(state, {
+      timestamp: createSessionEventTimestamp(),
+      kind: "plan_fallback_used",
+      title: nextPlan.title,
+      attempts: nextPlanResult.attempts,
+      reason: nextPlanResult.lastFailureMessage,
+    });
+  }
   recordSessionEvent(state, {
     timestamp: createSessionEventTimestamp(),
     kind: "plan_created",
@@ -2844,32 +2892,74 @@ async function generateTaskPlan(
   session: AgentSession,
   prompt: string,
   state: InteractiveState,
-): Promise<TaskPlan> {
-  try {
-    const response = await chatOnce(
-      buildTaskPlanMessages(session, prompt),
-      {
-        providerConfig: getActiveProviderConfig(state),
-        temperature: 0.1,
-      },
-    );
-    const parsed = parseTaskPlanResponse(response.content);
-    return createTaskPlan({
-      title: parsed.title || summarizePromptForPlan(prompt),
-      sourcePrompt: prompt,
-      steps: parsed.steps.map((step) => ({
-        title: step.title,
-        ...(step.details ? { details: step.details } : {}),
-      })),
-    });
-  } catch {
-    return createFallbackTaskPlan(prompt);
+): Promise<TaskPlanGenerationResult> {
+  let previousFailureMessage: string | null = null;
+
+  for (let attempt = 0; attempt < TASK_PLAN_GENERATION_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await requestTaskPlanDraft(session, prompt, state, previousFailureMessage);
+      const parsed = parseTaskPlanResponse(response.content);
+      return {
+        plan: createTaskPlan({
+          title: parsed.title || summarizePromptForPlan(prompt),
+          sourcePrompt: prompt,
+          steps: parsed.steps.map((step) => ({
+            title: step.title,
+            ...(step.details ? { details: step.details } : {}),
+          })),
+        }),
+        source: "model",
+        attempts: attempt + 1,
+        lastFailureMessage: null,
+      };
+    } catch (error) {
+      previousFailureMessage =
+        error instanceof Error ? error.message : "Unknown planning error.";
+    }
+  }
+
+  return {
+    plan: createFallbackTaskPlan(prompt),
+    source: "fallback",
+    attempts: TASK_PLAN_GENERATION_ATTEMPTS,
+    lastFailureMessage: previousFailureMessage,
+  };
+}
+
+async function requestTaskPlanDraft(
+  session: AgentSession,
+  prompt: string,
+  state: InteractiveState,
+  previousFailureMessage: string | null,
+) {
+  let timeoutRetryCount = 0;
+
+  while (true) {
+    try {
+      return await chatOnce(
+        buildTaskPlanMessages(session, prompt, previousFailureMessage),
+        {
+          providerConfig: getActiveProviderConfig(state),
+        },
+      );
+    } catch (error) {
+      if (!isProviderRequestTimeoutMessage(error) || timeoutRetryCount >= TASK_PLAN_TIMEOUT_RETRIES) {
+        throw error;
+      }
+
+      timeoutRetryCount += 1;
+      previousFailureMessage = [
+        previousFailureMessage,
+        `The previous planning request timed out (${error.message}). Continue the same planning task and return strict JSON only.`,
+      ].filter(Boolean).join(" ");
+    }
   }
 }
 
 function buildTaskPlanMessages(
   session: AgentSession,
   prompt: string,
+  previousFailureMessage: string | null = null,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
   return [
     {
@@ -2880,7 +2970,11 @@ function buildTaskPlanMessages(
         'Return JSON only with this exact shape: {"title":"short title","steps":[{"title":"step title","details":"short detail"}]}.',
         "Use 3 to 7 minimal executable steps.",
         "Keep each step concrete and implementation-oriented.",
+        "Do not use tools and do not serialize tool calls into the response.",
         "Do not include markdown, explanations, or extra keys.",
+        ...(previousFailureMessage
+          ? [`The previous planning attempt was invalid: ${previousFailureMessage}. Fix the output and return strict JSON only.`]
+          : []),
       ].join("\n\n"),
     },
     ...session.history.slice(-TASK_PLAN_HISTORY_CONTEXT_MESSAGES),
@@ -2949,6 +3043,11 @@ function createFallbackTaskPlan(prompt: string): TaskPlan {
       { title: "Verify the result and summarize any follow-up", details: "Run focused checks and confirm the behavior matches the request." },
     ],
   });
+}
+
+function isProviderRequestTimeoutMessage(error: unknown): error is Error {
+  return error instanceof Error &&
+    /Request timed out after \d+ms\./.test(error.message);
 }
 
 function summarizePromptForPlan(prompt: string): string {

@@ -376,14 +376,10 @@ async function resolveAgentReply(
         }
       }
 
-      if (session.activePlan && hasTaskPlanProgress(session.activePlan) && !isTaskPlanResolved(session.activePlan)) {
+      if (session.activePlan && !isTaskPlanResolved(session.activePlan)) {
         if (doesAssistantReportBlockedOutcomeStrict(response.content)) {
           session.activePlan = markRemainingPlanStepsBlocked(session.activePlan);
         } else {
-          if (response.content && options?.onChunk) {
-            options.onChunk(ensureAssistantChunkSpacing(response.content));
-          }
-
           if (isFinalAnswerAttempt) {
             throw new Error(
               "Task plan is still incomplete. Mark the remaining steps completed or blocked before finishing the turn.",
@@ -396,10 +392,14 @@ async function resolveAgentReply(
           });
           messages.push({
             role: "system",
-            content: buildIncompletePlanReminder(session.activePlan, {
-              canRequestUserInput,
-              userInputDismissed,
-            }),
+            content: buildIncompletePlanReminder(
+              session.activePlan,
+              {
+                canRequestUserInput,
+                userInputDismissed,
+              },
+              inferIncompletePlanRetryReason(response.content),
+            ),
           });
           continue;
         }
@@ -612,6 +612,7 @@ function buildActivePlanSystemMessage(
     `Active task plan: ${activePlan.title}`,
     "Before using any tool other than update_plan, mark exactly one relevant plan step as in_progress with update_plan.",
     "After finishing a step, mark it completed or blocked with update_plan.",
+    "While the task plan is unresolved, do not reply with prose-only progress updates. Your next response must include the tool calls needed to advance the current step or resolve the plan.",
     "Do not claim that edits succeeded unless the workspace was actually changed and later verification passes.",
     `Current in-progress step: ${currentStep ? `${currentStep.id} ${currentStep.title}` : "none"}`,
     "Plan steps:",
@@ -640,11 +641,19 @@ function buildActivePlanSystemMessage(
 function buildIncompletePlanReminder(
   activePlan: TaskPlan,
   guidance: RoundPromptGuidance,
+  retryReason: string | null = null,
 ): string {
   const reminderParts = [
     "The task plan is still incomplete, so you may not finish this turn yet.",
-    "Call update_plan to keep the plan accurate, then continue the remaining work.",
+    hasTaskPlanProgress(activePlan)
+      ? "Call update_plan to keep the plan accurate, then continue the remaining work."
+      : "No step is in progress yet. Call update_plan first to mark the relevant step as in_progress, then continue the work.",
+    "Your next response must contain the tool calls needed to advance the plan, not a prose-only status update.",
   ];
+
+  if (retryReason) {
+    reminderParts.push(`Retry reason: ${retryReason}`);
+  }
 
   if (guidance.canRequestUserInput) {
     reminderParts.push(
@@ -665,6 +674,27 @@ function buildIncompletePlanReminder(
       ? `Remaining steps: ${remainingSteps}`
       : "All remaining steps must be explicitly marked blocked before you finish.",
   ].join(" ");
+}
+
+function inferIncompletePlanRetryReason(content: string): string | null {
+  const normalized = content.trim();
+  if (!normalized) {
+    return "The previous reply tried to finish the turn without resolving the remaining plan steps.";
+  }
+
+  if (/<function_calls\b|<invoke\b|<parameter\b/i.test(normalized)) {
+    return "The previous reply wrote a tool call into plain text instead of emitting a real tool call.";
+  }
+
+  if (doesAssistantAskClarifyingQuestionStrict(normalized)) {
+    return "The previous reply asked the user in plain text instead of using request_user_input.";
+  }
+
+  if (/tool call|run_command|read_file|search_workspace|update_plan/i.test(normalized)) {
+    return "The previous reply described the next action in prose instead of actually calling the tool.";
+  }
+
+  return "The previous reply attempted to finish before the remaining plan steps were completed or blocked.";
 }
 
 function buildClarificationToolReminder(

@@ -62,6 +62,13 @@ export type SessionEvent =
     }
   | {
       timestamp: string;
+      kind: "plan_fallback_used";
+      title: string;
+      attempts: number;
+      reason: string;
+    }
+  | {
+      timestamp: string;
       kind: "plan_step_updated";
       planId: string;
       stepId: string;
@@ -108,6 +115,8 @@ export function formatSessionEvent(event: SessionEvent): string {
       return `${timestamp} ${event.level.toUpperCase()}: ${event.message}`;
     case "plan_created":
       return `${timestamp} Plan created: ${event.title} (${event.stepCount} steps).`;
+    case "plan_fallback_used":
+      return `${timestamp} Plan fallback used after ${event.attempts} failed planning attempt${event.attempts === 1 ? "" : "s"}: ${event.reason}`;
     case "plan_step_updated":
       return `${timestamp} Plan step updated: ${event.stepTitle} (${event.from} -> ${event.to}).`;
     case "plan_completed":

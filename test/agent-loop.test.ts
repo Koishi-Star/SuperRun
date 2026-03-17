@@ -426,7 +426,7 @@ test("runAgentTurn uses the plan-mode prompt and plan-only tools", async () => {
     assert.match(String(server.requests[0]?.messages[1]?.content ?? ""), /Runtime environment:/);
     assert.deepEqual(
       server.requests[0]?.tools?.map((tool) => tool.function?.name),
-      ["list_files", "read_file", "request_user_input"],
+      ["list_files", "search_workspace", "read_file", "request_user_input"],
     );
     const toolMessage = server.requests[1]?.messages[4];
     assert.equal(toolMessage?.role, "tool");
@@ -676,6 +676,77 @@ test("runAgentTurn continues after the user dismisses a clarification request", 
         message.role === "system" &&
         typeof message.content === "string" &&
         /user already declined a clarification request/i.test(message.content)
+      ),
+      true,
+    );
+  } finally {
+    restoreEnv(previousEnv);
+    await server.close();
+  }
+});
+
+test("runAgentTurn keeps incomplete-plan retry drafts out of streamed assistant output", async () => {
+  const server = await startMockOpenAIServer([
+    "Let me search for where slash commands are processed in the file.",
+    JSON.stringify({ kind: "other" }),
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "completed",
+            note: "Finished the initial inspection after the retry reminder.",
+          }),
+        },
+      ],
+    },
+    "I completed the inspection step and can continue.",
+  ]);
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    const session = createAgentSession({
+      systemPrompt: "Test system prompt",
+      activePlan: createClarificationPlan(),
+    });
+    const chunks: string[] = [];
+    const reply = await runAgentTurn(session, "Add the /ciallo command.", {
+      toolContext: createPlanAwareInteractiveToolContext(session, async () => ({
+        kind: "dismissed",
+        value: null,
+        label: null,
+        answer: "",
+      })),
+      onChunk: (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+
+    assert.equal(reply.reply, "I completed the inspection step and can continue.");
+    assert.equal(
+      chunks.some((chunk) => /Let me search for where slash commands are processed/i.test(chunk)),
+      false,
+    );
+    assert.equal(
+      server.requests.some((request) =>
+        request.messages?.some((message) =>
+          message.role === "system" &&
+          typeof message.content === "string" &&
+          /retry reason:/i.test(message.content) &&
+          /attempted to finish before the remaining plan steps were completed or blocked/i.test(message.content)
+        )
       ),
       true,
     );

@@ -42,6 +42,34 @@ test("CLI single-turn mode streams a prompt response without requiring a TTY", a
         { title: "Verify the output format" },
       ],
     }),
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "completed",
+          }),
+        },
+        {
+          id: "call_2",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_2",
+            status: "completed",
+          }),
+        },
+        {
+          id: "call_3",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_3",
+            status: "completed",
+          }),
+        },
+      ],
+    },
     "Hello from prompt mode.",
   ]);
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-cli-"));
@@ -60,7 +88,7 @@ test("CLI single-turn mode streams a prompt response without requiring a TTY", a
     );
 
     assert.equal(result.exitCode, 0, result.stderr || "CLI exited with a non-zero code.");
-    assert.equal(server.requests.length, 2);
+    assert.equal(server.requests.length, 3);
     assert.match(result.stdout, /Risk notice: this agent may read, run, modify, delete, or create files in the workspace\./);
     assert.match(result.stdout, /user: Hello there\./);
     assert.match(result.stdout, /plan:/);

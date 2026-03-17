@@ -133,8 +133,16 @@ export class OpenAICompatibleClient implements LLMClient {
 
     const message = data.choices?.[0]?.message;
     const rawContent = message?.content;
-    const content = normalizeAssistantContent(rawContent);
-    const toolCalls = normalizeToolCalls(message?.tool_calls);
+    const normalizedContent = normalizeAssistantContent(rawContent);
+    const nativeToolCalls = normalizeToolCalls(message?.tool_calls);
+    const inlineToolCallRepair =
+      nativeToolCalls.length === 0
+        ? extractInlineToolCalls(normalizedContent)
+        : null;
+    const content = inlineToolCallRepair?.content ?? normalizedContent;
+    const toolCalls = nativeToolCalls.length > 0
+      ? nativeToolCalls
+      : (inlineToolCallRepair?.toolCalls ?? []);
     const reasoningContent = normalizeReasoningContent(
       message?.reasoning_content,
     );
@@ -466,6 +474,76 @@ function normalizeToolCalls(
       },
     ];
   });
+}
+
+function extractInlineToolCalls(content: string): {
+  content: string;
+  toolCalls: ToolCall[];
+} | null {
+  if (!content.includes("<invoke") || !content.includes("<parameter")) {
+    return null;
+  }
+
+  const wrapperPattern = /<function_calls\b[^>]*>[\s\S]*?<\/function_calls>/gi;
+  const wrapperMatches = [...content.matchAll(wrapperPattern)];
+  const toolCalls: ToolCall[] = [];
+
+  if (wrapperMatches.length === 0) {
+    return null;
+  }
+
+  for (const wrapperMatch of wrapperMatches) {
+    const block = wrapperMatch[0] ?? "";
+    const invokes = [...block.matchAll(/<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/gi)];
+    if (invokes.length === 0) {
+      continue;
+    }
+
+    for (const [index, invoke] of invokes.entries()) {
+      const name = decodeInlineToolValue(invoke[1] ?? "").trim();
+      const body = invoke[2] ?? "";
+      const parameters = [...body.matchAll(/<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/gi)];
+      if (!name || parameters.length === 0) {
+        continue;
+      }
+
+      const args = Object.fromEntries(
+        parameters.map((parameter) => [
+          decodeInlineToolValue(parameter[1] ?? "").trim(),
+          decodeInlineToolValue(parameter[2] ?? ""),
+        ]).filter(([key]) => Boolean(key)),
+      );
+      toolCalls.push({
+        id: `inline_call_${toolCalls.length + index + 1}`,
+        name,
+        arguments: JSON.stringify(args),
+      });
+    }
+  }
+
+  if (toolCalls.length === 0) {
+    return null;
+  }
+
+  const cleanedContent = content
+    .replace(wrapperPattern, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return {
+    content: cleanedContent,
+    toolCalls,
+  };
+}
+
+function decodeInlineToolValue(value: string): string {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .trim();
 }
 
 function normalizeReasoningContent(value: unknown): string | undefined {

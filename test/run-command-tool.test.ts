@@ -183,6 +183,16 @@ test("run_command compounds read and execute segments instead of treating the fu
   assert.match(result.error ?? "", /Triggered by "node -p 1"\./);
 });
 
+test("classifyCommand keeps read-only PowerShell search pipelines in the read bucket", () => {
+  const assessment = classifyCommand(
+    'Select-String -Path src/cli.ts -Pattern "slash|command" | Select-Object -First 20',
+    ".",
+  );
+
+  assert.equal(assessment.category, "read");
+  assert.equal(assessment.summary, "Read-only search command");
+});
+
 test("run_command respects reject mode before execution", async () => {
   const result = JSON.parse(
     await executeAgentTool(

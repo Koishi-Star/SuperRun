@@ -189,6 +189,59 @@ export type RendererToolStep = {
   startedAtMs: number | null;
 };
 
+export type InteractiveRendererTraceEvent =
+  | {
+      kind: "shell_frame";
+      title: string;
+      statusLines: string[];
+      noticeLines: string[];
+      planLines: string[];
+      footerLines: string[];
+    }
+  | {
+      kind: "info" | "error" | "warning" | "body";
+      message: string;
+    }
+  | {
+      kind: "prompt_requested";
+      label: string;
+      promptKind: "primary" | "auxiliary";
+      workspaceFileCount: number;
+    }
+  | {
+      kind: "prompt_submitted";
+      value: string;
+    }
+  | {
+      kind: "overlay_requested";
+      overlayKind: "picker" | "viewer" | "approval" | "diff_approval" | "diff_review";
+      title: string;
+    }
+  | {
+      kind: "overlay_resolved";
+      overlayKind: "picker" | "viewer" | "approval" | "diff_approval" | "diff_review";
+      value: string | null;
+    }
+  | {
+      kind: "turn_started";
+      promptText: string;
+    }
+  | {
+      kind: "assistant_chunk";
+      chunk: string;
+    }
+  | {
+      kind: "turn_completed";
+    }
+  | {
+      kind: "turn_failed";
+      message: string;
+    }
+  | {
+      kind: "tool_event";
+      event: ToolTurnEvent;
+    };
+
 export type RendererAgentTurn = {
   id: string;
   kind: "agent";
@@ -309,6 +362,7 @@ export function createInteractiveRenderer(options: {
   enableInput?: boolean;
   minCommandPanelDurationMs?: number;
   onShortcut?: (shortcut: "toggle_plan_mode") => void;
+  traceEvent?: (event: InteractiveRendererTraceEvent) => void;
 }): InteractiveRenderer {
   const promptLabel = "> ";
   const editorPromptLabel = "system > ";
@@ -332,6 +386,9 @@ export function createInteractiveRenderer(options: {
   const pendingCommandCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let pendingToolOutputEvents: ToolTurnEvent[] = [];
   let toolOutputFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  const emitTrace = (event: InteractiveRendererTraceEvent) => {
+    options.traceEvent?.(event);
+  };
   // The shell now renders offscreen into a fixed-height document and writes it
   // through our own line-diff surface. This avoids Ink's fullscreen path,
   // which clears the terminal whenever output height reaches the TTY height.
@@ -635,6 +692,11 @@ export function createInteractiveRenderer(options: {
     if (updated) {
       rerender();
     }
+    if (status === "completed") {
+      emitTrace({
+        kind: "turn_completed",
+      });
+    }
     resolveAssistantFlushWaiters();
   };
 
@@ -706,11 +768,18 @@ export function createInteractiveRenderer(options: {
       inputMode: "inactive",
     };
     rerender();
+    emitTrace({
+      kind: "prompt_submitted",
+      value,
+    });
     resolver?.(value);
   };
 
   const resolveOverlay = (value: string | null) => {
     const resolver = overlayResolver;
+    const overlayKind = state.overlay?.kind === "picker"
+      ? "picker"
+      : "viewer";
     overlayResolver = null;
     state = {
       ...state,
@@ -718,6 +787,11 @@ export function createInteractiveRenderer(options: {
       overlay: null,
     };
     rerender();
+    emitTrace({
+      kind: "overlay_resolved",
+      overlayKind,
+      value,
+    });
     resolver?.(value);
   };
 
@@ -776,6 +850,11 @@ export function createInteractiveRenderer(options: {
       inputMode: "inactive",
     };
     rerender();
+    emitTrace({
+      kind: "overlay_resolved",
+      overlayKind: "approval",
+      value,
+    });
     resolver?.(value);
   };
 
@@ -788,6 +867,11 @@ export function createInteractiveRenderer(options: {
       inputMode: "inactive",
     };
     rerender();
+    emitTrace({
+      kind: "overlay_resolved",
+      overlayKind: "diff_approval",
+      value,
+    });
     resolver?.(value);
   };
 
@@ -801,6 +885,11 @@ export function createInteractiveRenderer(options: {
       inputMode: "inactive",
     };
     rerender();
+    emitTrace({
+      kind: "overlay_resolved",
+      overlayKind: "diff_review",
+      value: null,
+    });
     resolver?.();
   };
 
@@ -858,6 +947,14 @@ export function createInteractiveRenderer(options: {
         },
       };
       rerender();
+      emitTrace({
+        kind: "shell_frame",
+        title: frame.title,
+        statusLines: frame.statusLines.map((line) => line.text),
+        noticeLines: frame.noticeLines.map((line) => line.text),
+        planLines: (frame.planLines ?? []).map((line) => line.text),
+        footerLines: frame.footerLines.map((line) => line.text),
+      });
     },
     renderCommands: () => {
       appendSystemLines("body", "Available commands");
@@ -890,15 +987,31 @@ export function createInteractiveRenderer(options: {
     },
     renderInfo: (message) => {
       appendSystemLines("info", message);
+      emitTrace({
+        kind: "info",
+        message,
+      });
     },
     renderError: (message) => {
       appendSystemLines("error", message);
+      emitTrace({
+        kind: "error",
+        message,
+      });
     },
     renderWarning: (message) => {
       appendSystemLines("warning", message);
+      emitTrace({
+        kind: "warning",
+        message,
+      });
     },
     writeBodyLine: (message) => {
       appendSystemLines("body", message);
+      emitTrace({
+        kind: "body",
+        message,
+      });
     },
     beginAgentTurn: (promptText) => {
       state = {
@@ -917,8 +1030,16 @@ export function createInteractiveRenderer(options: {
         ],
       };
       rerender();
+      emitTrace({
+        kind: "turn_started",
+        promptText,
+      });
     },
     appendAssistantChunk: (chunk) => {
+      emitTrace({
+        kind: "assistant_chunk",
+        chunk,
+      });
       if (!shouldAnimateAssistantText) {
         appendAssistantTextImmediately(chunk);
         return;
@@ -940,6 +1061,9 @@ export function createInteractiveRenderer(options: {
       if (updated) {
         rerender();
       }
+      emitTrace({
+        kind: "turn_completed",
+      });
     },
     failActiveTurn: (message) => {
       const updated = updateLatestAgentTurn((turn) => ({
@@ -949,12 +1073,24 @@ export function createInteractiveRenderer(options: {
       }));
       if (updated) {
         rerender();
+        emitTrace({
+          kind: "turn_failed",
+          message,
+        });
         return;
       }
 
       renderer.renderError(message);
+      emitTrace({
+        kind: "turn_failed",
+        message,
+      });
     },
     applyToolEvent: (event) => {
+      emitTrace({
+        kind: "tool_event",
+        event,
+      });
       // Batch command output events to avoid per-line rerenders.
       if (event.kind === "command_execution" && event.phase === "output") {
         pendingToolOutputEvents.push(event);
@@ -1009,6 +1145,12 @@ export function createInteractiveRenderer(options: {
         },
       };
       rerender();
+      emitTrace({
+        kind: "prompt_requested",
+        label: nextLabel,
+        promptKind: promptKind ?? "auxiliary",
+        workspaceFileCount: workspaceFiles.length,
+      });
 
       return new Promise<string>((resolve) => {
         promptResolver = resolve;
@@ -1043,6 +1185,11 @@ export function createInteractiveRenderer(options: {
         },
       };
       rerender();
+      emitTrace({
+        kind: "overlay_requested",
+        overlayKind: "picker",
+        title: selection.title,
+      });
 
       return new Promise<string | null>((resolve) => {
         overlayResolver = resolve;
@@ -1072,6 +1219,11 @@ export function createInteractiveRenderer(options: {
         },
       };
       rerender();
+      emitTrace({
+        kind: "overlay_requested",
+        overlayKind: "viewer",
+        title: viewer.title,
+      });
 
       return new Promise<void>((resolve) => {
         overlayResolver = () => resolve();
@@ -1100,6 +1252,11 @@ export function createInteractiveRenderer(options: {
         inputMode: "inline",
       };
       rerender();
+      emitTrace({
+        kind: "overlay_requested",
+        overlayKind: "approval",
+        title: approval.title,
+      });
 
       return new Promise<CommandApprovalDecision>((resolve) => {
         inlineApprovalResolver = resolve;
@@ -1132,6 +1289,11 @@ export function createInteractiveRenderer(options: {
         inputMode: "inline",
       };
       rerender();
+      emitTrace({
+        kind: "overlay_requested",
+        overlayKind: "diff_approval",
+        title: review.title,
+      });
 
       return new Promise<CommandApprovalDecision>((resolve) => {
         diffResolver = resolve;
@@ -1166,6 +1328,11 @@ export function createInteractiveRenderer(options: {
         inputMode: "inline",
       };
       rerender();
+      emitTrace({
+        kind: "overlay_requested",
+        overlayKind: "diff_review",
+        title: review.title,
+      });
 
       return new Promise<void>((resolve) => {
         diffReviewResolver = resolve;

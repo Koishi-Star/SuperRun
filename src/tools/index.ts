@@ -12,6 +12,7 @@ import { replaceLinesTool } from "./replace_lines.js";
 import { requestUserInputTool } from "./request_user_input.js";
 import { restoreDeletedFileTool } from "./restore_deleted_file.js";
 import { runCommandTool } from "./run_command.js";
+import { searchWorkspaceTool } from "./search_workspace.js";
 import type { ToolExecutionContext } from "./types.js";
 import { updatePlanTool } from "./update_plan.js";
 import { writeFileTool } from "./write_file.js";
@@ -19,6 +20,7 @@ import { writeFileTool } from "./write_file.js";
 const defaultModeBaseTools = [
   fetchWebpageTool,
   updatePlanTool,
+  searchWorkspaceTool,
   runCommandTool,
   readFileTool,
   writeFileTool,
@@ -30,8 +32,8 @@ const defaultModeBaseTools = [
   purgeDeletedFileTool,
   emptyDeleteAreaTool,
 ] as const;
-const strictModeTools = [listFilesTool, readFileTool, listDeletedFilesTool] as const;
-const planModeBaseTools = [listFilesTool, readFileTool] as const;
+const strictModeTools = [listFilesTool, searchWorkspaceTool, readFileTool, listDeletedFilesTool] as const;
+const planModeBaseTools = [listFilesTool, searchWorkspaceTool, readFileTool] as const;
 
 export function getAgentToolDefinitions(
   mode: AgentMode,

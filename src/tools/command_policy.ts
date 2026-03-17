@@ -129,7 +129,7 @@ const READ_RULES: CommandRule[] = [
     summary: "Read-only search command",
     reason: "search and listing commands are inspection-oriented.",
     pattern:
-      /\b(?:cat|type|Get-Content|ls|dir|find|rg|ripgrep|fd|tree|pwd|Get-ChildItem|Select-String)\b/i,
+      /\b(?:cat|type|Get-Content|ls|dir|find|rg|ripgrep|fd|tree|pwd|Get-ChildItem|Get-Item|Select-String|Select-Object|Measure-Object|Sort-Object|findstr|head|tail|wc)\b/i,
     modeActions: allowInAllModes(),
   },
 ];
