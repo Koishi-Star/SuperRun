@@ -719,21 +719,29 @@ function materializeTurnContextMessages(
     .filter((entry) => !entry.compressed)
     .map((entry) => entry.message);
 
-  // Collect tool_call_ids that still have a matching tool-result message
-  // so we can strip orphaned toolCalls from assistant messages whose tool
-  // results were compressed away (the API rejects orphaned tool_call_ids).
-  const presentToolResultIds = new Set<string>();
-  for (const message of visible) {
-    if (message.role === "tool") {
-      presentToolResultIds.add(message.toolCallId);
-    }
-  }
-
-  return visible.map((message) => {
+  // Order-aware: for each assistant message with toolCalls, only keep IDs
+  // whose tool-result messages appear between it and the next assistant/user
+  // message.  A global ID set is insufficient because some providers (Kimi)
+  // reuse tool_call_ids across rounds (e.g. "read_file:1" in round N-1 AND
+  // round N), so a later round's result could incorrectly "vouch" for an
+  // earlier round's orphaned toolCall.
+  return visible.map((message, index) => {
     if (message.role !== "assistant" || !message.toolCalls?.length) {
       return message;
     }
-    const kept = message.toolCalls.filter((tc) => presentToolResultIds.has(tc.id));
+    // Collect tool_call_ids from the tool messages that follow this assistant
+    // message, stopping at the next assistant or user message.
+    const followingToolIds = new Set<string>();
+    for (let j = index + 1; j < visible.length; j++) {
+      const next = visible[j]!;
+      if (next.role === "tool") {
+        followingToolIds.add(next.toolCallId);
+      } else if (next.role === "assistant" || next.role === "user") {
+        break;
+      }
+      // system messages (e.g. policy notes) are skipped
+    }
+    const kept = message.toolCalls.filter((tc) => followingToolIds.has(tc.id));
     if (kept.length === message.toolCalls.length) {
       return message; // nothing stripped — return original
     }

@@ -419,24 +419,27 @@ function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
 
 // Last-resort safeguard: strip tool_call entries from assistant messages whose
 // matching tool-result messages are missing, so the API never receives orphaned
-// tool_call_ids.  The primary fix lives in materializeTurnContextMessages but
-// this layer catches anything that slips through (e.g. history edge cases).
+// tool_call_ids.  Order-aware: only considers tool results between this
+// assistant message and the next assistant/user message, because some providers
+// (Kimi) reuse tool_call_ids across rounds.
 function sanitizeToolCallInvariant(
   messages: Record<string, unknown>[],
 ): Record<string, unknown>[] {
-  const presentToolResultIds = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "tool" && typeof message.tool_call_id === "string") {
-      presentToolResultIds.add(message.tool_call_id);
-    }
-  }
-
-  return messages.map((message) => {
+  return messages.map((message, index) => {
     if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
       return message;
     }
+    const followingToolIds = new Set<string>();
+    for (let j = index + 1; j < messages.length; j++) {
+      const next = messages[j]!;
+      if (next.role === "tool" && typeof next.tool_call_id === "string") {
+        followingToolIds.add(next.tool_call_id);
+      } else if (next.role === "assistant" || next.role === "user") {
+        break;
+      }
+    }
     const kept = (message.tool_calls as Array<{ id?: string }>).filter(
-      (tc) => typeof tc.id === "string" && presentToolResultIds.has(tc.id),
+      (tc) => typeof tc.id === "string" && followingToolIds.has(tc.id),
     );
     if (kept.length === message.tool_calls.length) {
       return message;
