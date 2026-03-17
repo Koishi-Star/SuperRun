@@ -114,6 +114,14 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     {
       toolCalls: [
         {
+          id: "call_0",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_2",
+            status: "in_progress",
+          }),
+        },
+        {
           id: "call_1",
           name: "run_command",
           arguments: JSON.stringify({
@@ -143,7 +151,9 @@ test("CLI single-turn ask mode no longer falls back to readline approval prompts
     assert.equal(server.requests.length, 3);
     assert.match(result.stdout, /assistant: Command execution was blocked pending interactive approval\./);
 
-    const toolMessage = server.requests[2]?.messages.at(-1);
+    const toolMessage = [...(server.requests[2]?.messages ?? [])]
+      .reverse()
+      .find((message) => message.role === "tool");
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),
@@ -194,6 +204,14 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     {
       toolCalls: [
         {
+          id: "call_0",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_2",
+            status: "in_progress",
+          }),
+        },
+        {
           id: "call_1",
           name: "write_file",
           arguments: JSON.stringify({
@@ -224,7 +242,9 @@ test("CLI single-turn write_file tool calls also require Ink approval in ask mod
     assert.equal(server.requests.length, 3);
     assert.match(result.stdout, /assistant: The write was blocked pending interactive approval\./);
 
-    const toolMessage = server.requests[2]?.messages.at(-1);
+    const toolMessage = [...(server.requests[2]?.messages ?? [])]
+      .reverse()
+      .find((message) => message.role === "tool");
     assert.equal(toolMessage?.role, "tool");
     assert.match(
       String(toolMessage?.content ?? ""),

@@ -88,12 +88,18 @@ export function updateTaskPlanStep(
 
   let found = false;
   const nextSteps = plan.steps.map((step) => {
+    const nextStatus: TaskPlanStepStatus = updates.status ?? step.status;
     if (step.id !== normalizedStepId) {
+      if (updates.status === "in_progress" && step.status === "in_progress") {
+        return {
+          ...step,
+          status: "pending" as const,
+        };
+      }
       return { ...step };
     }
 
     found = true;
-    const nextStatus = updates.status ?? step.status;
     const normalizedNote = normalizeOptionalPlanText(updates.note);
     return {
       ...step,
@@ -133,6 +139,20 @@ export function getActiveTaskPlanStep(plan: TaskPlan): TaskPlanStep | null {
     plan.steps.find((step) => step.status === "blocked") ??
     plan.steps.find((step) => step.status === "pending") ??
     null
+  );
+}
+
+export function getInProgressTaskPlanStep(plan: TaskPlan): TaskPlanStep | null {
+  return plan.steps.find((step) => step.status === "in_progress") ?? null;
+}
+
+export function hasTaskPlanProgress(plan: TaskPlan): boolean {
+  return plan.steps.some((step) => step.status !== "pending");
+}
+
+export function isTaskPlanResolved(plan: TaskPlan): boolean {
+  return plan.steps.every((step) =>
+    step.status === "completed" || step.status === "blocked"
   );
 }
 

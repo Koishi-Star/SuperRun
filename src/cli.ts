@@ -4,6 +4,7 @@ import { Command, Option } from "commander";
 import {
   AgentToolLoopLimitError,
   type AgentSession,
+  commitAgentTurnHistory,
   createAgentSession,
   getAgentSessionStats,
   runAgentTurn,
@@ -70,10 +71,13 @@ import {
   purgeWorkspaceFileFromTrash,
   restoreWorkspaceFileFromTrash,
 } from "./tools/trash.js";
+import { runWorkspaceCommand } from "./tools/run_command.js";
 import type {
   CommandApprovalDecision,
   CommandApprovalMode,
   CommandApprovalRequest,
+  CommandCategory,
+  CommandPolicyContext,
   ToolTurnEvent,
   ToolExecutionContext,
   UserInputRequest,
@@ -252,11 +256,32 @@ type InteractiveState = {
 type SlashApprovalMode = Exclude<CommandApprovalMode, "crazy_auto">;
 type InteractiveNonPlanMode = Exclude<AgentMode, "plan">;
 
+type VerificationBaseline = {
+  gitStatusSnapshot: string | null;
+};
+
+type TurnVerificationResult = {
+  gitAvailable: boolean;
+  workspaceChanged: boolean;
+  buildPassed: boolean;
+  buildExitCode: number | null;
+  gitStatusOutput: string;
+  gitDiffOutput: string;
+  buildStdout: string;
+  buildStderr: string;
+  failureReason: string | null;
+};
+
 const EXIT_COMMANDS = new Set(["/exit", "exit", "exit()"]);
 const DEFAULT_MIN_COMMAND_PANEL_DURATION_MS = 1_000;
 const MIN_ALLOWED_COMMAND_PANEL_DURATION_MS = 100;
 const MAX_ALLOWED_COMMAND_PANEL_DURATION_MS = 10_000;
 const TASK_PLAN_HISTORY_CONTEXT_MESSAGES = 6;
+const VERIFICATION_BUILD_COMMAND = "npm run build";
+const VERIFICATION_STATUS_TIMEOUT_MS = 10_000;
+const VERIFICATION_BUILD_TIMEOUT_MS = 120_000;
+const IMPLEMENTATION_REQUEST_PATTERN =
+  /(?:\b(?:add|build|change|create|edit|fix|implement|modify|refactor|remove|rename|update|write)\b|增加|修改|实现|修复|添加|重构|删除|改成|改为|新增)/i;
 
 async function createInteractiveState(
   settings: SuperRunSettings,
@@ -327,6 +352,193 @@ async function createInteractiveState(
   };
 }
 
+function shouldForceExecutionContract(
+  session: AgentSession,
+  prompt: string,
+): boolean {
+  return session.mode === "default" && IMPLEMENTATION_REQUEST_PATTERN.test(prompt);
+}
+
+async function captureVerificationBaseline(
+  session: AgentSession,
+  prompt: string,
+): Promise<VerificationBaseline | null> {
+  if (!shouldForceExecutionContract(session, prompt)) {
+    return null;
+  }
+
+  try {
+    const result = await runWorkspaceCommand(
+      {
+        command: "git status --short --untracked-files=all",
+        timeout_ms: VERIFICATION_STATUS_TIMEOUT_MS,
+      },
+      {
+        commandPolicy: createInternalVerificationCommandPolicy(),
+      },
+    );
+    return {
+      gitStatusSnapshot: result.exitCode === 0 ? result.stdout.trim() : null,
+    };
+  } catch {
+    return {
+      gitStatusSnapshot: null,
+    };
+  }
+}
+
+async function runTurnVerification(
+  session: AgentSession,
+  prompt: string,
+  baseline: VerificationBaseline | null,
+  executionEvents: ToolTurnEvent[],
+  draftReply: string,
+  ui: InteractiveRenderer | null,
+  turnEvents: ToolTurnEvent[],
+): Promise<TurnVerificationResult | null> {
+  if (!baseline || !shouldForceExecutionContract(session, prompt)) {
+    return null;
+  }
+
+  const commandContext = createInternalVerificationToolContext(ui, turnEvents);
+  const gitStatus = await runWorkspaceCommand(
+    {
+      command: "git status --short --untracked-files=all",
+      timeout_ms: VERIFICATION_STATUS_TIMEOUT_MS,
+    },
+    commandContext,
+  );
+  const gitDiff = await runWorkspaceCommand(
+    {
+      command: "git diff --stat",
+      timeout_ms: VERIFICATION_STATUS_TIMEOUT_MS,
+    },
+    commandContext,
+  );
+  const buildResult = await runWorkspaceCommand(
+    {
+      command: VERIFICATION_BUILD_COMMAND,
+      timeout_ms: VERIFICATION_BUILD_TIMEOUT_MS,
+    },
+    commandContext,
+  );
+
+  const gitStatusOutput = gitStatus.stdout.trim();
+  const gitAvailable = gitStatus.exitCode === 0;
+  const workspaceChanged =
+    gitAvailable &&
+    gitStatusOutput !== (baseline.gitStatusSnapshot ?? "");
+  const requiresRepositoryChange =
+    didExecutionAttemptWorkspaceChange(executionEvents) ||
+    doesReplyClaimWorkspaceChange(draftReply);
+  const buildPassed = buildResult.exitCode === 0 && !buildResult.timedOut;
+  const failureReason = !gitAvailable
+    ? "git status could not verify repository changes for this task."
+    : requiresRepositoryChange && !workspaceChanged
+      ? "git status did not show any new repository changes for this task."
+      : !buildPassed
+        ? "npm run build failed during mandatory verification."
+        : null;
+
+  if (failureReason) {
+    const warningEvent = {
+      kind: "notice",
+      level: "warning",
+      message: failureReason,
+    } satisfies ToolTurnEvent;
+    turnEvents.push(warningEvent);
+    ui?.applyToolEvent(warningEvent);
+  } else {
+    const infoEvent = {
+      kind: "notice",
+      level: "info",
+      message: "Mandatory verification passed: git detected repository changes and npm run build succeeded.",
+    } satisfies ToolTurnEvent;
+    turnEvents.push(infoEvent);
+    ui?.applyToolEvent(infoEvent);
+  }
+
+  return {
+    gitAvailable,
+    workspaceChanged,
+    buildPassed,
+    buildExitCode: buildResult.exitCode,
+    gitStatusOutput,
+    gitDiffOutput: gitDiff.stdout.trim(),
+    buildStdout: buildResult.stdout,
+    buildStderr: buildResult.stderr,
+    failureReason,
+  };
+}
+
+function createInternalVerificationToolContext(
+  ui: InteractiveRenderer | null,
+  turnEvents: ToolTurnEvent[],
+): ToolExecutionContext {
+  return {
+    commandPolicy: createInternalVerificationCommandPolicy(),
+    turnEvents: {
+      addEvent: (event) => {
+        turnEvents.push(event);
+        ui?.applyToolEvent(event);
+      },
+    },
+  };
+}
+
+function createInternalVerificationCommandPolicy(): CommandPolicyContext {
+  return {
+    getMode: () => "allow-all",
+    setMode: () => {},
+  };
+}
+
+function buildVerificationFailureReply(
+  reply: string,
+  verification: TurnVerificationResult,
+): string {
+  const lines = [
+    verification.failureReason ?? "Mandatory verification failed.",
+  ];
+  if (!verification.gitAvailable) {
+    lines.push("`git status --short --untracked-files=all` did not complete successfully.");
+  } else if (!verification.workspaceChanged) {
+    lines.push("`git status --short --untracked-files=all` showed no new repository changes compared with the pre-task baseline.");
+  } else if (verification.gitStatusOutput) {
+    lines.push("Detected repository changes:");
+    lines.push(verification.gitStatusOutput);
+  }
+
+  if (!verification.buildPassed) {
+    lines.push(`\`${VERIFICATION_BUILD_COMMAND}\` failed.`);
+    if (verification.buildStderr) {
+      lines.push(verification.buildStderr);
+    } else if (verification.buildStdout) {
+      lines.push(verification.buildStdout);
+    }
+  }
+
+  if (reply.trim()) {
+    lines.push("The previous assistant summary was not accepted because verification failed.");
+  }
+
+  return lines.join("\n\n");
+}
+
+function didExecutionAttemptWorkspaceChange(events: ToolTurnEvent[]): boolean {
+  return events.some((event) =>
+    event.kind === "workspace_edit_review" ||
+    (event.kind === "command_execution" &&
+      event.phase === "completed" &&
+      event.category !== "read")
+  );
+}
+
+function doesReplyClaimWorkspaceChange(reply: string): boolean {
+  return /(?:\b(?:added|applied|changed|created|implemented|inserted|modified|renamed|updated|wrote)\b|已(?:修改|添加|实现|插入|更新|写入)|现在会输出|命令已插入)/i
+    .test(reply);
+}
+
 async function runSingleTurn(
   session: AgentSession,
   prompt: string,
@@ -337,6 +549,7 @@ async function runSingleTurn(
     process.stdout.write(chunk);
   }, "assistant");
   const plan = await ensureActiveTaskPlan(session, prompt, state, null);
+  const verificationBaseline = await captureVerificationBaseline(session, prompt);
   console.log("user:", prompt);
   console.log("plan:");
   process.stdout.write(renderTaskPlanMarkdown(plan));
@@ -345,13 +558,33 @@ async function runSingleTurn(
   const result = await runAgentTurn(session, prompt, {
     providerConfig: getActiveProviderConfig(state),
     toolContext: createToolExecutionContext(session, state, null, turnEvents),
+    commitHistory: false,
+    streamFinalResponse: false,
     onChunk: (chunk) => {
       assistantWriter.writeChunk(chunk);
     },
   });
+  const executionEvents = [...turnEvents];
+  const verification = await runTurnVerification(
+    session,
+    prompt,
+    verificationBaseline,
+    executionEvents,
+    result.reply,
+    null,
+    turnEvents,
+  );
+  const finalReply = verification?.failureReason
+    ? buildVerificationFailureReply(result.reply, verification)
+    : result.reply;
+  commitAgentTurnHistory(session, prompt, finalReply || "(empty response)");
+  applyTurnEventsToSession(state, turnEvents);
+  await persistCurrentSession(session, state);
 
-  if (!result.reply) {
+  if (!finalReply) {
     assistantWriter.writeChunk("(empty response)");
+  } else {
+    assistantWriter.writeChunk(finalReply);
   }
 
   assistantWriter.end();
@@ -1138,6 +1371,7 @@ async function handleInteractivePrompt(
   }
 
   await ensureActiveTaskPlan(session, prompt, state, ui);
+  const verificationBaseline = await captureVerificationBaseline(session, prompt);
 
   if (ui) {
     ui.beginAgentTurn(prompt);
@@ -1150,10 +1384,13 @@ async function handleInteractivePrompt(
   let reply = "";
   const requestAbortController = ui ? new AbortController() : null;
   let exitRequestedDuringTurn = false;
+  let contextBudgetSnapshot = session.contextBudget;
   try {
     const result = await runAgentTurn(session, prompt, {
       providerConfig: getActiveProviderConfig(state),
       toolContext: createToolExecutionContext(session, state, ui, turnEvents),
+      commitHistory: false,
+      streamFinalResponse: false,
       ...(requestAbortController
         ? { abortSignal: requestAbortController.signal }
         : {}),
@@ -1180,6 +1417,7 @@ async function handleInteractivePrompt(
       },
     });
     reply = result.reply;
+    contextBudgetSnapshot = result.contextBudgetSnapshot;
     if (result.trimmedTurns > 0) {
       renderWarning(
         ui,
@@ -1203,19 +1441,45 @@ async function handleInteractivePrompt(
     ui?.setActiveRequestInterrupt(null);
   }
 
+  const verification = await runTurnVerification(
+    session,
+    prompt,
+    verificationBaseline,
+    [...turnEvents],
+    reply,
+    ui,
+    turnEvents,
+  );
+  const finalReply = verification?.failureReason
+    ? buildVerificationFailureReply(reply, verification)
+    : reply;
+  session.contextBudget = contextBudgetSnapshot;
+  commitAgentTurnHistory(session, prompt, finalReply || "(empty response)");
   applyTurnEventsToSession(state, turnEvents);
   await persistCurrentSession(session, state);
   await refreshDeleteAreaBanner(session, state, ui);
 
-  if (!reply) {
+  if (verification?.failureReason) {
+    if (ui) {
+      ui.failActiveTurn(finalReply);
+    } else {
+      process.stdout.write(finalReply);
+    }
+  } else if (!finalReply) {
     if (ui) {
       ui.appendAssistantChunk("(empty response)");
     } else {
       process.stdout.write("(empty response)");
     }
+  } else if (ui) {
+    ui.appendAssistantChunk(finalReply);
+  } else {
+    process.stdout.write(finalReply);
   }
 
-  if (ui) {
+  if (ui && verification?.failureReason) {
+    // Keep the transcript card visibly failed when verification rejects the turn.
+  } else if (ui) {
     ui.completeActiveTurn();
   }
 

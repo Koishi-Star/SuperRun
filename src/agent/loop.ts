@@ -13,6 +13,13 @@ import {
   type ContextBudgetSnapshot,
 } from "./context-budget.js";
 import {
+  getInProgressTaskPlanStep,
+  hasTaskPlanProgress,
+  isTaskPlanResolved,
+  type TaskPlan,
+  type TaskPlanStepStatus,
+} from "./plan.js";
+import {
   resolveProviderRuntimeConfig,
   resolveProviderSettings,
   type ProviderUsage,
@@ -22,7 +29,6 @@ import {
   buildSessionSystemPrompt,
 } from "../prompts/system.js";
 import { parseAgentMode, type AgentMode } from "./mode.js";
-import type { TaskPlan } from "./plan.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 import type { ToolExecutionContext } from "../tools/types.js";
 import {
@@ -38,6 +44,8 @@ import {
 export type AgentTurnOptions = ChatOptions & {
   toolContext?: ToolExecutionContext;
   onModelRequestStateChange?: (active: boolean) => void;
+  commitHistory?: boolean;
+  streamFinalResponse?: boolean;
 };
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
 // Coding-oriented models often need several inspect/edit/verify rounds before
@@ -92,6 +100,9 @@ export type AgentTurnResult = {
   trimmedTurns: number;
 };
 
+const PLAN_UPDATE_TOOL_NAME = "update_plan";
+const PLAN_EXEMPT_TOOL_NAMES = new Set([PLAN_UPDATE_TOOL_NAME, "request_user_input"]);
+
 export function createAgentSession(
   options?: CreateAgentSessionOptions,
 ): AgentSession {
@@ -141,7 +152,9 @@ export async function runAgentTurn(
     resolveProviderRuntimeConfig(resolveProviderSettings());
   const trimmedTurns = trimSessionHistory(session, trimmedPrompt);
   const baseMessages = buildTurnMessages(session, trimmedPrompt);
-  const estimatedPromptTokens = estimateChatMessageTokens(baseMessages);
+  const estimatedPromptTokens = estimateChatMessageTokens(
+    buildRoundMessages(baseMessages, 0, false, session.activePlan),
+  );
   const response = await resolveAgentReply(
     baseMessages,
     session,
@@ -154,17 +167,9 @@ export async function runAgentTurn(
     estimatedPromptTokens,
   });
 
-  session.history.push(
-    {
-      role: "user",
-      content: trimmedPrompt,
-    },
-    {
-      role: "assistant",
-      content: response.content,
-    },
-  );
-  trimSessionHistory(session);
+  if (options?.commitHistory !== false) {
+    commitAgentTurnHistory(session, trimmedPrompt, response.content);
+  }
   session.contextBudget = contextBudgetSnapshot;
 
   return {
@@ -216,6 +221,24 @@ function trimSessionHistory(
   return trimmed.trimmedTurns;
 }
 
+export function commitAgentTurnHistory(
+  session: AgentSession,
+  userPrompt: string,
+  assistantReply: string,
+): void {
+  session.history.push(
+    {
+      role: "user",
+      content: userPrompt,
+    },
+    {
+      role: "assistant",
+      content: assistantReply,
+    },
+  );
+  trimSessionHistory(session);
+}
+
 async function resolveAgentReply(
   baseMessages: ChatMessage[],
   session: AgentSession,
@@ -230,7 +253,7 @@ async function resolveAgentReply(
     const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
     options?.onModelRequestStateChange?.(true);
     const response = await chatOnce(
-      buildRoundMessages(messages, round, isFinalAnswerAttempt),
+      buildRoundMessages(messages, round, isFinalAnswerAttempt, session.activePlan),
       {
         ...(options?.model ? { model: options.model } : {}),
         ...(options?.temperature !== undefined
@@ -259,9 +282,33 @@ async function resolveAgentReply(
         throw new Error("Model returned empty content.");
       }
 
-      if (options?.onChunk) {
-        // Tool routing currently resolves non-streaming first, then flushes the
-        // final assistant reply through the existing chunk callback.
+      if (session.activePlan && hasTaskPlanProgress(session.activePlan) && !isTaskPlanResolved(session.activePlan)) {
+        if (doesAssistantReportBlockedOutcome(response.content)) {
+          session.activePlan = markRemainingPlanStepsBlocked(session.activePlan);
+        } else {
+          if (response.content && options?.onChunk) {
+            options.onChunk(ensureAssistantChunkSpacing(response.content));
+          }
+
+          if (isFinalAnswerAttempt) {
+            throw new Error(
+              "Task plan is still incomplete. Mark the remaining steps completed or blocked before finishing the turn.",
+            );
+          }
+
+          messages.push({
+            role: "assistant",
+            content: response.content,
+          });
+          messages.push({
+            role: "system",
+            content: buildIncompletePlanReminder(session.activePlan),
+          });
+          continue;
+        }
+      }
+
+      if (options?.onChunk && options?.streamFinalResponse !== false) {
         options.onChunk(response.content);
       }
 
@@ -290,12 +337,16 @@ async function resolveAgentReply(
         ? { reasoningContent: response.reasoningContent }
         : {}),
     });
+    if (response.content && options?.onChunk) {
+      options.onChunk(ensureAssistantChunkSpacing(response.content));
+    }
 
     for (const toolCall of response.toolCalls) {
       throwIfAborted(options?.abortSignal);
       const toolExecution = await executeToolCallForAgentRound(
         toolCall,
         session.mode,
+        session.activePlan,
         session.webpageFetchCache,
         outlinedUrlsAtRoundStart,
         options?.toolContext,
@@ -327,10 +378,22 @@ type ToolExecutionOutcome = {
 async function executeToolCallForAgentRound(
   toolCall: ToolCall,
   mode: AgentMode,
+  activePlan: TaskPlan | null,
   webpageFetchCache: FetchWebpageSessionCache,
   outlinedUrlsAtRoundStart: ReadonlySet<string>,
   toolContext?: ToolExecutionContext,
 ): Promise<ToolExecutionOutcome> {
+  const planGate = buildPlanToolGate(toolCall, activePlan);
+  if (planGate) {
+    return {
+      toolResult: JSON.stringify({
+        ok: false,
+        error: planGate.toolError,
+      }),
+      policyMessage: planGate.policyMessage,
+    };
+  }
+
   if (toolCall.name !== FETCH_WEBPAGE_TOOL_NAME) {
     return {
       toolResult: await executeAgentTool(toolCall, mode, toolContext),
@@ -391,17 +454,25 @@ function buildRoundMessages(
   messages: ChatMessage[],
   round: number,
   isFinalAnswerAttempt: boolean,
+  activePlan: TaskPlan | null,
 ): ChatMessage[] {
+  const planMessage = buildActivePlanSystemMessage(activePlan);
   const warning = buildToolLoopWarning(round, isFinalAnswerAttempt);
-  return warning
-    ? [
-        ...messages,
-        {
-          role: "system",
+  return [
+    ...messages,
+    ...(planMessage
+      ? [{
+          role: "system" as const,
+          content: planMessage,
+        }]
+      : []),
+    ...(warning
+      ? [{
+          role: "system" as const,
           content: warning,
-        },
-      ]
-    : messages;
+        }]
+      : []),
+  ];
 }
 
 function buildToolLoopWarning(
@@ -417,6 +488,110 @@ function buildToolLoopWarning(
   }
 
   return `You have already used ${round} tool rounds on this turn. Avoid repeating broad scans or reading the same kind of files again. Only call another tool if it directly narrows the answer or applies the requested change. If results are blocked, redacted, repetitive, or insufficient, stop and explain the limit instead.`;
+}
+
+function buildActivePlanSystemMessage(
+  activePlan: TaskPlan | null,
+): string | null {
+  if (!activePlan) {
+    return null;
+  }
+
+  const currentStep = getInProgressTaskPlanStep(activePlan);
+  return [
+    `Active task plan: ${activePlan.title}`,
+    "Before using any tool other than update_plan, mark exactly one relevant plan step as in_progress with update_plan.",
+    "After finishing a step, mark it completed or blocked with update_plan.",
+    "Do not claim that edits succeeded unless the workspace was actually changed and later verification passes.",
+    `Current in-progress step: ${currentStep ? `${currentStep.id} ${currentStep.title}` : "none"}`,
+    "Plan steps:",
+    ...activePlan.steps.map((step) =>
+      `- ${step.id} [${step.status}] ${step.title}${step.note ? ` note: ${step.note}` : ""}`,
+    ),
+  ].join("\n");
+}
+
+function buildIncompletePlanReminder(
+  activePlan: TaskPlan,
+): string {
+  const remainingSteps = activePlan.steps
+    .filter((step) => step.status === "pending" || step.status === "in_progress")
+    .map((step) => `${step.id} ${step.title}`);
+  return [
+    "The task plan is still incomplete, so you may not finish this turn yet.",
+    "Call update_plan to keep the plan accurate, then continue the remaining work.",
+    remainingSteps.length > 0
+      ? `Remaining steps: ${remainingSteps.join("; ")}`
+      : "All remaining steps must be explicitly marked blocked before you finish.",
+  ].join(" ");
+}
+
+function buildPlanToolGate(
+  toolCall: ToolCall,
+  activePlan: TaskPlan | null,
+): { toolError: string; policyMessage: string } | null {
+  if (!activePlan || PLAN_EXEMPT_TOOL_NAMES.has(toolCall.name)) {
+    return null;
+  }
+
+  if (isTaskPlanResolved(activePlan)) {
+    return {
+      toolError:
+        `The task plan is already resolved. Do not call ${toolCall.name} after every step is completed or blocked.`,
+      policyMessage:
+        "The agent blocked a tool call because the task plan is already resolved. Only use update_plan if you need to reopen or clarify the plan state.",
+    };
+  }
+
+  const activeStep = getInProgressTaskPlanStep(activePlan);
+  if (activeStep) {
+    return null;
+  }
+
+  const availableSteps = activePlan.steps
+    .filter((step) => step.status === "pending")
+    .map((step) => `${step.id} ${step.title}`)
+    .join("; ");
+  return {
+    toolError:
+      `Call update_plan first to mark the relevant step as in_progress before using ${toolCall.name}. Available steps: ${availableSteps || "none"}.`,
+    policyMessage:
+      `The agent blocked ${toolCall.name} because the active task plan had no in-progress step. Call update_plan first, then retry the tool.`,
+  };
+}
+
+function ensureAssistantChunkSpacing(content: string): string {
+  return content.endsWith("\n")
+    ? `${content}\n`
+    : `${content}\n\n`;
+}
+
+function doesAssistantReportBlockedOutcome(content: string): boolean {
+  return /(?:blocked|pending interactive approval|requires approval|waiting for approval|cannot continue|needs user input|被阻止|需要审批|等待审批|无法继续)/i
+    .test(content);
+}
+
+function markRemainingPlanStepsBlocked(
+  activePlan: TaskPlan,
+): TaskPlan {
+  const timestamp = new Date().toISOString();
+  return {
+    ...activePlan,
+    updatedAt: timestamp,
+    steps: activePlan.steps.map((step) =>
+      step.status === "completed"
+        ? { ...step }
+        : {
+            ...step,
+            status: "blocked" as TaskPlanStepStatus,
+            ...(step.note
+              ? {}
+              : {
+                  note: "Stopped because the task is blocked and cannot continue in this turn.",
+                }),
+          }
+    ),
+  };
 }
 
 function trimConversationHistory(
