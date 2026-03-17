@@ -4,7 +4,7 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { executeAgentTool } from "../src/tools/index.js";
-import type { CommandApprovalMode, ToolTurnEvent } from "../src/tools/types.js";
+import type { CommandApprovalMode, ToolTurnEvent, WorkspaceEditReviewEvent } from "../src/tools/types.js";
 
 function createWorkspaceEditPolicyContext(mode: CommandApprovalMode) {
   return {
@@ -88,7 +88,8 @@ test("insert_after_symbol inserts code after the anchor symbol", async () => {
 
     // Turn event recorded.
     assert.equal(turnEvents.length, 1);
-    assert.equal(turnEvents[0]?.tool, "insert_after_symbol");
+    assert.equal(turnEvents[0]?.kind, "workspace_edit_review");
+    assert.equal((turnEvents[0] as WorkspaceEditReviewEvent | undefined)?.tool, "insert_after_symbol");
   } finally {
     process.chdir(prev);
     await rm(tempDir, { recursive: true, force: true });
@@ -155,7 +156,8 @@ test("insert_before_symbol inserts code before the anchor symbol", async () => {
     assert.ok(sepPos < betaPos, "SEPARATOR should be before beta");
 
     assert.equal(turnEvents.length, 1);
-    assert.equal(turnEvents[0]?.tool, "insert_before_symbol");
+    assert.equal(turnEvents[0]?.kind, "workspace_edit_review");
+    assert.equal((turnEvents[0] as WorkspaceEditReviewEvent | undefined)?.tool, "insert_before_symbol");
   } finally {
     process.chdir(prev);
     await rm(tempDir, { recursive: true, force: true });
