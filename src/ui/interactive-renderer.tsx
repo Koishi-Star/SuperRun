@@ -193,6 +193,7 @@ export type InteractiveRendererTraceEvent =
   | {
       kind: "shell_frame";
       title: string;
+      workspaceLines: string[];
       statusLines: string[];
       noticeLines: string[];
       planLines: string[];
@@ -950,6 +951,7 @@ export function createInteractiveRenderer(options: {
       emitTrace({
         kind: "shell_frame",
         title: frame.title,
+        workspaceLines: frame.workspaceLines.map((line) => line.text),
         statusLines: frame.statusLines.map((line) => line.text),
         noticeLines: frame.noticeLines.map((line) => line.text),
         planLines: (frame.planLines ?? []).map((line) => line.text),
@@ -968,6 +970,7 @@ export function createInteractiveRenderer(options: {
       renderer.writeBodyLine("/session  Show current session status");
       renderer.writeBodyLine("/history  Show the current or selected session transcript and events");
       renderer.writeBodyLine("/plan     Show the current task plan or clear it with /plan reset");
+      renderer.writeBodyLine("/hide    Toggle the top SuperRun header card");
       renderer.writeBodyLine("/sessions Open the saved-session picker, optionally filtered by text");
       renderer.writeBodyLine("/new [title] Create and switch to a fresh session");
       renderer.writeBodyLine("/switch   Switch to a saved session by id, title, or list index");

@@ -19,6 +19,7 @@ const SLASH_COMMAND_SUGGESTIONS = [
   "/settings",
   "/session",
   "/history",
+  "/hide",
   "/sessions",
   "/new",
   "/switch",

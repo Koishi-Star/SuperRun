@@ -15,6 +15,7 @@ import {
   formatTaskPlanSummary,
   getActiveTaskPlanStep,
   getTaskPlanProgress,
+  isTaskPlanResolved,
   renderTaskPlanMarkdown,
   updateTaskPlanStep,
   type TaskPlan,
@@ -198,6 +199,7 @@ program
           },
           currentSessionId: null,
           currentSessionTitle: null,
+          headerCardHidden: false,
           pendingDeleteAllConfirmation: false,
           pendingSystemPromptLines: null,
           workspaceFiles: null,
@@ -242,6 +244,7 @@ type InteractiveState = {
   sessionStore: SessionStoreState;
   currentSessionId: string | null;
   currentSessionTitle: string | null;
+  headerCardHidden: boolean;
   pendingDeleteAllConfirmation: boolean;
   pendingSystemPromptLines: string[] | null;
   workspaceFiles: string[] | null;
@@ -319,6 +322,7 @@ async function createInteractiveState(
         sessionStore,
         currentSessionId,
         currentSessionTitle: storedSession.title,
+        headerCardHidden: false,
         pendingDeleteAllConfirmation: false,
         pendingSystemPromptLines: null,
         workspaceFiles: null,
@@ -347,6 +351,7 @@ async function createInteractiveState(
     sessionStore,
     currentSessionId,
     currentSessionTitle: null,
+    headerCardHidden: false,
     pendingDeleteAllConfirmation: false,
     pendingSystemPromptLines: null,
     workspaceFiles: null,
@@ -701,13 +706,18 @@ async function handleInteractivePrompt(
     if (ui) {
       ui.renderCommands();
     } else {
-      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|plan|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /plan [/reset] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /clear /exit");
+      console.log("Commands: /help /provider [openai-compatible|kimi|key|clear-key|model [name]|context [value|auto]|refresh-models|base-url [url|moonshot-cn|moonshot-ai]|timeout <ms>] /model [name] /mode [default|strict|plan|crazy-auto] /approvals [ask|allow-all|reject] /duration [seconds] /settings /session /history [id|index|title] /plan [/reset] /sessions [query] /new [title] /switch <id|index|title> /rename <title> /delete [id|index|title|all] /trash [list|restore <id>|purge <id>|empty YES] /system /editor /system reset /hide /clear /exit");
     }
     return true;
   }
 
   if (matchesCommand(prompt, "/model")) {
     const modelArgument = parseCommandArgument(prompt, "/model");
+
+  if (prompt === "/ciallo") {
+    console.log("Ciallo～(∠・ω< )⌒☆");
+    return true;
+  }
     await handleProviderModelShortcut(session, state, ui, modelArgument);
     return true;
   }
@@ -1377,6 +1387,23 @@ async function handleInteractivePrompt(
     return true;
   }
 
+  if (prompt === "/hide") {
+    if (!ui) {
+      renderError(ui, '"/hide" requires an interactive terminal.');
+      return true;
+    }
+
+    state.headerCardHidden = !state.headerCardHidden;
+    renderInteractiveShell(ui, session, state);
+    renderInfo(
+      ui,
+      state.headerCardHidden
+        ? "Hidden the SuperRun header card. Run /hide again to show it."
+        : "Restored the SuperRun header card.",
+    );
+    return true;
+  }
+
   if (matchesCommand(prompt, "/trash")) {
     await handleTrashCommand(prompt, session, state, ui);
     return true;
@@ -1730,7 +1757,9 @@ function buildInteractiveShellFrame(
     : state.sessionStore.sessions.length === 0
       ? "unsaved"
       : "not loaded";
-  const workspaceLines: Array<Omit<RendererLine, "id">> = [
+  const workspaceLines: Array<Omit<RendererLine, "id">> = state.headerCardHidden
+    ? []
+    : [
     {
       kind: "info",
       text: `${provider.label}  ${provider.model}  ${process.cwd()}`,
@@ -1744,7 +1773,9 @@ function buildInteractiveShellFrame(
       text: `provider ${formatProviderStatus(provider)}  mode ${formatInteractiveModeLabel(session.mode, state.commandApprovalMode)}  approvals ${formatApprovalModeDisplay(session.mode, state.commandApprovalMode)}`,
     },
   ];
-  const statusLines: Array<Omit<RendererLine, "id">> = [
+  const statusLines: Array<Omit<RendererLine, "id">> = state.headerCardHidden
+    ? []
+    : [
     {
       kind: "info",
       text: `context  ${contextDisplay.usedText} / ${contextDisplay.limitText}  (${contextDisplay.percentText})`,
@@ -1765,7 +1796,7 @@ function buildInteractiveShellFrame(
     },
   ];
 
-  if (contextDisplay.isNearFull) {
+  if (!state.headerCardHidden && contextDisplay.isNearFull) {
     statusLines.push({
       kind: "info",
       text: 'Context nearly full. Consider "/new" to start fresh.',
@@ -1773,7 +1804,7 @@ function buildInteractiveShellFrame(
     });
   }
 
-  if (state.sessionStore.sessions.length === 0) {
+  if (!state.headerCardHidden && state.sessionStore.sessions.length === 0) {
     statusLines.push({
       kind: "info",
       text: "No saved sessions yet.",
@@ -1786,10 +1817,12 @@ function buildInteractiveShellFrame(
     statusLines,
     noticeLines: buildNoticeBannerLines(session, state),
     planLines: buildPlanCardLines(session.activePlan),
-    footerLines: [
+    footerLines: state.headerCardHidden
+      ? []
+      : [
       {
         kind: "body",
-        text: "commands /help /provider /model /plan /sessions /new [title] /mode /approvals /duration /system /clear /exit",
+        text: "commands /help /provider /model /plan /sessions /new [title] /mode /approvals /duration /system /hide /clear /exit",
       },
       {
         kind: "body",
@@ -2853,6 +2886,11 @@ async function ensureActiveTaskPlan(
   state: InteractiveState,
   ui: InteractiveRenderer | null,
 ): Promise<TaskPlan> {
+  // Reuse the existing plan when it still has unfinished steps.
+  if (session.activePlan && !isTaskPlanResolved(session.activePlan)) {
+    return session.activePlan;
+  }
+
   const nextPlanResult = await generateTaskPlan(session, prompt, state);
   const nextPlan = nextPlanResult.plan;
   if (session.activePlan) {
@@ -3457,7 +3495,11 @@ function renderError(ui: InteractiveRenderer | null, message: string): void {
 
 function formatAgentTurnFailureMessage(error: unknown): string {
   if (error instanceof AgentToolLoopLimitError) {
-    return "Stopped this turn after the model exhausted the tool-call limit without producing an answer. The failed tool loop was not added to session history. Ask for a narrower target or a specific file if you want to continue.";
+    if (error.reason === "stalled") {
+      return "Stopped this turn after the model repeated tool calls without enough new progress. The failed tool loop was not added to session history. Ask for a narrower target or a specific file if you want to continue.";
+    }
+
+    return "Stopped this turn after the model exhausted the emergency tool-call safety fuse without producing an answer. The failed tool loop was not added to session history. Ask for a narrower target or a specific file if you want to continue.";
   }
 
   return error instanceof Error ? error.message : "Unknown error";

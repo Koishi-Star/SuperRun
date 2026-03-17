@@ -90,7 +90,9 @@ export class OpenAICompatibleClient implements LLMClient {
     const shouldStream = typeof onChunk === "function";
     const requestBody: Record<string, unknown> = {
       model,
-      messages: messages.map((message) => serializeChatMessage(message)),
+      messages: sanitizeToolCallInvariant(
+        messages.map((message) => serializeChatMessage(message)),
+      ),
       stream: shouldStream,
     };
 
@@ -413,6 +415,35 @@ function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
       ? { reasoning_content: message.reasoningContent }
       : {}),
   };
+}
+
+// Last-resort safeguard: strip tool_call entries from assistant messages whose
+// matching tool-result messages are missing, so the API never receives orphaned
+// tool_call_ids.  The primary fix lives in materializeTurnContextMessages but
+// this layer catches anything that slips through (e.g. history edge cases).
+function sanitizeToolCallInvariant(
+  messages: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const presentToolResultIds = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "tool" && typeof message.tool_call_id === "string") {
+      presentToolResultIds.add(message.tool_call_id);
+    }
+  }
+
+  return messages.map((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+      return message;
+    }
+    const kept = (message.tool_calls as Array<{ id?: string }>).filter(
+      (tc) => typeof tc.id === "string" && presentToolResultIds.has(tc.id),
+    );
+    if (kept.length === message.tool_calls.length) {
+      return message;
+    }
+    const { tool_calls: _dropped, ...rest } = message;
+    return kept.length ? { ...rest, tool_calls: kept } : rest;
+  });
 }
 
 function serializeToolDefinition(tool: ToolDefinition): Record<string, unknown> {

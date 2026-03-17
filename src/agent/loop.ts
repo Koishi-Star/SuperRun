@@ -50,19 +50,31 @@ export type AgentTurnOptions = ChatOptions & {
   streamFinalResponse?: boolean;
 };
 export const DEFAULT_MAX_HISTORY_TURNS = 10;
-// Coding-oriented models often need several inspect/edit/verify rounds before
-// they can finish naturally, so keep a guardrail without forcing tiny loops.
-const MAX_TOOL_CALL_ROUNDS = 8;
-const TOOL_LOOP_WARNING_AFTER_ROUND = 4;
+// Long coding turns often need many read rounds before they can change code.
+// Use a high emergency fuse, then only force a final answer when the loop has
+// stalled for several consecutive rounds without enough new progress.
+export const MAX_TOTAL_TOOL_CALL_ROUNDS = 128;
+export const MAX_STALLED_TOOL_CALL_ROUNDS = 6;
+const TOOL_LOOP_WARNING_AFTER_ROUND = 12;
 const MAX_MODEL_REQUEST_TIMEOUT_RETRIES = 6;
+
+type ToolLoopLimitReason = "stalled" | "safety";
 
 export class AgentToolLoopLimitError extends Error {
   readonly maxRounds: number;
+  readonly reason: ToolLoopLimitReason;
+  readonly stalledRounds: number;
 
-  constructor(maxRounds: number) {
+  constructor(
+    maxRounds: number,
+    reason: ToolLoopLimitReason,
+    stalledRounds = 0,
+  ) {
     super("Model exceeded the maximum tool call rounds.");
     this.name = "AgentToolLoopLimitError";
     this.maxRounds = maxRounds;
+    this.reason = reason;
+    this.stalledRounds = stalledRounds;
   }
 }
 
@@ -115,6 +127,16 @@ type ClarificationReplyKind =
 
 const PLAN_UPDATE_TOOL_NAME = "update_plan";
 const PLAN_EXEMPT_TOOL_NAMES = new Set([PLAN_UPDATE_TOOL_NAME, "request_user_input"]);
+const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_lines",
+  "insert_lines",
+  "delete_file",
+  "restore_deleted_file",
+  "purge_deleted_file",
+  "empty_delete_area",
+  "trash",
+]);
 
 export function createAgentSession(
   options?: CreateAgentSessionOptions,
@@ -170,10 +192,14 @@ export async function runAgentTurn(
   const trimmedTurns = trimSessionHistory(session, trimmedPrompt);
   const baseMessages = buildTurnMessages(session, trimmedPrompt);
   const estimatedPromptTokens = estimateChatMessageTokens(
-    buildRoundMessages(baseMessages, 0, false, session.activePlan, {
+    buildRoundMessages(baseMessages, 0, {
+      isFinalAnswerAttempt: false,
+      stalledRounds: 0,
+      exhaustedSafetyFuse: false,
+    }, session.activePlan, {
       canRequestUserInput: Boolean(options?.toolContext?.userInput?.requestUserInput),
       userInputDismissed: false,
-    }),
+    }, new Map()),
   );
   const response = await resolveAgentReply(
     baseMessages,
@@ -264,25 +290,47 @@ async function resolveAgentReply(
   session: AgentSession,
   options?: AgentTurnOptions,
 ): Promise<{ content: string; usage?: ProviderUsage }> {
-  const messages = [...baseMessages];
+  const turnContextEntries: TurnContextEntry[] = baseMessages.map((message) => ({
+    message,
+    stepId: null,
+    compressed: false,
+  }));
   const canRequestUserInput = Boolean(options?.toolContext?.userInput?.requestUserInput);
   const tools = getAgentToolDefinitions(session.mode, options?.toolContext);
   let lastUsage: ProviderUsage | undefined;
   let userInputDismissed = false;
   let timeoutRetryCount = 0;
+  let stalledToolCallRounds = 0;
+  const seenToolCallSignatures = new Set<string>();
+  const stepActivities = new Map<string, StepContextActivity>();
+  const compressedStepSummaries = new Map<string, string>();
 
-  for (let round = 0; round <= MAX_TOOL_CALL_ROUNDS; round += 1) {
+  for (let round = 0; round < MAX_TOTAL_TOOL_CALL_ROUNDS; round += 1) {
     throwIfAborted(options?.abortSignal);
-    const isFinalAnswerAttempt = round === MAX_TOOL_CALL_ROUNDS;
+    const exhaustedSafetyFuse = round === MAX_TOTAL_TOOL_CALL_ROUNDS - 1;
+    const isFinalAnswerAttempt =
+      exhaustedSafetyFuse ||
+      stalledToolCallRounds >= MAX_STALLED_TOOL_CALL_ROUNDS;
     let response;
     while (true) {
       options?.onModelRequestStateChange?.(true);
       try {
         response = await chatOnce(
-          buildRoundMessages(messages, round, isFinalAnswerAttempt, session.activePlan, {
-            canRequestUserInput,
-            userInputDismissed,
-          }),
+          buildRoundMessages(
+            materializeTurnContextMessages(turnContextEntries),
+            round,
+            {
+              isFinalAnswerAttempt,
+              stalledRounds: stalledToolCallRounds,
+              exhaustedSafetyFuse,
+            },
+            session.activePlan,
+            {
+              canRequestUserInput,
+              userInputDismissed,
+            },
+            compressedStepSummaries,
+          ),
           {
             ...(options?.model ? { model: options.model } : {}),
             ...(options?.temperature !== undefined
@@ -294,8 +342,9 @@ async function resolveAgentReply(
             ...(options?.abortSignal
               ? { abortSignal: options.abortSignal }
               : {}),
-            // The last pass disables tools so the model has to summarize or explain
-            // the limit instead of looping forever through more reads or commands.
+            // Only disable tools once the loop is clearly stalled or the
+            // emergency fuse is exhausted. Long read-only investigation chains
+            // should be allowed to continue while they still make progress.
             ...(isFinalAnswerAttempt ? {} : { tools }),
           },
         );
@@ -307,10 +356,13 @@ async function resolveAgentReply(
         }
 
         timeoutRetryCount += 1;
-        messages.push({
-          role: "system",
-          content: buildModelTimeoutRetryMessage(timeoutRetryCount, error),
-        });
+        appendTurnContextEntry(
+          turnContextEntries,
+          {
+            role: "system",
+            content: buildModelTimeoutRetryMessage(timeoutRetryCount, error),
+          },
+        );
       } finally {
         options?.onModelRequestStateChange?.(false);
       }
@@ -346,14 +398,20 @@ async function resolveAgentReply(
             );
           }
 
-          messages.push({
-            role: "assistant",
-            content: response.content,
-          });
-          messages.push({
-            role: "system",
-            content: buildClarificationToolReminder(session.activePlan),
-          });
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "assistant",
+              content: response.content,
+            },
+          );
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "system",
+              content: buildClarificationToolReminder(session.activePlan),
+            },
+          );
           continue;
         }
 
@@ -364,14 +422,20 @@ async function resolveAgentReply(
             );
           }
 
-          messages.push({
-            role: "assistant",
-            content: response.content,
-          });
-          messages.push({
-            role: "system",
-            content: buildDismissedUserInputReminder(session.activePlan),
-          });
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "assistant",
+              content: response.content,
+            },
+          );
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "system",
+              content: buildDismissedUserInputReminder(session.activePlan),
+            },
+          );
           continue;
         }
       }
@@ -386,21 +450,27 @@ async function resolveAgentReply(
             );
           }
 
-          messages.push({
-            role: "assistant",
-            content: response.content,
-          });
-          messages.push({
-            role: "system",
-            content: buildIncompletePlanReminder(
-              session.activePlan,
-              {
-                canRequestUserInput,
-                userInputDismissed,
-              },
-              inferIncompletePlanRetryReason(response.content),
-            ),
-          });
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "assistant",
+              content: response.content,
+            },
+          );
+          appendTurnContextEntry(
+            turnContextEntries,
+            {
+              role: "system",
+              content: buildIncompletePlanReminder(
+                session.activePlan,
+                {
+                  canRequestUserInput,
+                  userInputDismissed,
+                },
+                inferIncompletePlanRetryReason(response.content),
+              ),
+            },
+          );
           continue;
         }
       }
@@ -421,25 +491,36 @@ async function resolveAgentReply(
     }
 
     if (isFinalAnswerAttempt) {
-      throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
+      throw new AgentToolLoopLimitError(
+        exhaustedSafetyFuse ? MAX_TOTAL_TOOL_CALL_ROUNDS : MAX_STALLED_TOOL_CALL_ROUNDS,
+        exhaustedSafetyFuse ? "safety" : "stalled",
+        stalledToolCallRounds,
+      );
     }
 
     const outlinedUrlsAtRoundStart = buildOutlinedUrlSnapshot(session.webpageFetchCache);
 
-    messages.push({
-      role: "assistant",
-      content: response.content,
-      toolCalls: response.toolCalls,
-      ...(response.reasoningContent
-        ? { reasoningContent: response.reasoningContent }
-        : {}),
-    });
+    appendTurnContextEntry(
+      turnContextEntries,
+      {
+        role: "assistant",
+        content: response.content,
+        toolCalls: response.toolCalls,
+        ...(response.reasoningContent
+          ? { reasoningContent: response.reasoningContent }
+          : {}),
+      },
+    );
     if (response.content && options?.onChunk) {
       options.onChunk(ensureAssistantChunkSpacing(response.content));
     }
 
+    let roundMadeProgress = false;
     for (const toolCall of response.toolCalls) {
       throwIfAborted(options?.abortSignal);
+      const activeStepIdBefore = session.activePlan
+        ? getInProgressTaskPlanStep(session.activePlan)?.id ?? null
+        : null;
       const toolExecution = await executeToolCallForAgentRound(
         toolCall,
         session.mode,
@@ -448,12 +529,17 @@ async function resolveAgentReply(
         outlinedUrlsAtRoundStart,
         options?.toolContext,
       );
-      messages.push({
-        role: "tool",
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-        content: toolExecution.toolResult,
-      });
+      recordStepActivity(stepActivities, activeStepIdBefore, toolCall, toolExecution);
+      appendTurnContextEntry(
+        turnContextEntries,
+        {
+          role: "tool",
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          content: toolExecution.toolResult,
+        },
+        activeStepIdBefore,
+      );
       if (toolExecution.userInputResponseKind === "dismissed") {
         userInputDismissed = true;
       } else if (toolExecution.userInputResponseKind) {
@@ -461,21 +547,52 @@ async function resolveAgentReply(
       }
 
       if (toolExecution.policyMessage) {
-        messages.push({
-          role: "system",
-          content: toolExecution.policyMessage,
-        });
+        appendTurnContextEntry(
+          turnContextEntries,
+          {
+            role: "system",
+            content: toolExecution.policyMessage,
+          },
+          activeStepIdBefore,
+        );
       }
+
+      if (didToolCallMakeProgress(toolCall, toolExecution, seenToolCallSignatures)) {
+        roundMadeProgress = true;
+      }
+
+      compressResolvedStepContext(
+        session.activePlan,
+        activeStepIdBefore,
+        stepActivities,
+        turnContextEntries,
+        compressedStepSummaries,
+      );
     }
+
+    stalledToolCallRounds = roundMadeProgress
+      ? 0
+      : stalledToolCallRounds + 1;
   }
 
-  throw new AgentToolLoopLimitError(MAX_TOOL_CALL_ROUNDS);
+  throw new AgentToolLoopLimitError(MAX_TOTAL_TOOL_CALL_ROUNDS, "safety", stalledToolCallRounds);
 }
 
 type ToolExecutionOutcome = {
   toolResult: string;
   policyMessage?: string;
   userInputResponseKind?: UserInputResponse["kind"];
+  madeProgress?: boolean;
+};
+
+type TurnContextEntry = {
+  message: ChatMessage;
+  stepId: string | null;
+  compressed: boolean;
+};
+
+type StepContextActivity = {
+  observations: string[];
 };
 
 async function executeToolCallForAgentRound(
@@ -494,6 +611,7 @@ async function executeToolCallForAgentRound(
         error: planGate.toolError,
       }),
       policyMessage: planGate.policyMessage,
+      madeProgress: false,
     };
   }
 
@@ -541,6 +659,7 @@ async function executeToolCallForAgentRound(
     }),
     policyMessage:
       `The agent enforced outline-before-article retrieval for ${normalizedUrl}. The prior fetch_webpage call returned outline mode instead of article mode. Review that outline first and only call article mode in a later round if it is still necessary.`,
+    madeProgress: true,
   };
 }
 
@@ -561,12 +680,21 @@ function buildOutlinedUrlSnapshot(
 function buildRoundMessages(
   messages: ChatMessage[],
   round: number,
-  isFinalAnswerAttempt: boolean,
+  loopState: {
+    isFinalAnswerAttempt: boolean;
+    stalledRounds: number;
+    exhaustedSafetyFuse: boolean;
+  },
   activePlan: TaskPlan | null,
   guidance: RoundPromptGuidance,
+  compressedStepSummaries: ReadonlyMap<string, string>,
 ): ChatMessage[] {
-  const planMessage = buildActivePlanSystemMessage(activePlan, guidance);
-  const warning = buildToolLoopWarning(round, isFinalAnswerAttempt);
+  const planMessage = buildActivePlanSystemMessage(
+    activePlan,
+    guidance,
+    compressedStepSummaries,
+  );
+  const warning = buildToolLoopWarning(round, loopState);
   return [
     ...messages,
     ...(planMessage
@@ -584,24 +712,396 @@ function buildRoundMessages(
   ];
 }
 
-function buildToolLoopWarning(
-  round: number,
-  isFinalAnswerAttempt: boolean,
-): string | null {
-  if (isFinalAnswerAttempt) {
-    return `You have already used ${MAX_TOOL_CALL_ROUNDS} tool rounds on this turn. Do not call more tools. Respond with the best answer you can from the information already gathered. If the results were blocked, redacted, repetitive, or insufficient, say that plainly, summarize the relevant findings, and ask the user for a narrower target instead of continuing a broad search.`;
+function materializeTurnContextMessages(
+  entries: TurnContextEntry[],
+): ChatMessage[] {
+  const visible = entries
+    .filter((entry) => !entry.compressed)
+    .map((entry) => entry.message);
+
+  // Collect tool_call_ids that still have a matching tool-result message
+  // so we can strip orphaned toolCalls from assistant messages whose tool
+  // results were compressed away (the API rejects orphaned tool_call_ids).
+  const presentToolResultIds = new Set<string>();
+  for (const message of visible) {
+    if (message.role === "tool") {
+      presentToolResultIds.add(message.toolCallId);
+    }
   }
 
-  if (round < TOOL_LOOP_WARNING_AFTER_ROUND) {
+  return visible.map((message) => {
+    if (message.role !== "assistant" || !message.toolCalls?.length) {
+      return message;
+    }
+    const kept = message.toolCalls.filter((tc) => presentToolResultIds.has(tc.id));
+    if (kept.length === message.toolCalls.length) {
+      return message; // nothing stripped — return original
+    }
+    // Shallow-copy so we don't mutate the TurnContextEntry's message.
+    const { toolCalls: _dropped, ...rest } = message;
+    return kept.length
+      ? { ...rest, toolCalls: kept }
+      : rest as ChatMessage;
+  });
+}
+
+function appendTurnContextEntry(
+  entries: TurnContextEntry[],
+  message: ChatMessage,
+  stepId: string | null = null,
+): void {
+  entries.push({
+    message,
+    stepId,
+    compressed: false,
+  });
+}
+
+function recordStepActivity(
+  stepActivities: Map<string, StepContextActivity>,
+  stepId: string | null,
+  toolCall: ToolCall,
+  toolExecution: ToolExecutionOutcome,
+): void {
+  if (!stepId || toolCall.name === PLAN_UPDATE_TOOL_NAME) {
+    return;
+  }
+
+  const observation = buildToolContextObservation(toolCall, toolExecution);
+  if (!observation) {
+    return;
+  }
+
+  const current = stepActivities.get(stepId) ?? { observations: [] };
+  if (!current.observations.includes(observation)) {
+    current.observations.push(observation);
+  }
+  stepActivities.set(stepId, current);
+}
+
+function compressResolvedStepContext(
+  activePlan: TaskPlan | null,
+  stepId: string | null,
+  stepActivities: Map<string, StepContextActivity>,
+  turnContextEntries: TurnContextEntry[],
+  compressedStepSummaries: Map<string, string>,
+): void {
+  if (!activePlan || !stepId || compressedStepSummaries.has(stepId)) {
+    return;
+  }
+
+  const step = activePlan.steps.find((candidate) => candidate.id === stepId);
+  if (!step || (step.status !== "completed" && step.status !== "blocked")) {
+    return;
+  }
+
+  compressedStepSummaries.set(
+    stepId,
+    buildCompletedStepContextSummary(step, stepActivities.get(stepId)),
+  );
+
+  for (const entry of turnContextEntries) {
+    if (entry.stepId !== stepId) {
+      continue;
+    }
+
+    if (entry.message.role === "tool" || entry.message.role === "system") {
+      entry.compressed = true;
+    }
+  }
+}
+
+function buildToolLoopWarning(
+  round: number,
+  loopState: {
+    isFinalAnswerAttempt: boolean;
+    stalledRounds: number;
+    exhaustedSafetyFuse: boolean;
+  },
+): string | null {
+  if (loopState.isFinalAnswerAttempt) {
+    if (loopState.exhaustedSafetyFuse) {
+      return `You have already used ${MAX_TOTAL_TOOL_CALL_ROUNDS} tool rounds on this turn. Do not call more tools. Respond with the best answer you can from the information already gathered, explain any remaining uncertainty, and ask for a narrower target instead of continuing an unbounded search.`;
+    }
+
+    return `The last ${loopState.stalledRounds} tool rounds did not add enough new progress. Do not call more tools. Respond with the best answer you can from the information already gathered. If the results were blocked, repetitive, or still insufficient, say that plainly and ask the user for a narrower target or a specific file.`;
+  }
+
+  if (round < TOOL_LOOP_WARNING_AFTER_ROUND && loopState.stalledRounds === 0) {
     return null;
   }
 
-  return `You have already used ${round} tool rounds on this turn. Avoid repeating broad scans or reading the same kind of files again. Only call another tool if it directly narrows the answer or applies the requested change. If results are blocked, redacted, repetitive, or insufficient, stop and explain the limit instead.`;
+  const warnings = [
+    `You have already used ${round} tool rounds on this turn.`,
+  ];
+  if (loopState.stalledRounds > 0) {
+    warnings.push(`The last ${loopState.stalledRounds} round${loopState.stalledRounds === 1 ? "" : "s"} did not add enough new progress.`);
+  }
+  warnings.push(
+    "Only call another tool if it reads a new target, updates the plan, asks a focused clarification, applies a change, or verifies the result.",
+    "Avoid repeating the same scans or rereading the same target without a concrete reason.",
+  );
+  return warnings.join(" ");
+}
+
+function didToolCallMakeProgress(
+  toolCall: ToolCall,
+  toolExecution: ToolExecutionOutcome,
+  seenToolCallSignatures: Set<string>,
+): boolean {
+  const signature = buildToolCallSignature(toolCall);
+  const isNovelSignature = !seenToolCallSignatures.has(signature);
+  seenToolCallSignatures.add(signature);
+
+  if (toolExecution.madeProgress !== undefined) {
+    return toolExecution.madeProgress;
+  }
+
+  if (toolExecution.policyMessage) {
+    return false;
+  }
+
+  if (WORKSPACE_MUTATION_TOOL_NAMES.has(toolCall.name)) {
+    return true;
+  }
+
+  return isNovelSignature;
+}
+
+function buildToolCallSignature(toolCall: ToolCall): string {
+  return `${toolCall.name}:${normalizeToolCallArguments(toolCall.arguments)}`;
+}
+
+function normalizeToolCallArguments(argumentsText: string): string {
+  const normalized = argumentsText.trim();
+  if (!normalized) {
+    return "";
+  }
+
+  try {
+    return stableSerializeValue(JSON.parse(normalized));
+  } catch {
+    return normalized.replace(/\s+/g, " ");
+  }
+}
+
+function stableSerializeValue(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerializeValue(item)).join(",")}]`;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerializeValue(entryValue)}`);
+  return `{${entries.join(",")}}`;
+}
+
+function buildCompletedStepContextSummary(
+  step: TaskPlan["steps"][number],
+  activity: StepContextActivity | undefined,
+): string {
+  const summarizedActions = summarizeStepContextObservations(activity?.observations ?? []);
+  if (summarizedActions) {
+    return truncateContextSummary(summarizedActions, 280);
+  }
+
+  if (step.note) {
+    return truncateContextSummary(step.note, 280);
+  }
+
+  return truncateContextSummary(
+    step.status === "blocked"
+      ? "Step blocked; detailed tool output was compressed."
+      : "Step completed; detailed tool output was compressed.",
+    280,
+  );
+}
+
+function summarizeStepContextObservations(observations: string[]): string {
+  if (observations.length === 0) {
+    return "";
+  }
+
+  const visibleObservations = observations.slice(0, 3);
+  const suffix = observations.length > visibleObservations.length
+    ? `; ${observations.length - visibleObservations.length} more action${observations.length - visibleObservations.length === 1 ? "" : "s"}`
+    : "";
+  return `Actions: ${visibleObservations.join("; ")}${suffix}.`;
+}
+
+function buildToolContextObservation(
+  toolCall: ToolCall,
+  toolExecution: ToolExecutionOutcome,
+): string {
+  const parsedArgs = tryParseJsonRecord(toolCall.arguments);
+  const parsedResult = tryParseJsonRecord(toolExecution.toolResult);
+
+  switch (toolCall.name) {
+    case "read_file": {
+      const path = getStringProperty(parsedResult, "path") ?? getStringProperty(parsedArgs, "path");
+      const startLine = getNumberProperty(parsedResult, "startLine") ?? getNumberProperty(parsedArgs, "start_line");
+      const endLine = getNumberProperty(parsedResult, "endLine") ?? getNumberProperty(parsedArgs, "end_line");
+      const range = startLine !== null && endLine !== null
+        ? ` lines ${startLine}-${endLine}`
+        : "";
+      return truncateContextSummary(`read ${path ?? "a file"}${range}`, 120);
+    }
+    case "search_workspace": {
+      const pattern = getStringProperty(parsedArgs, "pattern");
+      const path = getStringProperty(parsedResult, "path") ?? getStringProperty(parsedArgs, "path") ?? ".";
+      const matchCount = getArrayLength(parsedResult, "matches");
+      const matchSuffix = matchCount !== null ? ` (${matchCount} matches)` : "";
+      return truncateContextSummary(
+        `searched ${path} for ${quoteContextValue(pattern)}${matchSuffix}`,
+        120,
+      );
+    }
+    case "list_files": {
+      const path = getStringProperty(parsedResult, "path") ?? getStringProperty(parsedArgs, "path") ?? ".";
+      const depth = getNumberProperty(parsedResult, "depth") ?? getNumberProperty(parsedArgs, "depth");
+      const entryCount = getArrayLength(parsedResult, "entries");
+      const detail = [
+        depth !== null ? `depth ${depth}` : null,
+        entryCount !== null ? `${entryCount} entries` : null,
+      ].filter(Boolean).join(", ");
+      return truncateContextSummary(
+        `listed ${path}${detail ? ` (${detail})` : ""}`,
+        120,
+      );
+    }
+    case "run_command": {
+      const command = getStringProperty(parsedArgs, "command");
+      const exitCode = getNumberProperty(parsedResult, "exitCode");
+      const timedOut = getBooleanProperty(parsedResult, "timedOut");
+      const outcome = timedOut
+        ? "timed out"
+        : exitCode !== null
+          ? `exit ${exitCode}`
+          : "ran";
+      return truncateContextSummary(
+        `ran ${quoteContextValue(command, 80)} (${outcome})`,
+        120,
+      );
+    }
+    case "fetch_webpage": {
+      const url = getStringProperty(parsedArgs, "url");
+      const mode = getStringProperty(parsedArgs, "mode") ?? "outline";
+      return truncateContextSummary(
+        `fetched ${mode} for ${quoteContextValue(url, 80)}`,
+        120,
+      );
+    }
+    case "request_user_input":
+      return "asked a focused clarification question";
+    default: {
+      const argumentPreview = formatToolArgumentPreview(parsedArgs);
+      return truncateContextSummary(
+        argumentPreview
+          ? `${toolCall.name} ${argumentPreview}`
+          : toolCall.name,
+        120,
+      );
+    }
+  }
+}
+
+function formatToolArgumentPreview(
+  value: Record<string, unknown> | null,
+): string {
+  if (!value) {
+    return "";
+  }
+
+  const entries = Object.entries(value)
+    .filter(([, entryValue]) =>
+      typeof entryValue === "string" ||
+      typeof entryValue === "number" ||
+      typeof entryValue === "boolean"
+    )
+    .slice(0, 3)
+    .map(([key, entryValue]) =>
+      `${key}=${typeof entryValue === "string" ? quoteContextValue(entryValue, 48) : String(entryValue)}`
+    );
+  return entries.join(" ");
+}
+
+function truncateContextSummary(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(1, maxLength - 3))}...`;
+}
+
+function quoteContextValue(value: string | null | undefined, maxLength = 60): string {
+  if (!value) {
+    return '"?"';
+  }
+
+  return `"${truncateContextSummary(value, maxLength)}"`;
+}
+
+function tryParseJsonRecord(value: string): Record<string, unknown> | null {
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function getStringProperty(
+  value: Record<string, unknown> | null,
+  key: string,
+): string | null {
+  return value && typeof value[key] === "string"
+    ? value[key] as string
+    : null;
+}
+
+function getNumberProperty(
+  value: Record<string, unknown> | null,
+  key: string,
+): number | null {
+  return value && typeof value[key] === "number"
+    ? value[key] as number
+    : null;
+}
+
+function getBooleanProperty(
+  value: Record<string, unknown> | null,
+  key: string,
+): boolean | null {
+  return value && typeof value[key] === "boolean"
+    ? value[key] as boolean
+    : null;
+}
+
+function getArrayLength(
+  value: Record<string, unknown> | null,
+  key: string,
+): number | null {
+  return value && Array.isArray(value[key])
+    ? (value[key] as unknown[]).length
+    : null;
 }
 
 function buildActivePlanSystemMessage(
   activePlan: TaskPlan | null,
   guidance: RoundPromptGuidance,
+  compressedStepSummaries: ReadonlyMap<string, string>,
 ): string | null {
   if (!activePlan) {
     return null;
@@ -616,9 +1116,18 @@ function buildActivePlanSystemMessage(
     "Do not claim that edits succeeded unless the workspace was actually changed and later verification passes.",
     `Current in-progress step: ${currentStep ? `${currentStep.id} ${currentStep.title}` : "none"}`,
     "Plan steps:",
-    ...activePlan.steps.map((step) =>
-      `- ${step.id} [${step.status}] ${step.title}${step.note ? ` note: ${step.note}` : ""}`,
-    ),
+    ...activePlan.steps.map((step) => {
+      const stepDetails: string[] = [];
+      if (step.note) {
+        stepDetails.push(`note: ${step.note}`);
+      }
+      const compressedSummary = compressedStepSummaries.get(step.id);
+      if (compressedSummary && compressedSummary !== step.note) {
+        stepDetails.push(`summary: ${compressedSummary}`);
+      }
+
+      return `- ${step.id} [${step.status}] ${step.title}${stepDetails.length > 0 ? ` ${stepDetails.join(" ")}` : ""}`;
+    }),
   ];
 
   if (guidance.canRequestUserInput) {

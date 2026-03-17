@@ -8,6 +8,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import {
   AgentToolLoopLimitError,
+  MAX_STALLED_TOOL_CALL_ROUNDS,
   createAgentSession,
   getAgentSessionStats,
   runAgentTurn,
@@ -322,7 +323,10 @@ test("runAgentTurn resolves a list_files tool call before producing the final an
 
     assert.equal(reply.reply, "The workspace includes alpha.ts and beta.txt.");
     assert.equal(server.requests.length, 2);
-    assert.equal(server.requests[0]?.tools?.[0]?.function?.name, "list_files");
+    assert.equal(
+      server.requests[0]?.tools?.some((tool) => tool.function?.name === "list_files"),
+      true,
+    );
     assert.equal(server.requests[1]?.messages?.[0]?.role, "system");
     assert.equal(server.requests[1]?.messages?.[0]?.content, "Test system prompt");
     assert.equal(server.requests[1]?.messages?.[1]?.role, "system");
@@ -1122,7 +1126,7 @@ test("runAgentTurn tolerates multi-step tool loops that exceed three rounds", as
 
 test("runAgentTurn forces a final no-tool answer after repeated tool rounds", async () => {
   const server = await startMockOpenAIServer([
-    ...Array.from({ length: 8 }, (_, index) => ({
+    ...Array.from({ length: MAX_STALLED_TOOL_CALL_ROUNDS + 1 }, (_, index) => ({
       toolCalls: [
         {
           id: `call_${index + 1}`,
@@ -1158,11 +1162,11 @@ test("runAgentTurn forces a final no-tool answer after repeated tool rounds", as
     const reply = await runAgentTurn(session, "Inspect carefully, then stop looping.");
 
     assert.equal(reply.reply, "Final answer without more tools.");
-    assert.equal(server.requests.length, 9);
-    assert.equal(server.requests[8]?.tools, undefined);
+    assert.equal(server.requests.length, MAX_STALLED_TOOL_CALL_ROUNDS + 2);
+    assert.equal(server.requests[MAX_STALLED_TOOL_CALL_ROUNDS + 1]?.tools, undefined);
     assert.match(
-      String(server.requests[8]?.messages.at(-1)?.content ?? ""),
-      /Do not call more tools\./,
+      String(server.requests[MAX_STALLED_TOOL_CALL_ROUNDS + 1]?.messages.at(-1)?.content ?? ""),
+      /Do not call more tools\.|did not add enough new progress/i,
     );
   } finally {
     process.chdir(previousCwd);
@@ -1172,9 +1176,310 @@ test("runAgentTurn forces a final no-tool answer after repeated tool rounds", as
   }
 });
 
-test("runAgentTurn leaves history untouched when the model exceeds the tool-round limit", async () => {
+test("runAgentTurn allows long exploratory read chains when each round targets a new file", async () => {
+  const fileNames = Array.from({ length: 12 }, (_, index) => `file_${index + 1}.ts`);
+  const server = await startMockOpenAIServer([
+    ...fileNames.map((fileName, index) => ({
+      toolCalls: [
+        {
+          id: `call_${index + 1}`,
+          name: "read_file",
+          arguments: JSON.stringify({ path: fileName, startLine: 1, endLine: 20 }),
+        },
+      ],
+    })),
+    "Completed a long read-only investigation.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-long-read-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    for (const [index, fileName] of fileNames.entries()) {
+      await writeFile(
+        path.join(tempDir, fileName),
+        `export const value${index + 1} = ${index + 1};\n`,
+        "utf8",
+      );
+    }
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+    });
+    const reply = await runAgentTurn(session, "Inspect several files before answering.");
+
+    assert.equal(reply.reply, "Completed a long read-only investigation.");
+    assert.equal(server.requests.length, fileNames.length + 1);
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn compresses completed step tool output into plan summaries for later rounds", async () => {
+  const alphaMarker = "ALPHA_CONTEXT_SHOULD_BE_COMPRESSED";
+  const betaMarker = "BETA_CONTEXT_CAN_REMAIN";
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "in_progress",
+          }),
+        },
+        {
+          id: "call_2",
+          name: "read_file",
+          arguments: JSON.stringify({
+            path: "alpha.ts",
+            start_line: 1,
+            end_line: 3,
+          }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_3",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_1",
+            status: "completed",
+            note: "Found the alpha handler.",
+          }),
+        },
+        {
+          id: "call_4",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_2",
+            status: "in_progress",
+          }),
+        },
+        {
+          id: "call_5",
+          name: "read_file",
+          arguments: JSON.stringify({
+            path: "beta.ts",
+            start_line: 1,
+            end_line: 3,
+          }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_6",
+          name: "update_plan",
+          arguments: JSON.stringify({
+            step_id: "step_2",
+            status: "completed",
+            note: "Finished inspecting beta.",
+          }),
+        },
+      ],
+    },
+    "Compressed context works.",
+  ]);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-step-compress-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    await writeFile(
+      path.join(tempDir, "alpha.ts"),
+      `export const alpha = "${alphaMarker}";\nexport const alphaValue = 1;\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(tempDir, "beta.ts"),
+      `export const beta = "${betaMarker}";\nexport const betaValue = 2;\n`,
+      "utf8",
+    );
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test system prompt",
+      activePlan: createTaskPlan({
+        title: "Inspect two files",
+        sourcePrompt: "Inspect alpha and beta.",
+        steps: [
+          { title: "Inspect alpha.ts" },
+          { title: "Inspect beta.ts" },
+        ],
+      }),
+    });
+    const reply = await runAgentTurn(session, "Inspect both files before answering.", {
+      toolContext: createPlanToolContext(session),
+    });
+
+    assert.equal(reply.reply, "Compressed context works.");
+    const thirdRequestContent = (server.requests[2]?.messages ?? [])
+      .map((message) => String(message.content ?? ""))
+      .join("\n");
+    assert.doesNotMatch(thirdRequestContent, new RegExp(alphaMarker));
+    assert.match(thirdRequestContent, /note: Found the alpha handler\./);
+    assert.match(thirdRequestContent, /summary: Actions: read alpha\.ts lines 1-2\./);
+    assert.match(thirdRequestContent, new RegExp(betaMarker));
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("compressed step tool results do not leave orphaned toolCalls in assistant messages", async () => {
+  // When a plan step completes mid-round, compressResolvedStepContext marks the
+  // tool-result entries as compressed.  The matching assistant message (which carries
+  // the toolCalls array) must also have those tool_call_ids stripped at
+  // materialization time, otherwise the API rejects the request with
+  //   "tool_call_ids did not have response messages".
+  //
+  // Round 0: model returns [update_plan step_1→in_progress, read_file, update_plan step_1→completed]
+  //          → step_1 completes → its tool results are compressed.
+  // Round 1: model returns [update_plan step_2→in_progress, read_file]
+  //          → the request for round 1 must NOT contain orphaned tool_call_ids from round 0.
+  // Round 2: model returns final text answer.
+  const server = await startMockOpenAIServer([
+    {
+      toolCalls: [
+        {
+          id: "call_1",
+          name: "update_plan",
+          arguments: JSON.stringify({ step_id: "step_1", status: "in_progress" }),
+        },
+        {
+          id: "call_2",
+          name: "read_file",
+          arguments: JSON.stringify({ path: "data.txt", start_line: 1, end_line: 3 }),
+        },
+        {
+          id: "call_3",
+          name: "update_plan",
+          arguments: JSON.stringify({ step_id: "step_1", status: "completed", note: "Done." }),
+        },
+      ],
+    },
+    {
+      toolCalls: [
+        {
+          id: "call_4",
+          name: "update_plan",
+          arguments: JSON.stringify({ step_id: "step_2", status: "in_progress" }),
+        },
+        {
+          id: "call_5",
+          name: "read_file",
+          arguments: JSON.stringify({ path: "data.txt", start_line: 1, end_line: 3 }),
+        },
+        {
+          id: "call_6",
+          name: "update_plan",
+          arguments: JSON.stringify({ step_id: "step_2", status: "completed", note: "Done too." }),
+        },
+      ],
+    },
+    "All done.",
+  ]);
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "superrun-agent-orphan-tc-"));
+  const previousCwd = process.cwd();
+  const previousEnv = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_TIMEOUT_MS: process.env.OPENAI_TIMEOUT_MS,
+  };
+
+  process.env.OPENAI_API_KEY = "test-key";
+  process.env.OPENAI_BASE_URL = server.baseURL;
+  process.env.OPENAI_MODEL = "mock-model";
+  process.env.OPENAI_TIMEOUT_MS = "5000";
+
+  try {
+    await writeFile(path.join(tempDir, "data.txt"), "line 1\nline 2\nline 3\n", "utf8");
+    process.chdir(tempDir);
+
+    const session = createAgentSession({
+      mode: "strict",
+      systemPrompt: "Test",
+      activePlan: createTaskPlan({
+        title: "Two steps",
+        sourcePrompt: "Read data twice.",
+        steps: [
+          { title: "First read" },
+          { title: "Second read" },
+        ],
+      }),
+    });
+    const reply = await runAgentTurn(session, "Go.", {
+      toolContext: createPlanToolContext(session),
+    });
+
+    assert.equal(reply.reply, "All done.");
+
+    // The second request (round 1) must not carry orphaned tool_call_ids from
+    // the compressed first round.
+    const round1Messages = server.requests[1]?.messages ?? [];
+    for (const message of round1Messages) {
+      if (message.role !== "assistant") continue;
+      const assistantMsg = message as { toolCalls?: Array<{ id: string }> };
+      if (!assistantMsg.toolCalls?.length) continue;
+      // Every tool_call_id in this assistant message must have a following tool-result
+      const followingToolIds = new Set(
+        round1Messages
+          .filter((m): m is { role: "tool"; toolCallId: string } => m.role === "tool")
+          .map((m) => m.toolCallId),
+      );
+      for (const tc of assistantMsg.toolCalls) {
+        assert.ok(
+          followingToolIds.has(tc.id),
+          `Assistant message carries orphaned tool_call_id "${tc.id}" with no matching tool result`,
+        );
+      }
+    }
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnv(previousEnv);
+    await server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("runAgentTurn leaves history untouched when the model exceeds the stalled tool-loop limit", async () => {
   const server = await startMockOpenAIServer(
-    Array.from({ length: 9 }, (_, index) => ({
+    Array.from({ length: MAX_STALLED_TOOL_CALL_ROUNDS + 2 }, (_, index) => ({
       toolCalls: [
         {
           id: `call_${index + 1}`,
@@ -1209,7 +1514,9 @@ test("runAgentTurn leaves history untouched when the model exceeds the tool-roun
 
     await assert.rejects(
       () => runAgentTurn(session, "Keep trying forever."),
-      (error) => error instanceof AgentToolLoopLimitError,
+      (error) =>
+        error instanceof AgentToolLoopLimitError &&
+        error.reason === "stalled",
     );
     assert.deepEqual(session.history, []);
   } finally {
@@ -1256,6 +1563,38 @@ function createPlanAwareInteractiveToolContext(
     userInput: {
       requestUserInput,
     },
+    plan: {
+      updatePlan: async (request: {
+        stepId: string;
+        status?: "pending" | "in_progress" | "completed" | "blocked";
+        note?: string | null;
+      }) => {
+        if (!session.activePlan) {
+          throw new Error("Expected an active plan in the test context.");
+        }
+
+        const nextPlan = updateTaskPlanStep(session.activePlan, request.stepId, {
+          ...(request.status ? { status: request.status } : {}),
+          ...(request.note !== undefined ? { note: request.note } : {}),
+        });
+        session.activePlan = nextPlan;
+        const nextStep = nextPlan.steps.find((step) => step.id === request.stepId);
+        if (!nextStep) {
+          throw new Error(`Unknown test plan step: ${request.stepId}`);
+        }
+
+        return {
+          planId: nextPlan.id,
+          stepId: nextStep.id,
+          status: nextStep.status,
+        };
+      },
+    },
+  };
+}
+
+function createPlanToolContext(session: ReturnType<typeof createAgentSession>) {
+  return {
     plan: {
       updatePlan: async (request: {
         stepId: string;

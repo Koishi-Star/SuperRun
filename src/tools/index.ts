@@ -32,7 +32,13 @@ const defaultModeBaseTools = [
   purgeDeletedFileTool,
   emptyDeleteAreaTool,
 ] as const;
-const strictModeTools = [listFilesTool, searchWorkspaceTool, readFileTool, listDeletedFilesTool] as const;
+const strictModeTools = [
+  updatePlanTool,
+  listFilesTool,
+  searchWorkspaceTool,
+  readFileTool,
+  listDeletedFilesTool,
+] as const;
 const planModeBaseTools = [listFilesTool, searchWorkspaceTool, readFileTool] as const;
 
 export function getAgentToolDefinitions(
