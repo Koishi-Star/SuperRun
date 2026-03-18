@@ -18,6 +18,7 @@ import { getSymbolSourceTool } from "./get_symbol_source.js";
 import { replaceSymbolBodyTool } from "./replace_symbol_body.js";
 import { insertBeforeSymbolTool, insertAfterSymbolTool } from "./insert_near_symbol.js";
 import { runValidationTool } from "./run_validation.js";
+import { applyPatchTool } from "./apply_patch.js";
 import type { ToolExecutionContext } from "./types.js";
 import { updatePlanTool } from "./update_plan.js";
 import { writeFileTool } from "./write_file.js";
@@ -33,6 +34,7 @@ const defaultModeBaseTools = [
   replaceSymbolBodyTool,
   insertBeforeSymbolTool,
   insertAfterSymbolTool,
+  applyPatchTool,
   runValidationTool,
   writeFileTool,
   replaceLinesTool,

@@ -13,7 +13,7 @@
 
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
-import { resolveSymbolRange, computeBodyHash, isSupportedSourceFile, getSymbolSource } from "./symbol-resolve.js";
+import { resolveSymbolRange, computeBodyHash, isSupportedSourceFile, getSymbolSource, resolveSymbolMemberRange, getSymbolMemberSource } from "./symbol-resolve.js";
 import { buildWorkspaceEditDiffPreview } from "./diff_preview.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
 import { normalizeReplacementLines, readWorkspaceTextFile, writeWorkspaceTextFile } from "./text_file.js";
@@ -27,6 +27,7 @@ import { normalizeRelativeWorkspacePath, resolveWorkspacePath } from "./workspac
 const insertNearSymbolArgsSchema = z.object({
   path: z.string().trim().min(1),
   symbol: z.string().trim().min(1),
+  member: z.string().trim().min(1).optional(),
   expected_hash: z.string().trim().min(1),
   content: z.string(),
 });
@@ -71,32 +72,62 @@ async function insertNearSymbol(
     throw new Error(`${toolName} only supports TypeScript and JavaScript files.`);
   }
 
-  // 1. Read the current file and resolve the anchor symbol.
+  // 1. Read the current file and resolve the anchor.
   const file = await readWorkspaceTextFile(absolutePath, toolName);
-  const resolved = resolveSymbolRange(absolutePath, file.content, args.symbol);
 
-  if (!resolved) {
-    throw new Error(
-      `Symbol "${args.symbol}" not found in ${relativePath}. Use get_symbols to list available symbols.`,
-    );
+  const targetingMember = Boolean(args.member);
+  let anchorStartLine: number;
+  let anchorEndLine: number;
+  let anchorHash: string;
+  let anchorKind: string;
+  let anchorLabel: string;
+
+  if (targetingMember) {
+    const memberRange = resolveSymbolMemberRange(absolutePath, file.content, args.symbol, args.member!);
+    if (!memberRange) {
+      throw new Error(
+        `Member "${args.member}" not found in symbol "${args.symbol}" in ${relativePath}. Use get_symbols to list available members.`,
+      );
+    }
+    anchorStartLine = memberRange.startLine;
+    anchorEndLine = memberRange.endLine;
+    anchorHash = memberRange.bodyHash;
+    anchorKind = memberRange.kind;
+    anchorLabel = `${anchorKind} "${args.member}" in ${args.symbol}`;
+  } else {
+    const resolved = resolveSymbolRange(absolutePath, file.content, args.symbol);
+    if (!resolved) {
+      throw new Error(
+        `Symbol "${args.symbol}" not found in ${relativePath}. Use get_symbols to list available symbols.`,
+      );
+    }
+    anchorStartLine = resolved.startLine;
+    anchorEndLine = resolved.endLine;
+    anchorHash = resolved.bodyHash;
+    anchorKind = resolved.kind;
+    anchorLabel = `${anchorKind} "${args.symbol}"`;
   }
 
   // 2. Hash check — reject if anchor has drifted.
-  if (resolved.bodyHash !== args.expected_hash) {
-    const current = getSymbolSource(absolutePath, file.content, args.symbol);
-    throw new HashMismatchError(
-      resolved.bodyHash,
-      current?.source ?? "(could not retrieve current source)",
-    );
+  if (anchorHash !== args.expected_hash) {
+    let currentSource: string;
+    if (targetingMember) {
+      const memberSrc = getSymbolMemberSource(absolutePath, file.content, args.symbol, args.member!);
+      currentSource = memberSrc?.source ?? "(could not retrieve current source)";
+    } else {
+      const symbolSrc = getSymbolSource(absolutePath, file.content, args.symbol);
+      currentSource = symbolSrc?.source ?? "(could not retrieve current source)";
+    }
+    throw new HashMismatchError(anchorHash, currentSource);
   }
 
   // 3. Compute insertion point and build new file lines.
   const insertionLines = normalizeReplacementLines(args.content);
 
-  // "before" → insert just before the anchor symbol's start line.
-  // "after"  → insert just after the anchor symbol's end line.
+  // "before" → insert just before the anchor's start line.
+  // "after"  → insert just after the anchor's end line.
   const insertAtIndex =
-    position === "before" ? resolved.startLine - 1 : resolved.endLine;
+    position === "before" ? anchorStartLine - 1 : anchorEndLine;
 
   // Ensure a blank line separates the new code from adjacent code.
   const linesWithSeparator = ensureBlankLineSeparation(
@@ -114,7 +145,7 @@ async function insertNearSymbol(
 
   // 4. Diff preview + approval.
   const positionLabel = position === "before" ? "before" : "after";
-  const summary = `Insert ${insertionLines.length} line(s) ${positionLabel} ${resolved.kind} "${args.symbol}" in ${relativePath}`;
+  const summary = `Insert ${insertionLines.length} line(s) ${positionLabel} ${anchorLabel} in ${relativePath}`;
 
   const diffPreview = buildWorkspaceEditDiffPreview({
     title: relativePath,
@@ -128,7 +159,7 @@ async function insertNearSymbol(
     path: relativePath,
     summary,
     reasons: [
-      `Symbol-anchored insertion ${positionLabel} ${resolved.kind} "${args.symbol}".`,
+      `Symbol-anchored insertion ${positionLabel} ${anchorLabel}.`,
     ],
     approvalRequired: true,
     diffPreview,
@@ -221,7 +252,7 @@ export const insertBeforeSymbolTool = {
   definition: {
     name: "insert_before_symbol",
     description:
-      "Insert new code immediately before a named top-level symbol. The anchor symbol is identified by name and verified by expected_hash (from get_symbol_source). The insertion always lands at a symbol boundary — never inside a declaration. Use this when adding a new function, type, constant, or import block that should appear before an existing symbol. After inserting, call run_validation.",
+      "Insert new code immediately before a named symbol or a member within it. The anchor is identified by name and verified by expected_hash. Use the optional `member` parameter to anchor to a class method or nested function. The insertion lands at a symbol boundary — never inside a declaration. After inserting, call run_validation.",
     parameters: {
       type: "object",
       properties: {
@@ -231,17 +262,21 @@ export const insertBeforeSymbolTool = {
         },
         symbol: {
           type: "string",
-          description: "Exact name of the anchor symbol to insert before.",
+          description: "Exact name of the top-level anchor symbol.",
+        },
+        member: {
+          type: "string",
+          description: "Optional. Name of a class method or nested function within the symbol to anchor to.",
         },
         expected_hash: {
           type: "string",
           description:
-            "The bodyHash of the anchor symbol from a prior get_symbol_source call.",
+            "The bodyHash of the anchor from a prior get_symbol_source call. When targeting a member, use the member's bodyHash.",
         },
         content: {
           type: "string",
           description:
-            "The code to insert. Will be placed on its own lines immediately before the anchor symbol.",
+            "The code to insert. Will be placed on its own lines immediately before the anchor.",
         },
       },
       required: ["path", "symbol", "expected_hash", "content"],
@@ -279,7 +314,7 @@ export const insertAfterSymbolTool = {
   definition: {
     name: "insert_after_symbol",
     description:
-      "Insert new code immediately after a named top-level symbol. The anchor symbol is identified by name and verified by expected_hash (from get_symbol_source). The insertion always lands at a symbol boundary — never inside a declaration. Use this when adding a new function, handler, type, or constant that should appear after an existing symbol. After inserting, call run_validation.",
+      "Insert new code immediately after a named symbol or a member within it. The anchor is identified by name and verified by expected_hash. Use the optional `member` parameter to anchor to a class method or nested function. The insertion lands at a symbol boundary — never inside a declaration. After inserting, call run_validation.",
     parameters: {
       type: "object",
       properties: {
@@ -289,17 +324,21 @@ export const insertAfterSymbolTool = {
         },
         symbol: {
           type: "string",
-          description: "Exact name of the anchor symbol to insert after.",
+          description: "Exact name of the top-level anchor symbol.",
+        },
+        member: {
+          type: "string",
+          description: "Optional. Name of a class method or nested function within the symbol to anchor to.",
         },
         expected_hash: {
           type: "string",
           description:
-            "The bodyHash of the anchor symbol from a prior get_symbol_source call.",
+            "The bodyHash of the anchor from a prior get_symbol_source call. When targeting a member, use the member's bodyHash.",
         },
         content: {
           type: "string",
           description:
-            "The code to insert. Will be placed on its own lines immediately after the anchor symbol.",
+            "The code to insert. Will be placed on its own lines immediately after the anchor.",
         },
       },
       required: ["path", "symbol", "expected_hash", "content"],

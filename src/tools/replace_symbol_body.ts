@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { ToolDefinition } from "../llm/types.js";
-import { resolveSymbolRange, computeBodyHash, isSupportedSourceFile, getSymbolSource } from "./symbol-resolve.js";
+import { resolveSymbolRange, computeBodyHash, isSupportedSourceFile, getSymbolSource, resolveSymbolMemberRange, getSymbolMemberSource } from "./symbol-resolve.js";
 import { buildWorkspaceEditDiffPreview } from "./diff_preview.js";
 import { authorizeWorkspaceEdit } from "./edit_policy.js";
 import { normalizeReplacementLines, readWorkspaceTextFile, writeWorkspaceTextFile } from "./text_file.js";
@@ -10,6 +10,7 @@ import { normalizeRelativeWorkspacePath, resolveWorkspacePath } from "./workspac
 const replaceSymbolBodyArgsSchema = z.object({
   path: z.string().trim().min(1),
   symbol: z.string().trim().min(1),
+  member: z.string().trim().min(1).optional(),
   expected_hash: z.string().trim().min(1),
   new_body: z.string(),
 });
@@ -20,7 +21,7 @@ export const replaceSymbolBodyTool = {
   definition: {
     name: "replace_symbol_body",
     description:
-      "Replace the entire declaration of a named symbol (function, class, interface, type, variable) with new content. Requires an expected_hash obtained from get_symbol_source to prevent edits based on stale content — if the hash does not match the current source, the edit is rejected and the current hash + source are returned so you can retry. Only the target symbol's line range is modified; surrounding code is untouched. After a successful edit, call run_validation to verify the project still compiles.",
+      "Replace the entire declaration of a named symbol, or a specific member within it (class method, nested function). Requires an expected_hash obtained from get_symbol_source to prevent edits based on stale content — if the hash does not match, the edit is rejected and the current hash + source are returned so you can retry. Use the optional `member` parameter to replace a single class method or nested function instead of the whole symbol. After a successful edit, call run_validation.",
     parameters: {
       type: "object",
       properties: {
@@ -30,17 +31,22 @@ export const replaceSymbolBodyTool = {
         },
         symbol: {
           type: "string",
-          description: "Exact name of the symbol to replace.",
+          description: "Exact name of the top-level symbol.",
+        },
+        member: {
+          type: "string",
+          description:
+            "Optional. Name of a class method or nested function within the symbol to replace. When specified, only the member's range is modified and the hash must match the member (not the parent).",
         },
         expected_hash: {
           type: "string",
           description:
-            "The bodyHash value from a prior get_symbol_source call. The edit is rejected if this does not match the symbol's current hash.",
+            "The bodyHash value from a prior get_symbol_source call. When targeting a member, use the member's bodyHash.",
         },
         new_body: {
           type: "string",
           description:
-            "Complete replacement source for the symbol declaration (including keywords like export, function, const, etc.).",
+            "Complete replacement source for the symbol or member declaration.",
         },
       },
       required: ["path", "symbol", "expected_hash", "new_body"],
@@ -110,46 +116,78 @@ async function replaceSymbolBody(
     throw new Error("replace_symbol_body only supports TypeScript and JavaScript files.");
   }
 
-  // 1. Read the current file and resolve symbol range + hash.
+  // 1. Read the current file and resolve target range + hash.
   const file = await readWorkspaceTextFile(absolutePath, "replace_symbol_body");
-  const resolved = resolveSymbolRange(absolutePath, file.content, args.symbol);
 
-  if (!resolved) {
-    throw new Error(
-      `Symbol "${args.symbol}" not found in ${relativePath}. Use get_symbols to list available symbols.`,
-    );
+  // Determine whether we're targeting a member or the whole symbol.
+  const targetingMember = Boolean(args.member);
+  let resolvedStartLine: number;
+  let resolvedEndLine: number;
+  let resolvedHash: string;
+  let resolvedKind: string;
+  let targetLabel: string;
+
+  if (targetingMember) {
+    const memberRange = resolveSymbolMemberRange(absolutePath, file.content, args.symbol, args.member!);
+    if (!memberRange) {
+      throw new Error(
+        `Member "${args.member}" not found in symbol "${args.symbol}" in ${relativePath}. Use get_symbols to list available members.`,
+      );
+    }
+    resolvedStartLine = memberRange.startLine;
+    resolvedEndLine = memberRange.endLine;
+    resolvedHash = memberRange.bodyHash;
+    resolvedKind = memberRange.kind;
+    targetLabel = `${resolvedKind} "${args.member}" in ${args.symbol}`;
+  } else {
+    const resolved = resolveSymbolRange(absolutePath, file.content, args.symbol);
+    if (!resolved) {
+      throw new Error(
+        `Symbol "${args.symbol}" not found in ${relativePath}. Use get_symbols to list available symbols.`,
+      );
+    }
+    resolvedStartLine = resolved.startLine;
+    resolvedEndLine = resolved.endLine;
+    resolvedHash = resolved.bodyHash;
+    resolvedKind = resolved.kind;
+    targetLabel = `${resolvedKind} "${args.symbol}"`;
   }
 
   // 2. Hash check — reject if stale.
-  if (resolved.bodyHash !== args.expected_hash) {
-    const current = getSymbolSource(absolutePath, file.content, args.symbol);
-    throw new HashMismatchError(
-      resolved.bodyHash,
-      current?.source ?? "(could not retrieve current source)",
-    );
+  if (resolvedHash !== args.expected_hash) {
+    // Provide current source for recovery.
+    let currentSource: string;
+    if (targetingMember) {
+      const memberSrc = getSymbolMemberSource(absolutePath, file.content, args.symbol, args.member!);
+      currentSource = memberSrc?.source ?? "(could not retrieve current source)";
+    } else {
+      const symbolSrc = getSymbolSource(absolutePath, file.content, args.symbol);
+      currentSource = symbolSrc?.source ?? "(could not retrieve current source)";
+    }
+    throw new HashMismatchError(resolvedHash, currentSource);
   }
 
   // 3. Build replacement lines.
   const replacementLines = normalizeReplacementLines(args.new_body);
   const nextLines = [
-    ...file.lines.slice(0, resolved.startLine - 1),
+    ...file.lines.slice(0, resolvedStartLine - 1),
     ...replacementLines,
-    ...file.lines.slice(resolved.endLine),
+    ...file.lines.slice(resolvedEndLine),
   ];
 
   // 4. Diff preview + approval (reuses existing edit policy).
   const diffPreview = buildWorkspaceEditDiffPreview({
     title: relativePath,
-    summary: `Replace ${resolved.kind} "${args.symbol}" (lines ${resolved.startLine}-${resolved.endLine}) in ${relativePath}`,
+    summary: `Replace ${targetLabel} (lines ${resolvedStartLine}-${resolvedEndLine}) in ${relativePath}`,
     oldLines: file.lines,
     newLines: nextLines,
   });
   const assessment: WorkspaceEditAssessment = {
     tool: "replace_symbol_body",
     path: relativePath,
-    summary: `Replace ${resolved.kind} "${args.symbol}" (lines ${resolved.startLine}-${resolved.endLine})`,
+    summary: `Replace ${targetLabel} (lines ${resolvedStartLine}-${resolvedEndLine})`,
     reasons: [
-      `Symbol-targeted replacement of ${resolved.kind} "${args.symbol}".`,
+      `Symbol-targeted replacement of ${targetLabel}.`,
     ],
     approvalRequired: true,
     diffPreview,
@@ -178,13 +216,14 @@ async function replaceSymbolBody(
 
   // 7. Compute new hash from the replacement text.
   const newHash = computeBodyHash(args.new_body.trim());
-  const newEndLine = resolved.startLine + replacementLines.length - 1;
+  const newEndLine = resolvedStartLine + replacementLines.length - 1;
 
   return {
     path: relativePath,
     symbol: args.symbol,
-    newStartLine: resolved.startLine,
-    newEndLine: Math.max(newEndLine, resolved.startLine),
+    ...(args.member ? { member: args.member } : {}),
+    newStartLine: resolvedStartLine,
+    newEndLine: Math.max(newEndLine, resolvedStartLine),
     newHash,
     insertedLineCount: replacementLines.length,
     totalLines: nextLines.length,

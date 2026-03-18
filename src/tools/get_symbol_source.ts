@@ -8,6 +8,8 @@ import { normalizeRelativeWorkspacePath, resolveWorkspacePath } from "./workspac
 const getSymbolSourceArgsSchema = z.object({
   path: z.string().trim().min(1),
   symbol: z.string().trim().min(1),
+  member: z.string().trim().min(1).optional(),
+  full: z.boolean().optional(),
 });
 
 type GetSymbolSourceArgs = z.infer<typeof getSymbolSourceArgsSchema>;
@@ -16,7 +18,7 @@ export const getSymbolSourceTool = {
   definition: {
     name: "get_symbol_source",
     description:
-      "Read the full source code of a specific named symbol (function, class, interface, type, variable) in a TypeScript or JavaScript file. Also returns the symbol's line range, a body hash for use with replace_symbol_body, and the file's import declarations for context. Use get_symbols first to discover available symbol names.",
+      "Read the source code of a named symbol in a TypeScript or JavaScript file. For symbols larger than 200 lines, returns a truncated preview with a member list — use the `member` parameter to drill into a specific class method or nested function, or pass `full: true` to read the entire source. Returns the symbol's line range, a body hash for use with replace_symbol_body, and the file's import declarations. Use get_symbols first to discover available symbol names and see which ones are large.",
     parameters: {
       type: "object",
       properties: {
@@ -27,6 +29,16 @@ export const getSymbolSourceTool = {
         symbol: {
           type: "string",
           description: "Exact name of the symbol to read (e.g. function name, class name).",
+        },
+        member: {
+          type: "string",
+          description:
+            "Optional. Name of a class method, property, or nested function to read instead of the entire symbol. Use get_symbols to see available members.",
+        },
+        full: {
+          type: "boolean",
+          description:
+            "Optional. Pass true to read the full source of a large symbol without truncation. Only use this when you genuinely need the entire symbol (e.g. for a major refactor).",
         },
       },
       required: ["path", "symbol"],
@@ -50,18 +62,27 @@ export const getSymbolSourceTool = {
       }
 
       const file = await readWorkspaceTextFile(absolutePath, "get_symbol_source");
-      const result = getSymbolSource(absolutePath, file.content, args.symbol);
+      const result = getSymbolSource(absolutePath, file.content, args.symbol, {
+        ...(args.member !== undefined ? { memberName: args.member } : {}),
+        ...(args.full !== undefined ? { full: args.full } : {}),
+      });
 
       if (!result) {
+        const what = args.member
+          ? `Member "${args.member}" in symbol "${args.symbol}"`
+          : `Symbol "${args.symbol}"`;
         return JSON.stringify({
           ok: false,
-          error: `Symbol "${args.symbol}" not found in ${relativePath}. Use get_symbols to list available symbols.`,
+          error: `${what} not found in ${relativePath}. Use get_symbols to list available symbols and their members.`,
         });
       }
 
+      const readTarget = args.member
+        ? `member "${args.member}" of ${result.kind} "${result.name}"`
+        : `${result.kind} "${result.name}"`;
       context?.notices?.addNotice?.({
         level: "info",
-        message: `get_symbol_source read ${result.kind} "${result.name}" (lines ${result.startLine}-${result.endLine}) from ${relativePath}`,
+        message: `get_symbol_source read ${readTarget} (lines ${result.startLine}-${result.endLine}) from ${relativePath}`,
       });
 
       return JSON.stringify({
@@ -74,6 +95,8 @@ export const getSymbolSourceTool = {
         bodyHash: result.bodyHash,
         source: result.source,
         imports: result.imports,
+        ...(result.truncated ? { truncated: true } : {}),
+        ...(result.members ? { members: result.members } : {}),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown get_symbol_source error.";

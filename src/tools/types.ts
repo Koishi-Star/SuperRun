@@ -45,6 +45,7 @@ export type WorkspaceEditAssessment = {
     | "replace_symbol_body"
     | "insert_before_symbol"
     | "insert_after_symbol"
+    | "apply_patch"
     | "delete_file"
     | "restore_deleted_file"
     | "purge_deleted_file"

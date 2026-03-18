@@ -56,11 +56,13 @@ export const getSymbolsTool = {
         ok: true,
         path: relativePath,
         totalLines: file.lines.length,
-        symbols: symbols.map(({ name, kind, startLine, endLine }) => ({
+        symbols: symbols.map(({ name, kind, startLine, endLine, lineCount, members }) => ({
           name,
           kind,
           startLine,
           endLine,
+          lineCount,
+          ...(members ? { members: members.map((m) => ({ name: m.name, kind: m.kind, startLine: m.startLine, endLine: m.endLine })) } : {}),
         })),
       });
     } catch (error) {

@@ -132,6 +132,10 @@ const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
   "write_file",
   "replace_lines",
   "insert_lines",
+  "replace_symbol_body",
+  "insert_before_symbol",
+  "insert_after_symbol",
+  "apply_patch",
   "delete_file",
   "restore_deleted_file",
   "purge_deleted_file",
@@ -303,6 +307,8 @@ async function resolveAgentReply(
   let timeoutRetryCount = 0;
   let stalledToolCallRounds = 0;
   const seenToolCallSignatures = new Set<string>();
+  /** Track recent tool calls (name + args summary) for stall diagnostics. */
+  const recentToolCallNames: string[][] = [];
   const stepActivities = new Map<string, StepContextActivity>();
   const compressedStepSummaries = new Map<string, string>();
 
@@ -331,6 +337,7 @@ async function resolveAgentReply(
               userInputDismissed,
             },
             compressedStepSummaries,
+            recentToolCallNames,
           ),
           {
             ...(options?.model ? { model: options.model } : {}),
@@ -517,6 +524,7 @@ async function resolveAgentReply(
     }
 
     let roundMadeProgress = false;
+    const roundToolNames: string[] = [];
     for (const toolCall of response.toolCalls) {
       throwIfAborted(options?.abortSignal);
       const activeStepIdBefore = session.activePlan
@@ -561,6 +569,7 @@ async function resolveAgentReply(
       if (didToolCallMakeProgress(toolCall, toolExecution, seenToolCallSignatures)) {
         roundMadeProgress = true;
       }
+      roundToolNames.push(toolCall.name);
 
       compressResolvedStepContext(
         session.activePlan,
@@ -571,6 +580,7 @@ async function resolveAgentReply(
       );
     }
 
+    recentToolCallNames.push(roundToolNames);
     stalledToolCallRounds = roundMadeProgress
       ? 0
       : stalledToolCallRounds + 1;
@@ -689,13 +699,14 @@ function buildRoundMessages(
   activePlan: TaskPlan | null,
   guidance: RoundPromptGuidance,
   compressedStepSummaries: ReadonlyMap<string, string>,
+  recentToolCallNames: string[][] = [],
 ): ChatMessage[] {
   const planMessage = buildActivePlanSystemMessage(
     activePlan,
     guidance,
     compressedStepSummaries,
   );
-  const warning = buildToolLoopWarning(round, loopState);
+  const warning = buildToolLoopWarning(round, loopState, recentToolCallNames);
   return [
     ...messages,
     ...(planMessage
@@ -827,6 +838,7 @@ function buildToolLoopWarning(
     stalledRounds: number;
     exhaustedSafetyFuse: boolean;
   },
+  recentToolCallNames: string[][] = [],
 ): string | null {
   if (loopState.isFinalAnswerAttempt) {
     if (loopState.exhaustedSafetyFuse) {
@@ -845,12 +857,72 @@ function buildToolLoopWarning(
   ];
   if (loopState.stalledRounds > 0) {
     warnings.push(`The last ${loopState.stalledRounds} round${loopState.stalledRounds === 1 ? "" : "s"} did not add enough new progress.`);
+
+    // Analyze recent tool calls for specific strategy guidance.
+    const strategyHint = buildStallStrategyHint(recentToolCallNames, loopState.stalledRounds);
+    if (strategyHint) {
+      warnings.push(strategyHint);
+    }
   }
   warnings.push(
     "Only call another tool if it reads a new target, updates the plan, asks a focused clarification, applies a change, or verifies the result.",
     "Avoid repeating the same scans or rereading the same target without a concrete reason.",
   );
   return warnings.join(" ");
+}
+
+/**
+ * Analyze recent tool call patterns during a stall and return actionable strategy.
+ */
+export function buildStallStrategyHint(
+  recentToolCallNames: string[][],
+  stalledRounds: number,
+): string | null {
+  // Look at the last N stalled rounds.
+  const stalledSlice = recentToolCallNames.slice(-stalledRounds);
+  const flatCalls = stalledSlice.flat();
+  if (flatCalls.length === 0) return null;
+
+  // Count call frequencies.
+  const freq = new Map<string, number>();
+  for (const name of flatCalls) {
+    freq.set(name, (freq.get(name) ?? 0) + 1);
+  }
+
+  // Pattern: repeatedly reading a large symbol.
+  const symbolSourceCount = freq.get("get_symbol_source") ?? 0;
+  if (symbolSourceCount >= 2) {
+    return (
+      "Strategy hint: You are repeatedly reading the same large symbol. " +
+      "If get_symbols shows the symbol has members, use the `member` parameter " +
+      "to read a specific class method or nested function instead of the entire symbol. " +
+      "If the symbol has no named members, use search_workspace to locate the specific " +
+      "code block you need, then use apply_patch or read_file with a targeted line range."
+    );
+  }
+
+  // Pattern: repeatedly searching.
+  const searchCount = freq.get("search_workspace") ?? 0;
+  if (searchCount >= 2) {
+    return (
+      "Strategy hint: You are repeating similar searches. " +
+      "Try narrowing the search path, using a different pattern, or reading the file directly " +
+      "if you already know which file contains the target."
+    );
+  }
+
+  // Pattern: repeatedly reading the same file.
+  const readFileCount = freq.get("read_file") ?? 0;
+  if (readFileCount >= 3) {
+    return (
+      "Strategy hint: You are re-reading files repeatedly. " +
+      "If you have enough context, proceed to make changes using replace_symbol_body, " +
+      "apply_patch, or insert_before/after_symbol. If the target is unclear, " +
+      "try search_workspace with a specific pattern."
+    );
+  }
+
+  return null;
 }
 
 function didToolCallMakeProgress(
