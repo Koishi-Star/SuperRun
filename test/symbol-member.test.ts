@@ -7,6 +7,7 @@ import {
   getSymbolMemberSource,
   resolveSymbolMemberRange,
   collectSymbolMembers,
+  getSyntaxErrors,
   LARGE_SYMBOL_THRESHOLD,
 } from "../src/tools/symbol-resolve.js";
 
@@ -270,4 +271,36 @@ test("resolveSymbolMemberRange returns null for missing member", () => {
   const fp = absPath("c.ts");
   const result = resolveSymbolMemberRange(fp, content, "C", "z");
   assert.equal(result, null);
+});
+
+// ---------------------------------------------------------------------------
+// getSyntaxErrors
+// ---------------------------------------------------------------------------
+
+test("getSyntaxErrors returns empty array for valid TS code", () => {
+  const content = `export function greet() { return "hello"; }`;
+  const errors = getSyntaxErrors(absPath("valid.ts"), content);
+  assert.deepEqual(errors, []);
+});
+
+test("getSyntaxErrors returns errors for broken TS code", () => {
+  const content = `export function greet( { return "hello"; }`;
+  const errors = getSyntaxErrors(absPath("broken.ts"), content);
+  assert.ok(errors.length > 0);
+  assert.ok(errors[0]!.startsWith("Line "));
+});
+
+test("getSyntaxErrors returns empty array for non-TS files", () => {
+  const content = `{{{this is not valid code`;
+  const errors = getSyntaxErrors(absPath("readme.md"), content);
+  assert.deepEqual(errors, []);
+});
+
+test("getSyntaxErrors respects maxErrors limit", () => {
+  // Generate code with many syntax errors.
+  const lines = Array.from({ length: 20 }, (_, i) => `const x${i}: = ;`);
+  const content = lines.join("\n");
+  const errors = getSyntaxErrors(absPath("many-errors.ts"), content, 3);
+  assert.ok(errors.length <= 3);
+  assert.ok(errors.length > 0);
 });

@@ -565,3 +565,33 @@ export function hasParseErrors(
     (d) => d.getCategory() === 1 /* DiagnosticCategory.Error */,
   );
 }
+
+/**
+ * Return up to `maxErrors` syntax/parse error messages for a TS/JS file.
+ * Each entry includes the line number and the error message text.
+ * Returns an empty array for unsupported file types or clean files.
+ */
+export function getSyntaxErrors(
+  absolutePath: string,
+  content: string,
+  maxErrors: number = 10,
+): string[] {
+  if (!isSupportedSourceFile(absolutePath)) return [];
+
+  const sourceFile = parseSourceFile(absolutePath, content);
+  const diagnostics = sourceFile.getPreEmitDiagnostics();
+  const errors: string[] = [];
+
+  for (const d of diagnostics) {
+    if (d.getCategory() !== 1 /* DiagnosticCategory.Error */) continue;
+    const line = d.getLineNumber() ?? 0;
+    const messageText = d.getMessageText();
+    const text = typeof messageText === "string"
+      ? messageText
+      : messageText.getMessageText();
+    errors.push(`Line ${line}: ${text}`);
+    if (errors.length >= maxErrors) break;
+  }
+
+  return errors;
+}

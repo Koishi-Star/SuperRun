@@ -1,4 +1,5 @@
-import { basename } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename, resolve as resolvePath } from "node:path";
 import { chatOnce } from "../llm/router.js";
 import type {
   ChatMessage,
@@ -34,6 +35,7 @@ import { parseAgentMode, type AgentMode } from "./mode.js";
 import { executeAgentTool, getAgentToolDefinitions } from "../tools/index.js";
 import type { ToolExecutionContext, UserInputResponse } from "../tools/types.js";
 import { getPlatformShellCommand } from "../tools/shell.js";
+import { isSupportedSourceFile, getSyntaxErrors } from "../tools/symbol-resolve.js";
 import {
   FETCH_WEBPAGE_TOOL_NAME,
   createFetchWebpageSessionCache,
@@ -632,6 +634,14 @@ async function executeToolCallForAgentRound(
       return buildUserInputToolOutcome(toolResult);
     }
 
+    // Post-edit diagnostics: syntax-error feedback + step-check reminder.
+    if (WORKSPACE_MUTATION_TOOL_NAMES.has(toolCall.name)) {
+      const postEditPolicy = buildPostEditPolicyMessage(toolResult, activePlan);
+      if (postEditPolicy) {
+        return { toolResult, policyMessage: postEditPolicy };
+      }
+    }
+
     return {
       toolResult,
     };
@@ -1193,6 +1203,7 @@ function buildActivePlanSystemMessage(
     `Active task plan: ${activePlan.title}`,
     "Before using any tool other than update_plan, mark exactly one relevant plan step as in_progress with update_plan.",
     "After finishing a step, mark it completed or blocked with update_plan.",
+    "Before starting edits for a step, verify whether its goal is already achieved by prior edits (use search_workspace or read the edit target). If already satisfied, mark it completed immediately (note: 'already satisfied by prior edits') without re-editing.",
     "While the task plan is unresolved, do not reply with prose-only progress updates. Your next response must include the tool calls needed to advance the current step or resolve the plan.",
     "Do not claim that edits succeeded unless the workspace was actually changed and later verification passes.",
     `Current in-progress step: ${currentStep ? `${currentStep.id} ${currentStep.title}` : "none"}`,
@@ -1347,6 +1358,80 @@ function buildPlanToolGate(
     policyMessage:
       `The agent blocked ${toolCall.name} because the active task plan had no in-progress step. Call update_plan first, then retry the tool.`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Post-edit diagnostics: syntax-error feedback + step-satisfaction reminder
+// ---------------------------------------------------------------------------
+
+/**
+ * After a workspace mutation tool succeeds, build a policy message that:
+ * 1. Reports any syntax/parse errors detected in the modified file(s).
+ * 2. Reminds the model to check whether subsequent plan steps are already satisfied.
+ */
+export function buildPostEditPolicyMessage(
+  toolResult: string,
+  activePlan: TaskPlan | null,
+): string | null {
+  const messages: string[] = [];
+
+  // Extract paths from the tool result.
+  const modifiedPaths = extractModifiedPaths(toolResult);
+
+  // Check for syntax errors in modified TS/JS files.
+  for (const relativePath of modifiedPaths) {
+    try {
+      if (!isSupportedSourceFile(relativePath)) continue;
+      const absolutePath = resolvePath(process.cwd(), relativePath);
+      const content = readFileSync(absolutePath, "utf-8");
+      const errors = getSyntaxErrors(absolutePath, content);
+      if (errors.length > 0) {
+        messages.push(
+          `Syntax errors detected in ${relativePath} after this edit:\n${errors.map((e) => `  ${e}`).join("\n")}\nFix these errors before proceeding.`,
+        );
+      }
+    } catch {
+      // File might not exist (delete tool) or unreadable — skip silently.
+    }
+  }
+
+  // Remind about checking subsequent plan steps after edits.
+  if (activePlan && modifiedPaths.length > 0) {
+    const pendingSteps = activePlan.steps.filter((s) => s.status === "pending");
+    if (pendingSteps.length > 0) {
+      messages.push(
+        "Workspace was modified. Check whether subsequent pending plan steps are already satisfied by this edit. If so, mark them completed with update_plan (note: \"already satisfied by prior edit\") before making further edits.",
+      );
+    }
+  }
+
+  return messages.length > 0 ? messages.join("\n\n") : null;
+}
+
+/**
+ * Parse a tool-result JSON and extract the relative path(s) of modified files.
+ */
+export function extractModifiedPaths(toolResult: string): string[] {
+  try {
+    const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+    if (!parsed.ok) return [];
+
+    // apply_patch returns { files: [{ path }] }.
+    if (Array.isArray(parsed.files)) {
+      return (parsed.files as Array<{ path?: string }>)
+        .map((f) => f.path)
+        .filter((p): p is string => typeof p === "string");
+    }
+
+    // Most other tools return { path }.
+    if (typeof parsed.path === "string") {
+      return [parsed.path];
+    }
+
+    return [];
+  } catch {
+    return [];
+  }
 }
 
 function ensureAssistantChunkSpacing(content: string): string {
